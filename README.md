@@ -203,7 +203,7 @@ python -m agentloop_hub approval list        # 验收确认 → 合并审批 →
 python -m pytest
 ```
 
-本机结果：**145 passed**（2026-11-03）。覆盖 Connector 清单、路由评分、总线订阅/回放/只追加、调度优先级、语义缓存、节省账本、Benchmark、五级记忆同步、架构/验收/发布门禁、Worktree/Patch、DAG、重试、熔断、预算、审批、验证、合并、回滚、恢复、交接、会话读取、HTTP API、CLI、项目初始化/切换、模型目录选配、版本漂移、MCP 工具发现/调用、GUI 适配器（stub 驱动）与 SSE 实时流。
+本机结果：**146 passed**（2026-11-03）。覆盖 Connector 清单、路由评分、总线订阅/回放/只追加、调度优先级、语义缓存、节省账本、Benchmark、五级记忆同步、架构/验收/发布门禁、Worktree/Patch、DAG、重试、熔断、预算、审批、验证、合并、回滚、恢复、交接、会话读取、HTTP API、CLI、项目初始化/切换、模型目录选配、版本漂移、MCP 工具发现/调用、GUI 适配器（stub 驱动）与 SSE 实时流。
 
 ## 安全边界与已知限制
 
@@ -222,6 +222,8 @@ python -m pytest
 - [概要设计](docs/概要设计.md)
 - [实现与测试报告](docs/实现与测试报告.md)
 - [验证日志](docs/验证日志.md)
+- [11 类 Agent 能力矩阵](docs/11类Agent能力矩阵.md)
+- [GUI 自动化实测报告](docs/GUI自动化实测报告.md)
 - 需求基线：`01-需求整理-v1.docx`（原始需求与更早版本保留在根目录）
 
 ## 许可

@@ -102,3 +102,4 @@ Trae 与 Qoder 各含国际版/CN 版，因此注册表实际有 14 个 Agent ID
 - 11 类 Agent 在注册表中已齐全；Qoder CN、WorkBuddy 现在是 `gui_automation`，`is_auto_executable=true`，P0 自动执行门禁按能力放行。
 - Qoder CN 的真实可用模型：`DeepSeek-Flash`（`dfmodel`）；WorkBuddy 的真实可用模型：`GLM-5.3-Flash`（`glm-5.3-flash`）。
 - 其余 GUI 产品仍保留 file_relay，原因是尚未完成同等强度的 GUI 定位/回读验证；不伪造自动执行能力。
+- 真实闭环结果：`qoder_cn`+DeepSeek-Flash 主 / `workbuddy`+GLM-5.3-Flash 子，run `run_6eb19690a433` 最终 `released`，合并 commit `e9c35b52`。详见 `docs/GUI自动化实测报告.md`。

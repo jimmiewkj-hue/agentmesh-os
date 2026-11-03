@@ -157,13 +157,14 @@ class WorkBuddyReader:
         self.db_path = Path(self.config.get("session_db") or
                             (Path.home() / ".workbuddy" / "workbuddy.db"))
         self.send_timeout = float(self.config.get("send_timeout_seconds", 90))
+        self.quiet_seconds = float(self.config.get("quiet_seconds", 10))
 
     def wait_reply(self, marker: str, *, started_at: float, timeout: float,
                    stall_seconds: float, expected_model: str = "") -> GuiReply:
         deadline = time.monotonic() + timeout
         send_deadline = time.monotonic() + min(self.send_timeout, timeout)
         last_size = -1
-        last_growth = time.monotonic()
+        last_activity = time.monotonic()
         found_any = False
         while time.monotonic() < deadline:
             for path in _candidate_files(self.root, started_at):
@@ -176,9 +177,12 @@ class WorkBuddyReader:
                 tool_calls: list[dict[str, Any]] = []
                 model = ""
                 usage = {}
-                completed = False
+                session_id = self._session_id(events, path)
+                meaningful: list[dict[str, Any]] = []
                 for event in events[index:]:
                     etype = event.get("type")
+                    if etype in ("message", "reasoning", "function_call", "function_call_result"):
+                        meaningful.append(event)
                     if etype == "function_call":
                         try:
                             arguments = event.get("arguments")
@@ -217,16 +221,33 @@ class WorkBuddyReader:
                     if event.get("role") == "assistant":
                         texts.append(_text_from_blocks(event.get("content"),
                                                        ("output_text", "text")))
-                        if event.get("status") == "completed":
-                            completed = True
-                if completed and any(texts):
+                db_status = self._db_status(session_id)
+                if db_status in ("failed", "error", "cancelled", "canceled"):
+                    raise GuiAutomationError(
+                        "GUI_DRIVER_ERROR",
+                        f"WorkBuddy 会话状态为 {db_status}",
+                        details={"session": session_id, "transcript": str(path)},
+                    )
+                last = meaningful[-1] if meaningful else {}
+                last_is_final = (
+                    last.get("type") == "message"
+                    and last.get("role") == "assistant"
+                    and last.get("status") == "completed"
+                )
+                if (db_status == "completed" or last_is_final) and any(texts):
+                    # A completed assistant message may be an intermediate step.
+                    # Require a quiet period so the next tool call (if any) lands
+                    # before we treat the turn as finished.
+                    if db_status != "completed":
+                        size = path.stat().st_size
+                        if size != last_size:
+                            last_size = size
+                            last_activity = time.monotonic()
+                        if time.monotonic() - last_activity < self.quiet_seconds:
+                            continue
                     text = "\n".join(t for t in texts if t).strip()
-                    session_id = self._session_id(events, path)
-                    db_model = self._db_model(session_id)
-                    actual = db_model or model
+                    actual = self._db_model(session_id) or model
                     if expected_model:
-                        candidates = {expected_model.lower(), model.lower(),
-                                      actual.lower()}
                         if expected_model.lower() != actual.lower():
                             raise GuiAutomationError(
                                 "GUI_MODEL_SWITCH_FAILED",
@@ -243,12 +264,13 @@ class WorkBuddyReader:
                 size = path.stat().st_size
                 if size != last_size:
                     last_size = size
-                    last_growth = time.monotonic()
-                if time.monotonic() - last_growth > stall_seconds:
+                    last_activity = time.monotonic()
+                if time.monotonic() - last_activity > stall_seconds:
                     raise GuiAutomationError(
                         "GUI_STALLED",
                         f"WorkBuddy 会话 {path.stem} 在 {stall_seconds:.0f}s 内无新增事件",
-                        details={"transcript": str(path), "marker": marker},
+                        details={"transcript": str(path), "marker": marker,
+                                 "session_status": db_status},
                     )
             if not found_any and time.monotonic() > send_deadline:
                 raise GuiAutomationError(
@@ -263,19 +285,26 @@ class WorkBuddyReader:
         )
 
     def _db_model(self, session_id: str) -> str:
+        return str(self._db_row(session_id).get("model") or "")
+
+    def _db_status(self, session_id: str) -> str:
+        return str(self._db_row(session_id).get("status") or "")
+
+    def _db_row(self, session_id: str) -> dict[str, Any]:
         if not session_id or not self.db_path.exists():
-            return ""
+            return {}
         try:
             conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=2)
             try:
-                row = conn.execute(
-                    "SELECT model FROM sessions WHERE id = ?", (session_id,)
-                ).fetchone()
+                cursor = conn.execute(
+                    "SELECT model, status FROM sessions WHERE id = ?", (session_id,)
+                )
+                row = cursor.fetchone()
             finally:
                 conn.close()
-            return str(row[0] or "") if row else ""
+            return {"model": row[0], "status": row[1]} if row else {}
         except sqlite3.Error:
-            return ""
+            return {}
 
     @staticmethod
     def _session_id(events: list[dict[str, Any]], path: Path) -> str:

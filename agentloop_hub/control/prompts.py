@@ -113,8 +113,8 @@ def _result_schema() -> dict[str, Any]:
             "status": "string",
             "summary": "non-empty string",
             "findings": "array",
-            "files_read": "array",
-            "files_changed": "array of repo-relative paths",
+            "files_read": "array of paths relative to the task workdir",
+            "files_changed": "array of paths relative to the task workdir (e.g. calc.py)",
             "commands_run": "array",
             "tool_calls": "array",
             "tests": "array of {command,result}",
@@ -130,6 +130,10 @@ def _result_schema() -> dict[str, Any]:
             "status=completed 时 files_changed、evidence、tests、unresolved_items 必须存在（可为空数组，但字段不可缺失）",
             "不得只返回自然语言“已完成”；必须写 JSON 文件",
             "evidence 必须能定位到文件/行或日志",
+            "evidence[].file 必须是本次工作目录内实际存在的相对文件路径；命令输出请写入 tests/commands_run，"
+            "不要把 git diff / git status 等命令名写进 evidence.file",
+            "files_read / files_changed / evidence[].file 必须是相对本次工作目录（worktree）的路径，"
+            "例如 calc.py；不要写绝对路径，也不要写 .agentloop/runs/... 前缀",
             "未执行测试时在 tests 中写明命令与 skipped 原因",
         ],
     }
@@ -323,11 +327,14 @@ class PromptBuilder:
 - status：completed / partial / failed
 - summary：一句话结论
 - findings：发现列表（含严重级别与定位）
-- files_read / files_changed：相对项目根的路径
+- files_read / files_changed：相对**本次工作目录（worktree）**的路径，例如 `calc.py`；
+  不要写绝对路径，也不要写 `.agentloop/runs/...` 前缀
 - commands_run：实际执行的命令
 - tool_calls：工具调用记录
 - tests：`[{{"command": "...", "result": "passed|failed|skipped", "output": "..."}}]`
-- evidence：`[{{"file": "...", "lines": "10-20", "description": "..."}}]`
+- evidence：`[{{"file": "...", "lines": "10-20", "description": "..."}}]`，
+  其中 `file` 必须是**本次工作目录内**实际存在的相对文件路径（例如 `calc.py`）；
+  命令输出请放在 `tests` 或 `commands_run`，不要把 `git diff`、`git status` 等命令字符串写进 `file`。
 - risks / unresolved_items：剩余风险与未解决项
 - artifacts：产物路径（补丁、报告、日志）
 - token_usage / cost_estimate：可填你实际知道的值；不知道时如实写 0
