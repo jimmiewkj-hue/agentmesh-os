@@ -601,6 +601,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
                 path.unlink()
                 continue
             location["projectRoot"] = workspace
+            location["workspaceId"] = workspace_id
             path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             kept.append(str(path))
         if not kept:
@@ -610,7 +611,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
                 "version": 2, "profile": "desktop", "productId": "qoder-cn",
                 "environment": "prod",
                 "location": {"sessionId": current["session_id"],
-                             "workspaceId": None, "projectRoot": workspace},
+                             "workspaceId": workspace_id, "projectRoot": workspace},
             }, ensure_ascii=False), encoding="utf-8")
             kept.append(str(path))
         evidence["site_sessions"] = kept
