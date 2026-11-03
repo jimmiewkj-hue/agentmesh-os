@@ -40,6 +40,7 @@ class AdapterType(str, Enum):
     MANUAL = "manual"
     SESSION_ONLY = "session_only"
     MCP = "mcp"
+    GUI_AUTOMATION = "gui_automation"
 
 
 class AgentStatus(str, Enum):

@@ -71,6 +71,7 @@ class ExecutionOutcome:
     duration_ms: int = 0
     pid: int = 0
     extras: dict[str, Any] = field(default_factory=dict)
+    error_code: str = ""
 
     @property
     def ok(self) -> bool:
@@ -83,6 +84,7 @@ class ExecutionOutcome:
             "result_payload": self.result_payload, "result_path": self.result_path,
             "logs": self.logs, "error": self.error, "session_id": self.session_id,
             "duration_ms": self.duration_ms, "pid": self.pid, "extras": self.extras,
+            "error_code": self.error_code,
         }
 
 

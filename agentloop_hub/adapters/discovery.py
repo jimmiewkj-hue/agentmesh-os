@@ -320,7 +320,53 @@ def _models_from_workbuddy(workbuddy_home: Path, projects: Path | None) -> list[
         _collect_model_entries(data, out)
     elif isinstance(data, dict):
         _collect_model_entries(data.get("models"), out)
+    # Session DB is the authoritative per-session model record for WorkBuddy.
+    out.update(_models_from_workbuddy_db(workbuddy_home / "workbuddy.db"))
     return sorted(out)
+
+
+def _models_from_workbuddy_db(db_path: Path) -> list[str]:
+    if not db_path.exists():
+        return []
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT model FROM sessions WHERE model IS NOT NULL AND model != ''"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
+
+
+QODER_CN_MODEL_ALIASES = {"dfmodel": "DeepSeek-Flash"}
+WORKBUDDY_MODEL_ALIASES = {"glm-5.3-flash": "GLM-5.3-Flash"}
+
+
+def _models_from_qoder_cn(home: Path, projects: Path | None) -> list[str]:
+    models = set(_models_from_jsonl_projects(projects, kind="qoder")) if projects else set()
+    catalog = home / ".qoder-cn" / ".models"
+    if catalog.exists() or "dfmodel" in models:
+        models.update(QODER_CN_MODEL_ALIASES)
+        models.update(QODER_CN_MODEL_ALIASES.values())
+    return sorted(models)
+
+
+def _models_from_workbuddy_real(home: Path, projects: Path | None) -> list[str]:
+    models = set(_models_from_workbuddy(home / ".workbuddy", projects))
+    if any(str(m).lower() in ("glm-5.3-flash", "glm-5.3") for m in models):
+        models.update(WORKBUDDY_MODEL_ALIASES)
+        models.update(WORKBUDDY_MODEL_ALIASES.values())
+    return sorted(models)
+
+
+def _qoder_cn_version(home: Path) -> str:
+    status = read_json(home / ".qoder-cn" / ".qoder-app-status.json", {}) or {}
+    version = str(status.get("version") or "").strip() if isinstance(status, dict) else ""
+    return version or "unknown"
 
 
 def _models_from_dsh(dsh_home: Path) -> list[str]:
@@ -376,9 +422,12 @@ def detect_models_for_agent(agent: AgentRecord, ctx: DiscoveryContext | None = N
     if agent.agent_id == "opencode" or reader == "opencode":
         return _opencode_models(exe)
     if reader == "qoder":
-        return _models_from_jsonl_projects(data_path or ctx.home / ".qoder" / "projects", kind="qoder")
+        projects = data_path or ctx.home / ".qoder" / "projects"
+        if agent.agent_id == "qoder_cn":
+            return _models_from_qoder_cn(ctx.home, projects)
+        return _models_from_jsonl_projects(projects, kind="qoder")
     if reader == "workbuddy":
-        return _models_from_workbuddy(ctx.home / ".workbuddy", data_path)
+        return _models_from_workbuddy_real(ctx.home, data_path)
     if reader == "zcode":
         return _models_from_zcode(ctx.home / ".zcode", data_path)
     if reader == "dsh":
@@ -535,14 +584,59 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         ctx.localappdata / "Programs" / "Qoder CN" / "Qoder CN.exe",
     ])
     qoder_cn_projects = ctx.home / ".qoder-cn" / "projects"
-    out.append(_make_agent(
+    qoder_cn_gui = qoder_cn_exe is not None
+    qoder_cn_config = {
+        "mode": "gui_automation" if qoder_cn_gui else "file_relay",
+        "gui_app": "qoder_cn" if qoder_cn_gui else "",
+        "window_title": "Qoder CN",
+        "executable": str(qoder_cn_exe) if qoder_cn_exe else "",
+        "launch_command": [str(qoder_cn_exe)] if qoder_cn_exe else [],
+        "input_offset_ratio": [0.524, 0.804],
+        "input_double_click": True,
+        "submit_key": "ENTER",
+        "model_selector_offset_ratio": None,
+        "model_item_offset_ratio": {},
+        "model_aliases": {
+            "dfmodel": "dfmodel", "DeepSeek-Flash": "dfmodel",
+            "DeepSeek Flash": "dfmodel", "deepseek-flash": "dfmodel",
+        },
+        "display_model": "DeepSeek-Flash",
+        "model_switch_supported": False,
+        "session_reader": "qoder",
+        "transcript_reader": "qoder_cn",
+        "data_path": str(qoder_cn_projects),
+        "send_timeout_seconds": 90,
+        "stall_seconds": 90,
+        "timeout_seconds": 1800,
+        "launch_timeout_seconds": 120,
+        "wait_seconds": 0,
+        "poll_seconds": 1,
+    }
+    qoder_cn = _make_agent(
         agent_id="qoder_cn", name="Qoder CN", product="Qoder CN", edition="domestic",
         exe=qoder_cn_exe,
         data_path=qoder_cn_projects if qoder_cn_projects.exists() else None,
         reader="qoder", project_id=project_id,
-        access_level=AccessLevel.L2.value if qoder_cn_exe or qoder_cn_projects.exists() else AccessLevel.L1.value,
-        structured=False, models=_models_from_jsonl_projects(qoder_cn_projects, kind="qoder"),
-    ))
+        access_level=AccessLevel.L3.value if qoder_cn_gui else (
+            AccessLevel.L2.value if qoder_cn_exe or qoder_cn_projects.exists() else AccessLevel.L1.value
+        ),
+        structured=qoder_cn_gui,
+        adapter_type=AdapterType.GUI_AUTOMATION.value if qoder_cn_gui else AdapterType.FILE_RELAY.value,
+        adapter_config=qoder_cn_config,
+        models=_models_from_qoder_cn(ctx.home, qoder_cn_projects),
+        version=_qoder_cn_version(ctx.home) if _qoder_cn_version(ctx.home) != "unknown"
+        else _read_version_from_exe(qoder_cn_exe),
+    )
+    if qoder_cn_gui:
+        qoder_cn.capabilities.update({
+            "gui_control": True, "auto_executable": True, "structured_output": True,
+            "background": True,
+        })
+        qoder_cn.extra["gui_automation"] = {
+            "app": "qoder_cn", "window_title": "Qoder CN",
+            "transcript_reader": "qoder_cn", "model_default": "DeepSeek-Flash",
+        }
+    out.append(qoder_cn)
 
     # --- ZCode ------------------------------------------------------------
     zcode_exe = _first_existing([
@@ -564,13 +658,58 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         ctx.localappdata / "Programs" / "WorkBuddy" / "WorkBuddy.exe",
     ])
     wb_projects = ctx.home / ".workbuddy" / "projects"
-    out.append(_make_agent(
+    wb_gui = wb_exe is not None
+    wb_config = {
+        "mode": "gui_automation" if wb_gui else "file_relay",
+        "gui_app": "workbuddy" if wb_gui else "",
+        "window_title": "WorkBuddy",
+        "executable": str(wb_exe) if wb_exe else "",
+        "launch_command": [str(wb_exe)] if wb_exe else [],
+        "input_offset_ratio": [0.439, 0.395],
+        "input_double_click": True,
+        "submit_key": "ENTER",
+        "model_selector_offset_ratio": [0.796, 0.519],
+        "model_item_offset_ratio": {"glm-5.3-flash": [0.630, 0.060]},
+        "model_aliases": {
+            "glm-5.3-flash": "glm-5.3-flash",
+            "GLM-5.3-Flash": "glm-5.3-flash",
+            "GLM 5.3 Flash": "glm-5.3-flash",
+        },
+        "display_model": "GLM-5.3-Flash",
+        "model_switch_supported": True,
+        "session_reader": "workbuddy",
+        "transcript_reader": "workbuddy",
+        "data_path": str(wb_projects),
+        "session_db": str(ctx.home / ".workbuddy" / "workbuddy.db"),
+        "send_timeout_seconds": 90,
+        "stall_seconds": 90,
+        "timeout_seconds": 1800,
+        "launch_timeout_seconds": 120,
+        "wait_seconds": 0,
+        "poll_seconds": 1,
+    }
+    workbuddy = _make_agent(
         agent_id="workbuddy", name="WorkBuddy", product="WorkBuddy", edition="domestic",
         exe=wb_exe, data_path=wb_projects if wb_projects.exists() else None,
         reader="workbuddy", project_id=project_id,
-        access_level=AccessLevel.L2.value if wb_exe or wb_projects.exists() else AccessLevel.L1.value,
-        structured=False, models=_models_from_workbuddy(ctx.home / ".workbuddy", wb_projects),
-    ))
+        access_level=AccessLevel.L3.value if wb_gui else (
+            AccessLevel.L2.value if wb_exe or wb_projects.exists() else AccessLevel.L1.value
+        ),
+        structured=wb_gui,
+        adapter_type=AdapterType.GUI_AUTOMATION.value if wb_gui else AdapterType.FILE_RELAY.value,
+        adapter_config=wb_config,
+        models=_models_from_workbuddy_real(ctx.home, wb_projects),
+    )
+    if wb_gui:
+        workbuddy.capabilities.update({
+            "gui_control": True, "auto_executable": True, "structured_output": True,
+            "background": True,
+        })
+        workbuddy.extra["gui_automation"] = {
+            "app": "workbuddy", "window_title": "WorkBuddy",
+            "transcript_reader": "workbuddy", "model_default": "GLM-5.3-Flash",
+        }
+    out.append(workbuddy)
 
     # --- DeepSeek Harness -------------------------------------------------
     dsh_exe = _first_existing([

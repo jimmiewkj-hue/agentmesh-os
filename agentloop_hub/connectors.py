@@ -37,7 +37,14 @@ CAPABILITY_VOCABULARY: dict[str, str] = {
     "execution": "通用任务执行",
     "local_mcp": "作为本地 MCP 服务被调用",
     "auto_executable": "无需人工操作即可自动执行任务",
+    "gui_control": "可通过 GUI 自动化驱动（窗口/输入/会话回读）",
 }
+
+# 需求整理-v1 模块 1 的 11 类产品（Trae/Qoder 各含国际版与 CN 版）。
+AGENT_CLASSES: tuple[str, ...] = (
+    "trae", "qoder", "workbuddy", "opencode", "zcode", "dsh",
+    "cursor", "claude_code", "gemini_cli", "codex_cli", "aider",
+)
 
 TASK_CAPABILITY_REQUIREMENTS: dict[str, list[str]] = {
     TaskType.ANALYSIS.value: ["read_files", "analysis"],
@@ -129,10 +136,16 @@ def is_auto_executable(agent: AgentRecord) -> bool:
     File relay / manual / MCP Agents are intentionally excluded. A project can
     opt one relay Agent in explicitly via ``extra.allow_auto_relay`` or the
     router's ``router_allow_manual_relay`` switch.
+
+    ``gui_automation`` is a capability, not a name-based bypass: it requires an
+    online agent with a known GUI app profile (window title + transcript reader).
     """
     kind = (agent.adapter_type or "").lower()
     if kind in ("cli", "opencode"):
         return True
+    if kind == "gui_automation":
+        config = agent.adapter_config or {}
+        return bool(config.get("gui_app")) and agent.status not in ("offline", "error", "unknown")
     if kind == "file_relay":
         return bool((agent.extra or {}).get("allow_auto_relay"))
     return False
@@ -152,9 +165,9 @@ def derive_capability_list(agent: AgentRecord) -> list[str]:
         profile = profile_for(agent.product.lower().replace(" ", "_")) or profile_for(agent.agent_id)
         if profile:
             caps.update(profile.assumed)
-    # Analysis requires a non-interactive CLI/structured Agent. Merely having
-    # file-read capability (GUI relay) must not grant analysis automatically.
-    if "read_files" in caps and agent.adapter_type in ("cli", "opencode"):
+    # Analysis requires a non-interactive CLI or a verified GUI automation
+    # bridge. A file-relay GUI alone still needs a human and is excluded.
+    if "read_files" in caps and agent.adapter_type in ("cli", "opencode", "gui_automation"):
         caps.add("analysis")
     if "write_files" in caps:
         caps.update({"code_generation", "documentation"})
@@ -168,6 +181,8 @@ def derive_capability_list(agent: AgentRecord) -> list[str]:
         caps.add("structured_output")
     if (agent.adapter_config or {}).get("mode") == "mcp":
         caps.add("local_mcp")
+    if agent.adapter_type == "gui_automation":
+        caps.add("gui_control")
     if is_auto_executable(agent):
         caps.add("auto_executable")
     return sorted(c for c in caps if c in CAPABILITY_VOCABULARY)
@@ -214,6 +229,7 @@ def missing_capabilities(agent: AgentRecord, required: Iterable[str]) -> list[st
 
 __all__ = [
     "CAPABILITY_VOCABULARY", "TASK_CAPABILITY_REQUIREMENTS", "CONNECTOR_PROFILES",
-    "ConnectorProfile", "profile_for", "derive_capability_list", "required_capabilities_for",
-    "agent_descriptor", "connector_manifest", "missing_capabilities", "is_auto_executable",
+    "AGENT_CLASSES", "ConnectorProfile", "profile_for", "derive_capability_list",
+    "required_capabilities_for", "agent_descriptor", "connector_manifest",
+    "missing_capabilities", "is_auto_executable",
 ]

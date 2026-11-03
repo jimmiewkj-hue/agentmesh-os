@@ -6,6 +6,7 @@ from ..errors import AdapterError
 from ..models import AdapterType, AgentRecord
 from .base import AgentAdapter
 from .cli import CliAgentAdapter
+from .gui import GuiAutomationAdapter
 from .mcp import McpAdapter
 from .opencode import OpenCodeAdapter
 from .relay import FileRelayAdapter, ManualAdapter
@@ -19,6 +20,8 @@ def create_adapter(agent: AgentRecord) -> AgentAdapter:
         return McpAdapter(agent)
     if kind == AdapterType.CLI.value:
         return CliAgentAdapter(agent)
+    if kind == AdapterType.GUI_AUTOMATION.value:
+        return GuiAutomationAdapter(agent)
     if kind == AdapterType.FILE_RELAY.value:
         return FileRelayAdapter(agent)
     if kind == AdapterType.MANUAL.value:
