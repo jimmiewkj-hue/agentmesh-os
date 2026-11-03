@@ -38,15 +38,21 @@ def qoder_cn_profile() -> GuiProfile:
         input_ratio=(0.524, 0.804),
         input_double_click=True,
         new_task_ratio=(0.036, 0.072),
-        # Re-measured 2026-11-03 against the 1336x808 window: selector sits
-        # left of the mic at (0.678, 0.907); the menu opens above it and
-        # DeepSeek-Flash / GLM-5.3 are the 6th / 7th rows.
+        # Re-measured 2026-11-03 against the 1336x808 window.  The composer
+        # has two layouts: the home composer is wider (selector 0.797) while
+        # an open chat is narrower because of the artifact panel (0.678).
+        # Menu rows are the same height; only their x differs.
         submit_button_ratio=(0.749, 0.907),
         model_selector_ratio=(0.678, 0.907),
+        model_selector_ratio_home=(0.797, 0.907),
         model_menu_scroll_ratio=(0.584, 0.620),
         model_item_ratio={
             "dfmodel": (0.584, 0.734),
             "gfmodel": (0.584, 0.781),
+        },
+        model_item_ratio_home={
+            "dfmodel": (0.674, 0.734),
+            "gfmodel": (0.674, 0.781),
         },
         workspace_row_ratio=(0.070, 0.282),
         workspace_new_task_ratio=(0.177, 0.282),

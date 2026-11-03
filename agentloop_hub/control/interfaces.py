@@ -403,9 +403,32 @@ def _rewrite_qoder_transcript(path: Path, *, workspace: str, model_key: str) -> 
     return changed
 
 
+def _process_running(image: str) -> bool:
+    try:
+        proc = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+                              capture_output=True, text=True, timeout=20,
+                              encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return image.lower() in (proc.stdout or "").lower()
+
+
 def _stop_process(name: str) -> None:
-    subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True,
+    """Kill the Electron image and wait until it is really gone.
+
+    ``taskkill /IM`` needs the executable image name (``Qoder CN.exe``); the
+    bare product name matched nothing, so the desktop kept running with its
+    in-memory route and ignored every store rewrite.
+    """
+    image = name if name.lower().endswith(".exe") else f"{name}.exe"
+    subprocess.run(["taskkill", "/F", "/IM", image, "/T"], capture_output=True,
                    timeout=30, check=False)
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if not _process_running(image):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"{image} 仍在运行，无法重载工作区")
 
 
 def _start_app(exe: str) -> None:
@@ -440,8 +463,8 @@ def prepare_qoder_session(*, workspace: str, model: str,
     evidence: dict[str, Any] = {"session_id": current["session_id"], "db": str(db),
                                 "workspace": workspace}
     try:
-        (stop_process or _stop_process)("Qoder CN")
-        time.sleep(3.0)
+        (stop_process or _stop_process)("Qoder CN.exe")
+        time.sleep(1.0)
     except Exception as exc:
         return InterfaceOutcome(
             False, "db_write", {"workspace": workspace, "model": key}, {},

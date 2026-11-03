@@ -340,30 +340,60 @@ class WindowsGuiDriver:
             time.sleep(0.08)
         time.sleep(0.3)
 
+    def _composer_layout(self) -> str:
+        """Detect the wide home composer vs the narrower open-chat composer."""
+        if not self.hwnd:
+            return ""
+        try:
+            from PIL import ImageGrab
+            image = ImageGrab.grab(bbox=_window_rect(self.hwnd), all_screens=True).convert("RGB")
+            width, height = image.size
+            pixels = image.load()
+            xs: list[int] = []
+            for y in range(int(height * 0.87), int(height * 0.94)):
+                for x in range(int(width * 0.6), width):
+                    red, green, blue = pixels[x, y]
+                    if green > 90 and green > red + 15 and green > blue + 15:
+                        xs.append(x)
+            if xs:
+                return "home" if max(xs) / width > 0.82 else "chat"
+        except Exception:
+            pass
+        return ""
+
     def select_model(self, model_key: str) -> bool:
         if not self.profile.model_switch_supported:
             return False
         selector = self.profile.model_selector_ratio
+        items = self.profile.model_item_ratio
+        layout = self._composer_layout()
+        if layout == "home":
+            selector = self.profile.model_selector_ratio_home or selector
+            items = self.profile.model_item_ratio_home or items
         if not selector:
             return False
-        item = self.profile.model_item_ratio.get(model_key)
+        item = items.get(model_key)
         if not item:
             raise GuiAutomationError(
                 "GUI_MODEL_SWITCH_FAILED",
                 f"未配置模型 {model_key} 的菜单项位置",
-                details={"known": sorted(self.profile.model_item_ratio)},
+                details={"known": sorted(items)},
             )
         self._focus()
         self.click_ratio(selector, times=1)
         time.sleep(1.5)
         # The menu auto-scrolls to the currently selected model. Reset to the
-        # top so the measured GLM-5.3-Flash row is stable regardless of the
-        # previous selection (e.g. after a mistaken Kimi/Hy click).
-        if self.profile.model_menu_scroll_ratio:
-            self.scroll_ratio(self.profile.model_menu_scroll_ratio, 8)
+        # top so the measured row is stable regardless of the previous
+        # selection (e.g. after a mistaken Kimi/Hy click).
+        scroll = self.profile.model_menu_scroll_ratio
+        if scroll:
+            if layout == "home":
+                scroll = (item[0] - 0.08, scroll[1])
+            self.scroll_ratio(scroll, 8)
         self.click_ratio(item, times=1)
         time.sleep(0.8)
-        self.log("select_model", model=model_key, selector=list(selector), item=list(item))
+        self.log("select_model", model=model_key, layout=layout or "unknown",
+                 selector=list(selector), item=list(item))
         return True
 
     def send_prompt(self, text: str) -> None:
