@@ -55,8 +55,8 @@ class QoderCnReader:
                    stall_seconds: float, expected_model: str = "") -> GuiReply:
         deadline = time.monotonic() + timeout
         send_deadline = time.monotonic() + min(self.send_timeout, timeout)
-        last_size = -1
-        last_growth = time.monotonic()
+        last_size: dict[Path, int] = {}
+        last_growth: dict[Path, float] = {}
         found_any = False
         while time.monotonic() < deadline:
             for path in _candidate_files(self.root, started_at):
@@ -121,11 +121,12 @@ class QoderCnReader:
                         tool_calls=tool_calls, usage=usage, events=len(events),
                         finished_at=now_iso(),
                     )
+                now = time.monotonic()
                 size = path.stat().st_size
-                if size != last_size:
-                    last_size = size
-                    last_growth = time.monotonic()
-                if time.monotonic() - last_growth > stall_seconds:
+                if last_size.get(path) != size:
+                    last_size[path] = size
+                    last_growth[path] = now
+                if now - last_growth.get(path, now) > stall_seconds:
                     raise GuiAutomationError(
                         "GUI_STALLED",
                         f"Qoder CN 会话 {path.stem} 在 {stall_seconds:.0f}s 内无新增事件",
@@ -168,8 +169,8 @@ class WorkBuddyReader:
                    stall_seconds: float, expected_model: str = "") -> GuiReply:
         deadline = time.monotonic() + timeout
         send_deadline = time.monotonic() + min(self.send_timeout, timeout)
-        last_size = -1
-        last_activity = time.monotonic()
+        last_size: dict[Path, int] = {}
+        last_activity: dict[Path, float] = {}
         found_any = False
         while time.monotonic() < deadline:
             for path in _candidate_files(self.root, started_at):
@@ -244,11 +245,12 @@ class WorkBuddyReader:
                     # Require a quiet period so the next tool call (if any) lands
                     # before we treat the turn as finished.
                     if db_status != "completed":
+                        now = time.monotonic()
                         size = path.stat().st_size
-                        if size != last_size:
-                            last_size = size
-                            last_activity = time.monotonic()
-                        if time.monotonic() - last_activity < self.quiet_seconds:
+                        if last_size.get(path) != size:
+                            last_size[path] = size
+                            last_activity[path] = now
+                        if now - last_activity.get(path, now) < self.quiet_seconds:
                             continue
                     text = "\n".join(t for t in texts if t).strip()
                     actual = self._db_model(session_id) or model
@@ -266,11 +268,12 @@ class WorkBuddyReader:
                         transcript_path=str(path), tool_calls=tool_calls,
                         usage=usage, events=len(events), finished_at=now_iso(),
                     )
+                now = time.monotonic()
                 size = path.stat().st_size
-                if size != last_size:
-                    last_size = size
-                    last_activity = time.monotonic()
-                if time.monotonic() - last_activity > stall_seconds:
+                if last_size.get(path) != size:
+                    last_size[path] = size
+                    last_activity[path] = now
+                if now - last_activity.get(path, now) > stall_seconds:
                     raise GuiAutomationError(
                         "GUI_STALLED",
                         f"WorkBuddy 会话 {path.stem} 在 {stall_seconds:.0f}s 内无新增事件",
