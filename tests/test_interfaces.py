@@ -199,6 +199,32 @@ def test_qoder_prepare_session_moves_transcript_and_updates_db(tmp_path, monkeyp
     assert verify.ok, verify
 
 
+def test_qoder_prepare_falls_back_to_session_with_transcript(tmp_path, monkeypatch):
+    workspace = str(tmp_path / "run-ws")
+    old_ws = str(tmp_path / "old-ws")
+    db = _qoder_db(tmp_path / "main.sqlite", cwd=old_ws, model="dfmodel")
+    projects = tmp_path / "projects"
+    _qoder_transcript(projects, old_ws, "qoder-sess", model="dfmodel")
+    conn = sqlite3.connect(db)
+    # Newer empty chat created by the GUI "+" before the adapter runs.
+    conn.execute("insert into chat_sessions values (?,?,?,?,?,?,?,?,?)",
+                 ("empty-sess", str(tmp_path / "other-ws"), "ws-old", "dfmodel",
+                  "empty", "standard", None, 999999, "{}"))
+    conn.commit()
+    conn.close()
+    assert iface._qoder_current_session(Path(db))["session_id"] == "empty-sess"
+
+    monkeypatch.setattr(iface, "_stop_process", lambda _name: None)
+    monkeypatch.setattr(iface, "_start_app", lambda _exe: None)
+    outcome = iface.prepare_qoder_session(
+        workspace=workspace, model="DeepSeek-Flash",
+        config={"qoder_db": str(db), "qoder_projects": str(projects)},
+    )
+    assert outcome.ok, outcome
+    assert outcome.evidence["session_id"] == "qoder-sess"
+    assert outcome.evidence["fallback_session_id"] == "qoder-sess"
+
+
 def test_qoder_daemon_cwd_mismatch_is_detected(tmp_path):
     workspace = r"D:\run\daemon-ws"
     db = _qoder_db(tmp_path / "main.sqlite", cwd=workspace, model="dfmodel")

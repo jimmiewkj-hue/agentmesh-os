@@ -371,6 +371,36 @@ def _transcript_for(projects: Path, cwd: str, session_id: str) -> Path:
     return projects / qoder_project_slug(cwd) / f"{session_id}.jsonl"
 
 
+def _find_qoder_transcript(projects: Path, cwd: str, session_id: str) -> Path:
+    """Locate a session transcript even if its workspace folder moved."""
+    if cwd:
+        path = _transcript_for(projects, cwd, session_id)
+        if path.exists():
+            return path
+    matches = sorted(projects.rglob(f"{session_id}.jsonl"),
+                     key=lambda item: item.stat().st_mtime, reverse=True)
+    return matches[0] if matches else Path()
+
+
+def _qoder_session_with_transcript(db: Path, projects: Path) -> tuple[dict[str, Any], Path] | None:
+    """Newest chat session that still has a transcript on disk."""
+    conn = _qoder_connect(db)
+    try:
+        rows = [dict(row) for row in conn.execute(
+            "select session_id, cwd, workspace_id, model from chat_sessions "
+            "where deleted_at is null and session_kind='standard' "
+            "order by updated_at desc limit 50"
+        )]
+    finally:
+        conn.close()
+    for row in rows:
+        path = _find_qoder_transcript(projects, str(row.get("cwd") or ""),
+                                     str(row["session_id"]))
+        if path.is_file():
+            return row, path
+    return None, Path()
+
+
 def _rewrite_qoder_transcript(path: Path, *, workspace: str, model_key: str) -> int:
     """Rewrite workspace events and append the requested runtime model."""
     if not path.exists():
@@ -473,15 +503,24 @@ def prepare_qoder_session(*, workspace: str, model: str,
         )
     current = _qoder_current_session(db) or current
     old_cwd = str(current["cwd"] or "")
-    old_transcript = _transcript_for(projects, old_cwd, current["session_id"]) if old_cwd else Path()
+    old_transcript = _find_qoder_transcript(projects, old_cwd, current["session_id"])
     new_transcript = _transcript_for(projects, workspace, current["session_id"])
+    if not old_transcript.is_file():
+        # The GUI may have created an empty chat (no transcript yet).  Migrate
+        # the newest session that has real history instead of failing.
+        fallback, fallback_path = _qoder_session_with_transcript(db, projects)
+        if fallback:
+            current = fallback
+            old_cwd = str(current["cwd"] or "")
+            old_transcript = fallback_path
+            new_transcript = _transcript_for(projects, workspace, current["session_id"])
+            evidence["fallback_session_id"] = current["session_id"]
     evidence.update({
+        "session_id": current["session_id"],
         "old_workspace": old_cwd, "old_transcript": str(old_transcript),
         "new_transcript": str(new_transcript),
     })
-    if not old_transcript.exists() and new_transcript.exists():
-        old_transcript = new_transcript
-    if not old_transcript.exists():
+    if not old_transcript.is_file():
         return InterfaceOutcome(
             False, "db_write",
             {"workspace": workspace, "model": key}, {},
