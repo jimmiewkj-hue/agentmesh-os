@@ -114,8 +114,10 @@ class RunService:
         if not plan:
             raise NotFoundError(f"计划不存在: {run['plan_id']}")
         self.store.update_run(run_id, status="running", started_at=run["started_at"] or now_iso())
+        run_workspace = self._ensure_run_workspace(run_id, run["base_commit"])
         self.audit.log("control-plane", "run.started", subject=run_id,
-                       payload={"max_parallel": max_parallel or self.config.max_parallel})
+                       payload={"max_parallel": max_parallel or self.config.max_parallel,
+                                "workspace": run_workspace})
         self.checkpoints.create("run_started", run_id=run_id)
         self.memory.sync_workflow(run_id)
         self.memory.sync_task_state(run_id)
@@ -387,6 +389,25 @@ class RunService:
         )
         adapter = create_adapter(agent)
         outcome = adapter.execute(request)
+        interface = (outcome.extras or {}).get("interface") or {}
+        verify = interface.get("verify") or {}
+        if verify:
+            self.audit.log("control-plane", "workspace.verified", subject=uid,
+                           payload={"expected": verify.get("expected", {}),
+                                    "actual": verify.get("actual", {}),
+                                    "evidence": verify.get("evidence", {}),
+                                    "method": interface.get("method", "")})
+            if self.config.workspace_verify and not verify.get("ok", True):
+                self._retry_or_fail(
+                    task,
+                    f"{verify.get('error_code') or 'WORKSPACE_MISMATCH'}: "
+                    f"{verify.get('reason', '')}",
+                )
+                return
+        elif interface.get("method") == "gui" and self.config.workspace_verify:
+            self.audit.log("control-plane", "workspace.unverified", subject=uid,
+                           payload={"agent": agent.agent_id,
+                                    "reason": interface.get("fallback_reason", "")})
         self.store.update_task(uid, pid=outcome.pid)
         self.budget.record(
             task, agent.agent_id, request.model, outcome.usage,
@@ -470,6 +491,25 @@ class RunService:
         self.store.cache_set(key, task.project_id, task.spec.type, file_hash, result.payload)
         if self.cost:
             self.cost.semantic_store(task, file_hash, result.payload)
+
+    def _ensure_run_workspace(self, run_id: str, base_commit: str) -> str:
+        target = self.paths.run_workspace(run_id)
+        with self._wt_lock:
+            if Path(target).exists():
+                proc = run_git(["rev-parse", "--is-inside-work-tree"], cwd=target, check=False)
+                if proc.returncode == 0:
+                    return str(target)
+                shutil.rmtree(target, ignore_errors=True)
+            try:
+                create_worktree(self.project.root, target, base_commit or self.project.commit)
+            except Exception as exc:
+                self.audit.log("control-plane", "workspace.create_failed", subject=run_id,
+                               payload={"expected": str(target), "error": str(exc)[:300]})
+                return str(self.project.root)
+        self.audit.log("control-plane", "workspace.created", subject=run_id,
+                       payload={"expected": str(target), "kind": "run",
+                                "base_commit": base_commit or self.project.commit})
+        return str(target)
 
     def _prepare_workdir(self, task: Task, run: dict[str, Any]) -> str:
         target = self.paths.worktree_dir(task.run_id, task.task_id)
@@ -896,6 +936,7 @@ class RunService:
             self.store.update_run(run_id, status="failed", finished_at=now_iso(),
                                   error="主节点 Agent 不存在")
             return {"status": "failed", "run_id": run_id, "error": "主节点 Agent 不存在"}
+        summary_workspace = self._ensure_run_workspace(run_id, run.get("base_commit", ""))
         prompt_path, summary_path = self.prompts.write_summary_request(
             run_id=run_id, main_agent=main_agent, model=run.get("model", ""), context=ctx,
         )
@@ -910,12 +951,12 @@ class RunService:
             plan_id=plan.plan_id, run_id=run_id, spec=plan.tasks[0] if plan.tasks else TaskSpec(
                 task_id="SUMMARY", title="汇总", objective="汇总", type="analysis"
             ),
-            status=TaskStatus.RUNNING.value, workdir=self.project.root,
+            status=TaskStatus.RUNNING.value, workdir=summary_workspace,
             task_dir=str(prompt_path.parent), base_commit=run.get("base_commit", ""),
         )
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
-            task=synthetic, workdir=self.project.root, task_dir=str(prompt_path.parent),
+            task=synthetic, workdir=summary_workspace, task_dir=str(prompt_path.parent),
             prompt_path=str(prompt_path), result_path=str(summary_path),
             model=run.get("model", ""), timeout_seconds=self.config.summary_timeout_seconds,
             purpose="summary",

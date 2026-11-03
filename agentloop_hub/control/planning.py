@@ -9,6 +9,7 @@ from typing import Any
 from ..adapters import create_adapter
 from ..adapters.base import ExecutionRequest
 from ..errors import NotFoundError, ValidationError
+from ..workspace import create_worktree
 from ..models import (
     AgentRecord, Project, Task, TaskPlan, TaskSpec, TaskStatus,
 )
@@ -72,6 +73,7 @@ class PlanningService:
             ctx = self.cost.compress_context(
                 ctx, self.config.context_summary_tokens, kind="context_compression",
             )
+        workspace = self._plan_workspace(plan_id)
         prompt_path, plan_path = self.prompts.write_plan_request(
             plan_id=plan_id, goal=goal, main_agent=main, model=model, context=ctx,
         )
@@ -86,16 +88,19 @@ class PlanningService:
         synthetic = self._synthetic_task(
             uid=f"{plan_id}:PLAN", task_id="PLAN", title="需求理解与任务拆分",
             objective=goal, type="analysis", plan_id=plan_id, run_id="",
-            workdir=self.project.root, task_dir=str(prompt_path.parent),
+            workdir=workspace, task_dir=str(prompt_path.parent),
             token_budget=self.config.default_plan_token_budget,
         )
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
-            task=synthetic, workdir=self.project.root, task_dir=str(prompt_path.parent),
+            task=synthetic, workdir=workspace, task_dir=str(prompt_path.parent),
             prompt_path=str(prompt_path), result_path=str(plan_path),
             model=model or (self._main_model() or ""),
             timeout_seconds=self.config.plan_timeout_seconds, purpose="plan",
         )
+        self.audit.log("control-plane", "workspace.created", subject=plan_id,
+                       payload={"expected": workspace, "kind": "plan",
+                                "base_commit": self.project.commit})
         adapter = create_adapter(main)
         outcome = adapter.execute(request)
         self.budget.record(
@@ -199,6 +204,16 @@ class PlanningService:
                                       plan_id=synthetic.plan_id or new_id("plan"))
         except ValidationError:
             return None
+
+    def _plan_workspace(self, plan_id: str) -> str:
+        target = self.paths.plan_workspace(plan_id)
+        try:
+            create_worktree(self.project.root, target, self.project.commit)
+        except Exception as exc:
+            self.audit.log("control-plane", "workspace.create_failed", subject=plan_id,
+                           payload={"expected": str(target), "error": str(exc)[:300]})
+            return str(self.project.root)
+        return str(target)
 
     def _resolve_main(self, main_agent_id: str, model: str) -> AgentRecord:
         current = self.store.get_main_node(self.project.project_id)

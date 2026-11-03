@@ -101,6 +101,12 @@ class WorkspacePaths:
     def worktree_dir(self, run_id: str, task_id: str) -> Path:
         return self.run_dir(run_id) / "worktrees" / task_id
 
+    def run_workspace(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "workspace"
+
+    def plan_workspace(self, plan_id: str) -> Path:
+        return self.planning / plan_id / "workspace"
+
     def verify_dir(self, run_id: str, task_id: str) -> Path:
         return self.run_dir(run_id) / "verify" / task_id
 

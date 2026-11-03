@@ -382,6 +382,19 @@ class Hub:
                        payload={"model": result.get("selected_model", "")})
         return result
 
+    def set_agent_model_programmatically(self, agent_id: str, model: str) -> dict[str, Any]:
+        from .control.interfaces import set_model_programmatically
+        from .gui import profile_for_app
+        agent = self.get_agent(agent_id)
+        profile = profile_for_app(agent.agent_id)
+        app = profile.app if profile else agent.agent_id
+        outcome = set_model_programmatically(app, model, self.config.to_dict())
+        self.audit.log("user", "agent.model_interface", subject=agent_id,
+                       payload={"app": app, "model": model, "outcome": outcome.to_dict()})
+        if outcome.ok:
+            self.model_catalog.select(agent_id, model)
+        return {"agent_id": agent_id, "app": app, **outcome.to_dict()}
+
     def register_agent_models(self, agent_id: str, models: list[str],
                               note: str = "") -> dict[str, Any]:
         result = self.model_catalog.register(agent_id, models, note=note)

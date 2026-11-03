@@ -110,6 +110,15 @@ class HubConfig:
     verify_build: bool = True
     verifier_agent_id: str | None = None
 
+    # Programmatic GUI-agent interface. WorkBuddy's task deeplink uses
+    # welcomeMode code/work/design; "code" is the development mode and maps
+    # to source_mode "craft" in workbuddy.db. GUI clicks are only a fallback.
+    workbuddy_welcome_mode: str = "code"
+    workbuddy_permission_mode: str = "fullAccess"
+    workbuddy_agent_mode: str = "craft"
+    workspace_verify: bool = True
+    interface_restart_timeout_seconds: int = 60
+
     dangerous_command_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_DANGEROUS_PATTERNS))
     high_risk_file_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_HIGH_RISK_FILE_PATTERNS))
 
@@ -165,6 +174,11 @@ class HubConfig:
             "require_independent_verifier": self.require_independent_verifier,
             "verify_build": self.verify_build,
             "verifier_agent_id": self.verifier_agent_id,
+            "workbuddy_welcome_mode": self.workbuddy_welcome_mode,
+            "workbuddy_permission_mode": self.workbuddy_permission_mode,
+            "workbuddy_agent_mode": self.workbuddy_agent_mode,
+            "workspace_verify": self.workspace_verify,
+            "interface_restart_timeout_seconds": self.interface_restart_timeout_seconds,
             "dangerous_command_patterns": self.dangerous_command_patterns,
             "high_risk_file_patterns": self.high_risk_file_patterns,
             "excluded_paths": self.excluded_paths,

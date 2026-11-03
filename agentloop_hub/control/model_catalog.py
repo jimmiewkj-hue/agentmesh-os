@@ -15,6 +15,7 @@ from typing import Any
 
 from ..adapters.discovery import DiscoveryContext, detect_models_for_agent
 from ..config import HubConfig
+from .interfaces import list_qoder_models, list_workbuddy_models
 from ..errors import NotFoundError, ValidationError
 from ..models import AgentRecord, Project
 from ..storage.repo import Store
@@ -108,7 +109,14 @@ class ModelCatalogService:
         agents = [self._agent(agent_id)] if agent_id else self.store.list_agents()
         refreshed: list[dict[str, Any]] = []
         for agent in agents:
-            detected = detect_models_for_agent(agent, self.discovery_ctx)
+            detected = list(detect_models_for_agent(agent, self.discovery_ctx))
+            if agent.agent_id == "workbuddy":
+                for row in list_workbuddy_models():
+                    detected.extend([row["id"], row["name"]])
+            elif agent.agent_id == "qoder_cn":
+                for row in list_qoder_models():
+                    detected.extend([row["id"], row["name"]])
+            detected = sorted({str(item) for item in detected if str(item).strip()})
             if detected:
                 self.store.replace_discovered_models(
                     self.project.project_id, agent.agent_id, detected,

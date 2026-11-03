@@ -16,9 +16,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..control.interfaces import (
+    prepare_qoder_session, prepare_workbuddy_task, qoder_model_key,
+    set_model_programmatically, verify_qoder_session, verify_workbuddy_task,
+    workbuddy_model_key,
+)
 from ..gui import (
     GUI_ERROR_CODES, GuiAutomationError, GuiProfile, GuiReply, WindowsGuiDriver,
-    create_reader, profile_for_app, resolve_model_key,
+    create_reader, find_window, profile_for_app, resolve_model_key,
 )
 from ..models import AgentRecord, ResultPackage
 from ..util import (
@@ -49,21 +54,51 @@ class GuiAutomationAdapter(BaseAdapter):
         screenshots: list[str] = []
         reply: GuiReply | None = None
         driver = self._driver
+        interface_info: dict[str, Any] = {"method": "gui"}
         try:
             profile = self._profile()
+            prompt_text = read_text(request.prompt_path)
+            if not prompt_text.strip():
+                raise GuiAutomationError("GUI_SEND_FAILED", "prompt.md 为空")
+            prompt_with_marker = (
+                prompt_text
+                + "\n\n---\n"
+                + f"<!-- {MARKER_PREFIX}: {marker} -->\n"
+            )
             driver = driver or WindowsGuiDriver(profile, self.config, log_path=log_path)
             reader = self._reader or create_reader(profile, self.config)
-            window = driver.attach()
-            _log(log_path, "attached", window=window)
-            if hasattr(driver, "prepare_new_task"):
-                try:
-                    if driver.prepare_new_task():
-                        _log(log_path, "new_task_ready")
-                except Exception as exc:
-                    _log(log_path, "new_task_failed", error=str(exc))
+            interface_info = self._prepare_interface(
+                profile, request, prompt_with_marker, marker, log_path, started_epoch,
+            )
+            window = self._attach(driver, profile)
+            _log(log_path, "attached", window=window, method=interface_info.get("method"))
+            model_key = interface_info.get("model_key") or \
+                resolve_model_key(request.model, profile.model_aliases)
 
-            model_key = resolve_model_key(request.model, profile.model_aliases)
-            if model_key:
+            if interface_info.get("method") == "qoder_db_transcript" and model_key:
+                # Evidence: Qoder resumes the model from encrypted session
+                # state; writing .models/default + chat_sessions.model +
+                # transcript runtime-config still produced the old model on
+                # the next turn.  GUI selection is therefore an explicit
+                # fallback, with the reason recorded.
+                try:
+                    if driver.select_model(model_key):
+                        interface_info["model_method"] = "gui_fallback"
+                        _log(log_path, "model_gui_fallback", model=model_key,
+                             reason="Qoder runtime resumes encrypted session model; "
+                                    "programmatic write not authoritative")
+                except Exception as exc:
+                    _log(log_path, "model_gui_fallback_failed", model=model_key,
+                         error=str(exc))
+
+            if interface_info.get("method") == "gui":
+                if hasattr(driver, "prepare_new_task"):
+                    try:
+                        if driver.prepare_new_task():
+                            _log(log_path, "new_task_ready")
+                    except Exception as exc:
+                        _log(log_path, "new_task_failed", error=str(exc))
+            if interface_info.get("method") == "gui" and model_key:
                 if profile.model_switch_supported:
                     if not driver.select_model(model_key):
                         raise GuiAutomationError(
@@ -85,16 +120,10 @@ class GuiAutomationAdapter(BaseAdapter):
             shot = driver.screenshot(before_shot)
             if shot:
                 screenshots.append(shot)
-            prompt_text = read_text(request.prompt_path)
-            if not prompt_text.strip():
-                raise GuiAutomationError("GUI_SEND_FAILED", "prompt.md 为空")
-            prompt_with_marker = (
-                prompt_text
-                + "\n\n---\n"
-                + f"<!-- {MARKER_PREFIX}: {marker} -->\n"
-            )
-            driver.send_prompt(prompt_with_marker)
-            _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_with_marker))
+            prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
+            driver.send_prompt(prompt_to_send)
+            _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                 method=interface_info.get("method"))
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
             reply = reader.wait_reply(
                 marker, started_at=started_epoch, timeout=timeout,
@@ -103,11 +132,22 @@ class GuiAutomationAdapter(BaseAdapter):
             )
             _log(log_path, "reply_received", session_id=reply.session_id,
                  model=reply.model, events=reply.events, chars=len(reply.text))
+            verify = interface_info.get("verify")
+            if verify:
+                outcome = verify()
+                interface_info["verify"] = outcome.to_dict()
+                _log(log_path, "interface_verify", **outcome.to_dict())
+                if not outcome.ok:
+                    raise GuiAutomationError(
+                        outcome.error_code or "WORKSPACE_MISMATCH",
+                        outcome.reason or "程序接口回读校验失败",
+                        details=outcome.to_dict(),
+                    )
             shot = driver.screenshot(after_shot)
             if shot:
                 screenshots.append(shot)
             return self._finish_success(request, reply, profile, model_key, screenshots,
-                                        log_path, started)
+                                        log_path, started, interface_info)
         except GuiAutomationError as exc:
             if driver:
                 try:
@@ -125,7 +165,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 duration_ms=_duration_ms(started), session_id=(reply.session_id if reply else ""),
                 extras={"gui_app": profile.app if 'profile' in locals() else "",
                         "screenshots": screenshots, "error_code": exc.code,
-                        "details": exc.details},
+                        "details": exc.details, "interface": interface_info},
                 text=(reply.text if reply else ""),
                 result_payload=None, result_path=request.result_path,
             )
@@ -143,6 +183,96 @@ class GuiAutomationAdapter(BaseAdapter):
                     driver.close()
                 except Exception:
                     pass
+
+    # -- programmatic interface -------------------------------------------
+    def _prepare_interface(self, profile: GuiProfile, request: ExecutionRequest,
+                           prompt_with_marker: str, marker: str,
+                           log_path: Path, started_epoch: float) -> dict[str, Any]:
+        """Use the agent's own launch/store interface before touching the GUI."""
+        app = str(profile.app or "")
+        workspace = str(request.workdir or "")
+        if self._driver is not None or self._reader is not None:
+            return {"method": "gui", "fallback_reason": "injected stub driver/reader"}
+        if not workspace:
+            return {"method": "gui", "fallback_reason": "no workspace"}
+        if app == "workbuddy":
+            model_key = workbuddy_model_key(request.model)
+            welcome = str(self.config.get("workbuddy_welcome_mode") or "code")
+            permission = str(self.config.get("workbuddy_permission_mode") or "fullAccess")
+            prompt_dir = ensure_dir(Path(workspace) / ".agentmesh")
+            prompt_copy = prompt_dir / "interface-prompt.md"
+            atomic_write_text(prompt_copy, prompt_with_marker)
+            short_prompt = (
+                f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
+                "完成后按其中的输出契约写结果。\n"
+                f"<!-- {MARKER_PREFIX}: {marker} -->\n"
+            )
+            outcome = prepare_workbuddy_task(
+                workspace=workspace, model=request.model, prompt=short_prompt,
+                welcome_mode=welcome, permission_mode=permission, config=self.config,
+            )
+            _log(log_path, "interface_prepare", app=app, **outcome.to_dict())
+            if not outcome.ok:
+                raise GuiAutomationError(
+                    outcome.error_code or "WORKSPACE_SWITCH_FAILED",
+                    outcome.reason or "WorkBuddy 深链接准备失败",
+                    details={**outcome.to_dict(), "prompt_copy": str(prompt_copy)},
+                )
+            return {
+                "method": "workbuddy_deeplink", "model_key": model_key,
+                "short_prompt": short_prompt, "prepare": outcome.to_dict(),
+                "prompt_file": str(prompt_copy),
+                "verify": lambda: verify_workbuddy_task(
+                    workspace=workspace, model=request.model,
+                    started_at=started_epoch, welcome_mode=welcome,
+                    permission_mode=permission, config=self.config,
+                ),
+            }
+        if app == "qoder_cn":
+            model_key = qoder_model_key(request.model) or "dfmodel"
+            outcome = prepare_qoder_session(
+                workspace=workspace, model=model_key, config=self.config,
+            )
+            _log(log_path, "interface_prepare", app=app, **outcome.to_dict())
+            if not outcome.ok:
+                fallback = set_model_programmatically(
+                    "qoder_cn", request.model, self.config,
+                ) if request.model else None
+                _log(log_path, "interface_fallback", reason=outcome.reason,
+                     fallback=(fallback.to_dict() if fallback else {}),
+                     note="工作区切换没有 GUI 兜底，直接中止")
+                raise GuiAutomationError(
+                    outcome.error_code or "WORKSPACE_SWITCH_FAILED",
+                    outcome.reason or "Qoder 会话工作区写入失败",
+                    details={**outcome.to_dict(),
+                             "fallback": fallback.to_dict() if fallback else {}},
+                )
+            return {
+                "method": "qoder_db_transcript", "model_key": model_key,
+                "prepare": outcome.to_dict(),
+                "verify": lambda: verify_qoder_session(
+                    workspace=workspace, model=request.model,
+                    started_at=started_epoch, config=self.config,
+                    session_id=str(outcome.evidence.get("session_id") or ""),
+                ),
+            }
+        return {"method": "gui", "fallback_reason": f"{app} 未实现程序接口"}
+
+    def _attach(self, driver: Any, profile: GuiProfile) -> dict[str, Any]:
+        deadline = time.monotonic() + max(20.0, float(profile.launch_timeout_seconds))
+        while time.monotonic() < deadline:
+            try:
+                if find_window(profile.window_title):
+                    return driver.attach()
+            except Exception:
+                break
+            time.sleep(1.0)
+        return driver.attach()
+
+    def set_model_programmatically(self, model: str) -> dict[str, Any]:
+        outcome = set_model_programmatically(self.agent.product or self.agent.agent_id,
+                                             model, self.config)
+        return outcome.to_dict()
 
     def health(self) -> dict[str, Any]:
         try:
@@ -163,7 +293,8 @@ class GuiAutomationAdapter(BaseAdapter):
     # -- result assembly -------------------------------------------------
     def _finish_success(self, request: ExecutionRequest, reply: GuiReply,
                         profile: GuiProfile, model_key: str, screenshots: list[str],
-                        log_path: Path, started: float) -> ExecutionOutcome:
+                        log_path: Path, started: float,
+                        interface_info: dict[str, Any] | None = None) -> ExecutionOutcome:
         usage = self._usage(reply, request, profile)
         purpose = str(request.purpose or "task")
         payload = read_json(request.result_path)
@@ -197,6 +328,14 @@ class GuiAutomationAdapter(BaseAdapter):
                 payload = self._build_task_result(request, reply, profile, model_key,
                                                   screenshots, usage)
                 write_json(request.result_path, payload)
+        interface_info = interface_info or {"method": "gui"}
+        if payload is not None:
+            evidence = payload.get("evidence")
+            if isinstance(evidence, list):
+                evidence.append(
+                    f"interface: {interface_info.get('method')} "
+                    f"workspace={interface_info.get('prepare', {}).get('expected', {}).get('workspace', '')}"
+                )
         return ExecutionOutcome(
             status="completed", text=reply.text[-20000:], usage=usage,
             tool_calls=reply.tool_calls, result_payload=payload,
@@ -205,7 +344,7 @@ class GuiAutomationAdapter(BaseAdapter):
             extras={"gui_app": profile.app, "window_title": profile.window_title,
                     "model": reply.model, "model_key": model_key,
                     "transcript": reply.transcript_path, "screenshots": screenshots,
-                    "events": reply.events},
+                    "events": reply.events, "interface": interface_info},
         )
 
     def _build_task_result(self, request: ExecutionRequest, reply: GuiReply,

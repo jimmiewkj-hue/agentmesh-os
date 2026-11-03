@@ -38,15 +38,26 @@ def qoder_cn_profile() -> GuiProfile:
         input_ratio=(0.524, 0.804),
         input_double_click=True,
         new_task_ratio=(0.036, 0.072),
-        model_selector_ratio=None,
-        model_item_ratio={},
+        # Measured 2026-11-03 on Qoder CN 0.5.1: selector at bottom-right,
+        # menu items appear above it.  These ratios are only used as the
+        # explicit fallback after the programmatic model write is verified
+        # not to affect the running runtime.
+        model_selector_ratio=(0.738, 0.894),
+        model_item_ratio={
+            "dfmodel": (0.669, 0.636),
+            "gfmodel": (0.669, 0.741),
+        },
         model_aliases={
             "dfmodel": "dfmodel",
             "DeepSeek-Flash": "dfmodel",
             "DeepSeek Flash": "dfmodel",
             "deepseek-flash": "dfmodel",
+            "gfmodel": "gfmodel",
+            "GLM-5.3-Flash": "gfmodel",
+            "GLM 5.3 Flash": "gfmodel",
+            "glm-5.3-flash": "gfmodel",
         },
-        model_switch_supported=False,
+        model_switch_supported=True,
         display_model="DeepSeek-Flash",
         launch_timeout_seconds=120,
         timeout_seconds=1800,
