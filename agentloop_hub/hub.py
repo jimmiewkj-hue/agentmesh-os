@@ -129,7 +129,8 @@ class Hub:
             self._write_project_yaml(existing)
             from .workspace.gitops import add_info_exclude
             add_info_exclude(self.root, [".agentloop/", ".agentloop-task/",
-                                         ".agentmesh/", ".workbuddy/"])
+                                         ".agentmesh/", ".workbuddy/",
+                                         "__pycache__/", ".pytest_cache/"])
             return existing
         info = detect_repo(self.root)
         if not info.get("is_git"):
@@ -141,7 +142,8 @@ class Hub:
         self._write_project_yaml(project)
         from .workspace.gitops import add_info_exclude
         add_info_exclude(self.root, [".agentloop/", ".agentloop-task/",
-                                     ".agentmesh/", ".workbuddy/"])
+                                     ".agentmesh/", ".workbuddy/",
+                                     "__pycache__/", ".pytest_cache/"])
         self._new_project = True
         return project
 
