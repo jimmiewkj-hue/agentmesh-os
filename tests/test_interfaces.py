@@ -136,23 +136,27 @@ def test_qoder_verification_detects_workspace_and_model_mismatch(tmp_path):
     workspace = r"D:\run\ws"
     db = _qoder_db(tmp_path / "main.sqlite", cwd=workspace, model="dfmodel")
     _qoder_transcript(tmp_path / "projects", workspace, "qoder-sess", model="dfmodel")
-    ok = iface.verify_qoder_session(workspace=workspace, model="DeepSeek-Flash",
-                                    started_at=0, config={"qoder_db": str(db),
-                                                          "qoder_projects": str(tmp_path / "projects")})
+    ok = iface.verify_qoder_session(
+        workspace=workspace, model="DeepSeek-Flash", started_at=0,
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects"),
+                "qoder_daemon_log": str(tmp_path / "no-daemon.log")},
+    )
     assert ok.ok
 
     _qoder_transcript(tmp_path / "projects2", r"D:\other", "qoder-sess",
                       model="dfmodel", workspace_event=r"D:\other")
     bad = iface.verify_qoder_session(
         workspace=r"D:\run\ws2", model="DeepSeek-Flash", started_at=0,
-        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects2")},
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects2"),
+                "qoder_daemon_log": str(tmp_path / "no-daemon.log")},
     )
     assert bad.error_code == "WORKSPACE_MISMATCH"
 
     _qoder_transcript(tmp_path / "projects3", workspace, "qoder-sess", model="dfmodel")
     wrong_model = iface.verify_qoder_session(
         workspace=workspace, model="GLM-5.3-Flash", started_at=0,
-        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects3")},
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects3"),
+                "qoder_daemon_log": str(tmp_path / "no-daemon.log")},
     )
     assert wrong_model.error_code == "GUI_MODEL_SWITCH_FAILED"
 
@@ -178,10 +182,32 @@ def test_qoder_prepare_session_moves_transcript_and_updates_db(tmp_path, monkeyp
     assert new_path.exists()
     verify = iface.verify_qoder_session(
         workspace=workspace, model="DeepSeek-Flash", started_at=0,
-        config={"qoder_db": str(db), "qoder_projects": str(projects)},
+        config={"qoder_db": str(db), "qoder_projects": str(projects),
+                "qoder_daemon_log": str(tmp_path / "no-daemon.log")},
         session_id="qoder-sess",
     )
     assert verify.ok, verify
+
+
+def test_qoder_daemon_cwd_mismatch_is_detected(tmp_path):
+    workspace = r"D:\run\daemon-ws"
+    db = _qoder_db(tmp_path / "main.sqlite", cwd=workspace, model="dfmodel")
+    _qoder_transcript(tmp_path / "projects", workspace, "qoder-sess", model="dfmodel")
+    daemon_log = tmp_path / "qoder-agent-sdk.log"
+    daemon_log.write_text(
+        "[DaemonSession] sessionId=x session opened cwd=C:\\Users\\<user> workerArgs=47\n",
+        encoding="utf-8",
+    )
+    parsed = iface.qoder_daemon_cwd({"qoder_daemon_log": str(daemon_log)})
+    assert parsed["cwd"] == r"C:\Users\<user>"
+    outcome = iface.verify_qoder_session(
+        workspace=workspace, model="DeepSeek-Flash", started_at=0,
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects"),
+                "qoder_daemon_log": str(daemon_log)},
+        session_id="qoder-sess",
+    )
+    assert outcome.error_code == "WORKSPACE_MISMATCH"
+    assert "daemon open_session cwd" in outcome.reason
 
 
 def test_set_model_programmatically_writes_qoder_default(tmp_path):

@@ -634,6 +634,34 @@ def prepare_qoder_session(*, workspace: str, model: str,
     )
 
 
+def qoder_daemon_cwd(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read the last ``open_session cwd=`` from the Qoder SDK daemon log.
+
+    The SDK request is ``open_session({worker_args, cwd})``; the daemon logs
+    the effective cwd.  This is the authoritative runtime workspace, unlike
+    the desktop DB/site state.
+    """
+    configured = str((config or {}).get("qoder_daemon_log") or "").strip()
+    if configured:
+        candidates = [Path(configured)]
+    else:
+        appdata = Path(os.environ.get("APPDATA") or _home() / "AppData" / "Roaming")
+        root = appdata / "com.qodercn.app.stable" / "logs"
+        candidates = sorted(root.glob("*/qodercli/qoder-agent-sdk.log"),
+                            key=lambda p: p.stat().st_mtime, reverse=True) \
+            if root.exists() else []
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        matches = re.findall(r"session opened cwd=(.*?) workerArgs=", text)
+        if matches:
+            return {"cwd": matches[-1].strip(), "log": str(path),
+                    "sessions": len(matches)}
+    return {"cwd": "", "log": "", "sessions": 0}
+
+
 def verify_qoder_session(*, workspace: str, model: str, started_at: float,
                          config: dict[str, Any] | None = None,
                          session_id: str = "") -> InterfaceOutcome:
@@ -687,8 +715,14 @@ def verify_qoder_session(*, workspace: str, model: str, started_at: float,
     actual["transcript_model"] = runtime_model
     actual["transcript_workspace"] = workspace_dirs[-1] if workspace_dirs else ""
     actual["completed"] = completed
+    daemon = qoder_daemon_cwd(config)
+    actual["daemon_cwd"] = daemon.get("cwd", "")
+    evidence["daemon_log"] = daemon.get("log", "")
     code, reason = "", ""
-    if not workspace_dirs or _norm_path(workspace_dirs[-1]) != _norm_path(workspace):
+    if daemon.get("cwd") and _norm_path(daemon["cwd"]) != _norm_path(workspace):
+        code = "WORKSPACE_MISMATCH"
+        reason = f"daemon open_session cwd={daemon['cwd']}，期望 {workspace}"
+    elif not workspace_dirs or _norm_path(workspace_dirs[-1]) != _norm_path(workspace):
         code = "WORKSPACE_MISMATCH"
         reason = f"期望工作区 {workspace}，实际 transcript={workspace_dirs[-1] if workspace_dirs else '(无)'}"
     elif runtime_model and runtime_model != expected["model"]:
