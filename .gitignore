@@ -1,0 +1,56 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Runtime workspaces, logs, evidence ---
+logs/
+.screenshots/
+.agentloop/
+.agentloop-task/
+*.log
+*.jsonl
+
+# --- AgentHub runtime data (state / task packages / caches) ---
+.agentloop/**/state.db
+state.db
+runs/
+patches/
+checkpoints/
+handoffs/
+relay/
+
+# --- Local credentials / secrets / model caches ---
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+secrets.json
+token.json
+*.token
+model-cache/
+models-cache/
+.cache/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# --- Share/export artifacts ---
+.trae-html-share-packages/

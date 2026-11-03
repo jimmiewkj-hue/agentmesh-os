@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentMesh OS 指挥中心</title>
+<style>
+:root{
+  --bg:#f4f6f8; --panel:#ffffff; --ink:#17212b; --muted:#64748b; --line:#e2e8f0;
+  --accent:#0f766e; --accent-2:#115e59; --warn:#b45309; --danger:#b91c1c; --ok:#15803d;
+  --info:#1d4ed8; --radius:10px; --shadow:0 1px 2px rgba(15,23,42,.06),0 8px 24px rgba(15,23,42,.05);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+a{color:var(--accent)}
+button{cursor:pointer;border:1px solid var(--line);background:#fff;color:var(--ink);padding:7px 12px;border-radius:8px;font:inherit}
+button:hover{border-color:#cbd5e1;background:#f8fafc}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:var(--accent-2)}
+button.danger{color:var(--danger);border-color:#fecaca;background:#fff5f5}
+button.small{padding:3px 8px;font-size:12px}
+button.ghost{background:transparent}
+input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);font:inherit}
+textarea{min-height:96px;resize:vertical;font-family:Consolas,"Cascadia Mono",monospace;font-size:13px}
+label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
+.layout{display:grid;grid-template-columns:214px 1fr;min-height:100vh}
+aside{background:#0f172a;color:#e2e8f0;padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}
+.brand{font-weight:700;font-size:17px;letter-spacing:.2px;margin-bottom:4px}
+.brand small{display:block;font-weight:400;color:#94a3b8;font-size:11px;letter-spacing:0}
+nav{margin-top:22px;display:flex;flex-direction:column;gap:4px}
+nav a{color:#cbd5e1;text-decoration:none;padding:9px 11px;border-radius:8px;font-size:13px}
+nav a.active,nav a:hover{background:#1e293b;color:#fff}
+.nav-group{font-size:11px;color:#64748b;margin:14px 4px 4px;letter-spacing:.5px}
+.aside-foot{font-size:11px;color:#94a3b8;word-break:break-all;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px}
+main{padding:22px 26px 60px;max-width:1560px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:18px}
+h1{font-size:21px;margin:0 0 4px}
+h2{font-size:16px;margin:22px 0 10px}
+h3{font-size:14px;margin:0 0 8px}
+.sub{color:var(--muted);font-size:12px}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;border:1px solid var(--line);background:#fff;margin-right:6px}
+.pill.ok{color:var(--ok);border-color:#bbf7d0;background:#f0fdf4}
+.pill.warn{color:var(--warn);border-color:#fde68a;background:#fffbeb}
+.pill.bad{color:var(--danger);border-color:#fecaca;background:#fef2f2}
+.pill.info{color:var(--info);border-color:#bfdbfe;background:#eff6ff}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px;margin-bottom:14px}
+.card.step{padding:18px}
+.step-head{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+.step-no{width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex:0 0 auto}
+.grid{display:grid;gap:14px}
+.grid.two{grid-template-columns:1fr 1fr}
+.grid.three{grid-template-columns:repeat(3,1fr)}
+@media(max-width:1100px){.grid.two,.grid.three{grid-template-columns:1fr}.layout{grid-template-columns:1fr}aside{position:relative;height:auto}nav{flex-direction:row;flex-wrap:wrap}.aside-foot{position:relative}}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row>*{flex:0 0 auto}
+.row .grow{flex:1 1 240px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:4px 12px;font-size:13px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-word}
+.bar{height:8px;background:#e2e8f0;border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#0f766e,#14b8a6)}
+.table{width:100%;border-collapse:collapse;font-size:13px}
+.table th,.table td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.table th{color:var(--muted);font-weight:600;font-size:12px}
+.table tr:hover td{background:#f8fafc}
+.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
+pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;max-height:360px;font-size:12px;white-space:pre-wrap}
+.muted{color:var(--muted)}
+.empty{color:var(--muted);padding:18px;text-align:center;border:1px dashed var(--line);border-radius:8px}
+.tag{display:inline-block;padding:1px 7px;border-radius:6px;background:#f1f5f9;color:#334155;font-size:11px;margin:2px 4px 2px 0}
+.toast{position:fixed;right:20px;bottom:20px;background:#0f172a;color:#fff;padding:11px 15px;border-radius:9px;font-size:13px;max-width:420px;opacity:0;transform:translateY(8px);transition:.2s;z-index:20}
+.toast.show{opacity:1;transform:none}
+.toast.error{background:#7f1d1d}
+svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.node{cursor:pointer}
+.node rect{fill:#fff;stroke:#cbd5e1;rx:8}
+.node text{font-size:11px;fill:#17212b}
+.node .st{font-size:9px;fill:#64748b}
+.node.completed rect{stroke:#86efac;fill:#f0fdf4}
+.node.failed rect,.node.blocked rect{stroke:#fca5a5;fill:#fef2f2}
+.node.running rect,.node.verifying rect{stroke:#93c5fd;fill:#eff6ff}
+.node.waiting_user rect,.node.paused rect{stroke:#fcd34d;fill:#fffbeb}
+.edge{stroke:#cbd5e1;fill:none;marker-end:url(#arrow)}
+.section{display:none}.section.active{display:block}
+.check{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px dashed var(--line);font-size:12px;gap:12px}
+.check b{font-weight:600}
+.plan-box{border-left:3px solid var(--accent);padding-left:12px}
+.hint{font-size:12px;color:var(--muted);margin:6px 0}
+.split{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}
+@media(max-width:1100px){.split{grid-template-columns:1fr}}
+.console{background:#0b1220;color:#cbd5e1;font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;height:340px;overflow:auto;padding:10px 12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}
+.console .bus{color:#93c5fd}.console .logs{color:#cbd5e1}.console .sys{color:#34d399}.console .err{color:#fca5a5}
+.banner{border:1px dashed #fcd34d;background:#fffbeb;color:#92400e;padding:12px;border-radius:8px;margin-bottom:12px}
+.models-row{display:grid;grid-template-columns:1.2fr .9fr 1fr auto auto;gap:8px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--line)}
+@media(max-width:1100px){.models-row{grid-template-columns:1fr}}
+.drift{border-left:3px solid #f59e0b;background:#fffbeb;padding:10px 12px;border-radius:6px;margin-bottom:8px}
+.timeline{border-left:2px solid var(--line);padding-left:12px;margin-left:6px}
+.timeline .item{margin:0 0 12px;position:relative}
+.timeline .dot{position:absolute;left:-17px;top:5px;width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.small-text{font-size:12px}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="brand">AgentMesh OS<small>本地多 Agent 协同操作系统</small></div>
+  <nav id="nav">
+    <div class="nav-group">统一入口</div>
+    <a href="#command" data-view="command">指挥中心</a>
+    <div class="nav-group">高级视图</div>
+    <a href="#agents" data-view="agents">Agent 管理</a>
+    <a href="#versions" data-view="versions">Agent 版本</a>
+    <a href="#graph" data-view="graph">任务图</a>
+    <a href="#task" data-view="task">任务详情</a>
+    <a href="#approvals" data-view="approvals">人类治理</a>
+    <a href="#bus" data-view="bus">Context Bus</a>
+    <a href="#audit" data-view="audit">成本与审计</a>
+  </nav>
+  <div class="aside-foot" id="dataDir">未打开项目</div>
+</aside>
+<main>
+  <header>
+    <div>
+      <h1 id="projectName">AgentMesh OS 指挥中心</h1>
+      <div class="sub" id="projectMeta">初始化项目目录，输入需求，选配主/子 Agent 与模型。</div>
+    </div>
+    <div class="row" id="topBadges"></div>
+  </header>
+
+  <section class="section active" id="view-command">
+    <div id="workspaceBanner"></div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">1</div><div><h3>项目目录</h3><div class="sub">创建或打开一个 Git 项目；AgentMesh 数据保存在项目内 .agentloop/。</div></div></div>
+      <div class="row">
+        <input id="wsPath" class="grow" placeholder="例如 D:\projects\my-app">
+        <input id="wsName" placeholder="项目名称（可选）" style="max-width:200px">
+        <button class="primary" onclick="initWorkspace()">初始化项目</button>
+        <button onclick="openWorkspace()">打开已有项目</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="budgetTokens" type="number" min="0" placeholder="项目 token 预算（0 表示不限）" style="max-width:260px">
+        <button onclick="saveBudget()">保存预算</button>
+        <span class="sub">计费 token 不含缓存 token；达到 80% 会在顶部告警。</span>
+      </div>
+      <div id="wsInfo" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">2</div><div><h3>原始 Prompt</h3><div class="sub">直接输入需求。主 Agent 负责理解、拆分任务并生成计划，关键决策仍由你审批。</div></div></div>
+      <textarea id="goal" placeholder="例如：审查登录模块的安全问题，修复高风险漏洞并补充测试；不要修改数据库结构。"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" onclick="requestPlan()">生成任务计划</button>
+        <button onclick="importPlanPrompt()">导入已有计划 JSON</button>
+        <span class="sub" id="jobStatus"></span>
+      </div>
+      <div id="planResult" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">3</div><div><h3>指挥中心：主 / 子 Agent 与模型</h3><div class="sub">模型列表全部来自本机真实探测或用户登记，不虚构。主 Agent 负责规划，子 Agent 参与任务调度。</div></div></div>
+      <div class="grid two">
+        <div>
+          <h3>主 Agent</h3>
+          <label>Agent（负责需求理解与规划）</label>
+          <select id="mainAgent" onchange="onMainAgentChange()"></select>
+          <label>模型（来自该 Agent 的模型清单）</label>
+          <select id="mainModelSelect" onchange="syncMainCustom()"></select>
+          <label>或手填模型名</label>
+          <input id="mainModel" placeholder="provider/model">
+          <label>主节点预算（tokens，0 表示使用项目预算）</label>
+          <input id="mainBudget" type="number" min="0" value="0">
+          <div class="row" style="margin-top:10px">
+            <button class="primary" onclick="saveMain()">保存主节点</button>
+            <button onclick="autoMain()">自动选择主节点</button>
+            <button onclick="discoverAgents()">重新探测 Agent</button>
+            <button onclick="refreshModels()">刷新全部模型</button>
+          </div>
+          <div id="mainInfo" class="sub" style="margin-top:10px"></div>
+        </div>
+        <div>
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <h3>子 Agent 模型编排</h3>
+            <span class="sub" id="modelSummary"></span>
+          </div>
+          <div id="subAgents"><div class="empty">尚未打开项目或没有 Agent</div></div>
+          <div class="hint">选择模型后立即保存到该 Agent；任务执行、规划与验证都会优先使用这里的选配结果。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">4</div><div><h3>计划审批与运行</h3><div class="sub">架构设计 → 计划批准 → 执行 → 验收 → 合并 → 发布，每一步都由你决定。</div></div></div>
+      <div class="grid two">
+        <div>
+          <h3>待审批</h3>
+          <div id="commandApprovals"></div>
+        </div>
+        <div>
+          <h3>最近运行</h3>
+          <div id="commandRun"></div>
+        </div>
+      </div>
+      <h3 style="margin-top:14px">计划列表</h3>
+      <div id="commandPlans"></div>
+    </div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">5</div><div><h3>实时全量监控</h3><div class="sub">SSE 实时流：Context Bus 事件、Agent 日志、任务状态、成本、审批与版本漂移。</div></div></div>
+      <div class="row" style="margin-bottom:10px">
+        <button class="primary" onclick="connectStream()">连接实时流</button>
+        <button onclick="disconnectStream()">断开</button>
+        <button onclick="clearConsole()">清空控制台</button>
+        <select id="streamRun" style="max-width:320px" onchange="connectStream()"></select>
+        <span class="pill" id="streamStatus">未连接</span>
+      </div>
+      <div id="liveStats" class="grid two" style="margin-bottom:12px"></div>
+      <div class="console" id="liveConsole"></div>
+      <h3 style="margin-top:14px">任务实时状态</h3>
+      <div id="liveTasks"></div>
+    </div>
+
+    <div class="card">
+      <h3>七个模块</h3>
+      <div id="moduleStatus"></div>
+    </div>
+
+    <div class="card">
+      <h3>历史会话导入</h3>
+      <div class="row">
+        <select id="sessionAgent" style="max-width:260px"></select>
+        <input id="sessionLimit" type="number" min="1" max="200" value="10" style="max-width:100px">
+        <button onclick="importSessions()">导入最近会话</button>
+        <span class="sub">只导入与当前项目路径匹配的会话</span>
+      </div>
+      <div id="conversations" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section class="section" id="view-agents">
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" onclick="discoverAgents()">探测本机 Agent</button>
+      <button onclick="refreshModels()">刷新模型清单</button>
+      <span class="sub">L0 人工接力 / L1 文件协同 / L2 结构化任务 / L3 会话级 / L4 原生双向</span>
+    </div>
+    <div id="mcpPanel"></div>
+    <div id="agentCards" class="grid three"></div>
+  </section>
+
+  <section class="section" id="view-versions">
+    <div class="card">
+      <h3>Agent 软件版本与兼容漂移</h3>
+      <div class="sub">每次探测都会记录版本、适配器、能力与模型指纹；升级后能力退化会显示为“漂移”。</div>
+      <div id="driftBox" style="margin-top:10px"></div>
+    </div>
+    <div class="card"><h3>版本台账</h3><div id="versionTable"></div></div>
+    <div class="card"><h3>版本历史</h3><div id="versionHistory" class="muted">点击上表“历史”查看某个 Agent 的版本记录。</div></div>
+  </section>
+
+  <section class="section" id="view-graph">
+    <div class="card">
+      <h3>任务依赖图 <span class="sub" id="graphRun"></span></h3>
+      <svg class="dag" id="dag" viewBox="0 0 900 380" preserveAspectRatio="none"></svg>
+      <div class="sub" style="margin-top:8px">点击节点查看任务详情；箭头表示前置依赖。</div>
+    </div>
+    <div class="card"><div id="graphTasks"></div></div>
+  </section>
+
+  <section class="section" id="view-task">
+    <div class="split">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h3 id="taskTitle">未选择任务</h3>
+          <div class="row" id="taskActions"></div>
+        </div>
+        <div id="taskBody" class="muted">从任务图或列表中选择一个任务。</div>
+      </div>
+      <div class="card">
+        <h3>提交 / 回滚</h3>
+        <label>接力成果 JSON（粘贴或填写文件路径）</label>
+        <textarea id="resultInput" placeholder='{"task_id": "...", ...} 或 C:\path\result.json'></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" onclick="submitResult()">提交成果包</button>
+          <button onclick="retryTask()">重试任务</button>
+          <button class="danger" onclick="cancelTask()">取消任务</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="loadPatch()">查看 Patch</button>
+          <button class="danger" onclick="rollbackTask()">回滚该任务</button>
+        </div>
+        <pre id="patchBox" style="display:none"></pre>
+        <label style="margin-top:10px">运行日志</label>
+        <pre id="logBox">选择任务后加载</pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="view-approvals">
+    <div class="card">
+      <h3>人类治理门禁</h3>
+      <div class="sub">架构设计 → 计划批准 → 验收确认 → 代码合并 → 发布审批。AI 负责执行，关键决策必须由用户做出。</div>
+      <div id="governanceStatus" style="margin-top:10px"></div>
+    </div>
+    <div id="approvalCards"></div>
+  </section>
+
+  <section class="section" id="view-bus">
+    <div class="grid two">
+      <div class="card">
+        <h3>总线统计</h3>
+        <div id="busStats"></div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="verifyBus()">验证哈希链</button>
+          <button onclick="refreshBus()">刷新事件</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>订阅与游标</h3>
+        <div id="busSubs"></div>
+        <label>订阅者</label>
+        <input id="busSubscriber" placeholder="例如 worker-a / main-node / external-tool">
+        <div class="row" style="margin-top:8px">
+          <button class="primary" onclick="subscribeBus()">订阅</button>
+          <button onclick="pollBus()">消费一次</button>
+        </div>
+        <label>订阅 ID</label>
+        <input id="busSubId" placeholder="sub_...">
+      </div>
+    </div>
+    <div class="card">
+      <h3>事件流 <span class="sub">Prompt / Response / File Change / Task State / Knowledge / Workflow</span></h3>
+      <div id="busEvents"></div>
+    </div>
+  </section>
+
+  <section class="section" id="view-audit">
+    <div class="grid two">
+      <div class="card"><h3>成本总览</h3><div id="costCards"></div></div>
+      <div class="card"><h3>审计链</h3><div id="auditSummary"></div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="verifyAudit()">验证审计链</button>
+          <button onclick="runRecover()">崩溃恢复检查</button>
+          <button onclick="loadRecovery()">查看未完成状态</button>
+        </div>
+      </div>
+    </div>
+    <div class="card"><h3>成本优化与 Agent 基准</h3><div id="optimizerCards"></div></div>
+    <div class="card"><h3>成本明细</h3><div id="usageTable"></div></div>
+    <div class="card"><h3>审计事件</h3><div id="auditEvents"></div></div>
+    <div class="card"><h3>统一记忆（Level 1-5）</h3><div id="memoryList"></div></div>
+  </section>
+
+  <div class="toast" id="toast"></div>
+</main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
