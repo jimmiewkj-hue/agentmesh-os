@@ -48,10 +48,12 @@ def qoder_cn_profile() -> GuiProfile:
         model_menu_scroll_ratio=(0.584, 0.620),
         model_item_ratio={
             "dfmodel": (0.584, 0.734),
+            "gmodel": (0.584, 0.781),
             "gfmodel": (0.584, 0.781),
         },
         model_item_ratio_home={
             "dfmodel": (0.674, 0.734),
+            "gmodel": (0.674, 0.781),
             "gfmodel": (0.674, 0.781),
         },
         workspace_row_ratio=(0.070, 0.282),
@@ -61,6 +63,8 @@ def qoder_cn_profile() -> GuiProfile:
             "DeepSeek-Flash": "dfmodel",
             "DeepSeek Flash": "dfmodel",
             "deepseek-flash": "dfmodel",
+            "gmodel": "gmodel",
+            "GLM-5.3": "gmodel",
             "gfmodel": "gfmodel",
             "GLM-5.3-Flash": "gfmodel",
             "GLM 5.3 Flash": "gfmodel",
