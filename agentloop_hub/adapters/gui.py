@@ -136,10 +136,13 @@ class GuiAutomationAdapter(BaseAdapter):
             _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
                  method=interface_info.get("method"))
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
+            # Never stall earlier than the measured profile threshold; the
+            # discovery-written adapter_config may still carry an old 90s.
+            stall_seconds = max(float(self.config.get("stall_seconds") or 0),
+                                float(profile.stall_seconds))
             reply = reader.wait_reply(
                 marker, started_at=started_epoch, timeout=timeout,
-                stall_seconds=float(self.config.get("stall_seconds") or profile.stall_seconds),
-                expected_model=model_key,
+                stall_seconds=stall_seconds, expected_model=model_key,
             )
             _log(log_path, "reply_received", session_id=reply.session_id,
                  model=reply.model, events=reply.events, chars=len(reply.text))
