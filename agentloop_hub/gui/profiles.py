@@ -70,7 +70,7 @@ def qoder_cn_profile() -> GuiProfile:
         display_model="DeepSeek-Flash",
         launch_timeout_seconds=120,
         timeout_seconds=1800,
-        stall_seconds=90,
+        stall_seconds=300,
     )
 
 
@@ -101,7 +101,9 @@ def workbuddy_profile() -> GuiProfile:
         display_model="GLM-5.3-Flash",
         launch_timeout_seconds=120,
         timeout_seconds=1800,
-        stall_seconds=90,
+        # GLM-5.3-Flash can reason for several minutes without emitting a
+        # transcript event; 90s wrongly reported GUI_STALLED mid-task.
+        stall_seconds=300,
     )
 
 
