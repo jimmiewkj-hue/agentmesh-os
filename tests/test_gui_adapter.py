@@ -192,6 +192,51 @@ def test_gui_adapter_model_mismatch_uses_reader_expected_model(tmp_path):
     assert outcome.error_code == "GUI_MODEL_SWITCH_FAILED"
 
 
+def test_no_gui_mode_forbids_gui_model_fallback(tmp_path):
+    request = make_request(tmp_path)
+    adapter = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=StubReader(),
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "no_gui_fallback": True},
+    )
+    outcome = adapter.execute(request)
+    assert outcome.status == "failed"
+    assert outcome.error_code == "MODEL_GUI_FORBIDDEN"
+
+
+def test_set_model_qoder_uses_db_transcript_path(tmp_path, monkeypatch):
+    from agentloop_hub.adapters import gui as gui_module
+    from agentloop_hub.control.interfaces import InterfaceOutcome
+
+    calls = []
+
+    def fake_prepare(*, workspace, model, config=None):
+        calls.append((workspace, model))
+        return InterfaceOutcome(True, "db_write", {"workspace": workspace, "model": model},
+                                {"model": model}, evidence={"session_id": "sess-db"})
+
+    monkeypatch.setattr(gui_module, "prepare_qoder_session", fake_prepare)
+    adapter = GuiAutomationAdapter(make_agent(), config={
+        "mode": "gui_automation", "gui_app": "qoder_cn",
+        "no_gui_fallback": True,
+    })
+    result = adapter.set_model("DeepSeek-Flash", workspace=str(tmp_path / "ws"))
+    assert result["ok"] is True
+    assert result["path"] == "db+transcript"
+    assert result["actual"] == "dfmodel"
+    assert calls == [(str(tmp_path / "ws"), "dfmodel")]
+
+
+def test_set_model_without_workspace_is_unsupported(tmp_path):
+    adapter = GuiAutomationAdapter(make_agent(), config={
+        "mode": "gui_automation", "gui_app": "qoder_cn",
+        "no_gui_fallback": True,
+    })
+    with pytest.raises(GuiAutomationError) as info:
+        adapter.set_model("DeepSeek-Flash")
+    assert info.value.code == "MODEL_SWITCH_UNSUPPORTED"
+
+
 def test_auto_executable_gui_requires_online_agent_and_profile():
     online = make_agent(status="online")
     assert is_auto_executable(online) is True

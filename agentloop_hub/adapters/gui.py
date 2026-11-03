@@ -9,6 +9,7 @@ completion, then returns a strict structured result package.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -41,6 +42,8 @@ class GuiAutomationAdapter(BaseAdapter):
         super().__init__(agent, config)
         self._driver = driver
         self._reader = reader
+        self.no_gui = (str(self.config.get("no_gui_fallback") or "").lower() in ("1", "true", "yes")
+                       or os.environ.get("AGENTMESH_DISABLE_GUI_INPUT") == "1")
 
     # -- public contract -------------------------------------------------
     def execute(self, request: ExecutionRequest) -> ExecutionOutcome:
@@ -76,33 +79,39 @@ class GuiAutomationAdapter(BaseAdapter):
                 resolve_model_key(request.model, profile.model_aliases)
 
             if interface_info.get("method") == "qoder_db_transcript":
-                # The desktop restores its last route after the restart; the
-                # run workspace is listed first because prepare bumped it, so
-                # activate the row and open a new task inside it.  Without
-                # this the chat keeps running in the previous workspace.
-                time.sleep(2.0)
-                try:
-                    if driver.select_workspace(Path(request.workdir).name):
-                        _log(log_path, "workspace_selected", workspace=request.workdir)
-                except Exception as exc:
-                    _log(log_path, "workspace_select_failed", error=str(exc))
-            if interface_info.get("method") == "qoder_db_transcript" and model_key:
-                # Evidence: Qoder resumes the model from encrypted session
-                # state; writing .models/default + chat_sessions.model +
-                # transcript runtime-config still produced the old model on
-                # the next turn.  GUI selection is therefore an explicit
-                # fallback, with the reason recorded.
+                if self.no_gui:
+                    # prepare_qoder_session already wrote the model into
+                    # main.sqlite and the transcript runtime-config; the
+                    # desktop restores that session on restart, so neither the
+                    # workspace nor the model needs a mouse click.
+                    _log(log_path, "model_programmatic", model=model_key,
+                         path="db+transcript", no_gui=True)
+                else:
+                    # The desktop restores its last route after the restart;
+                    # activate the workspace row and open a new task inside it.
+                    time.sleep(2.0)
+                    try:
+                        if driver.select_workspace(Path(request.workdir).name):
+                            _log(log_path, "workspace_selected", workspace=request.workdir)
+                    except Exception as exc:
+                        _log(log_path, "workspace_select_failed", error=str(exc))
+            if interface_info.get("method") == "qoder_db_transcript" and model_key and not self.no_gui:
+                # Diagnostic-only GUI fallback; forbidden in zero-mouse mode.
                 try:
                     if driver.select_model(model_key):
                         interface_info["model_method"] = "gui_fallback"
                         _log(log_path, "model_gui_fallback", model=model_key,
-                             reason="Qoder runtime resumes encrypted session model; "
-                                    "programmatic write not authoritative")
+                             reason="diagnostic fallback")
                 except Exception as exc:
                     _log(log_path, "model_gui_fallback_failed", model=model_key,
                          error=str(exc))
 
             if interface_info.get("method") == "gui":
+                if self.no_gui:
+                    raise GuiAutomationError(
+                        "MODEL_GUI_FORBIDDEN",
+                        "零鼠标模式没有可用的程序化模型接口，禁止回退到 GUI 点击",
+                    )
                 if hasattr(driver, "prepare_new_task"):
                     try:
                         if driver.prepare_new_task():
@@ -132,9 +141,19 @@ class GuiAutomationAdapter(BaseAdapter):
             if shot:
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
-            driver.send_prompt(prompt_to_send)
-            _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                 method=interface_info.get("method"))
+            if interface_info.get("method") == "workbuddy_deeplink":
+                # The deep link already submitted the prompt with the model;
+                # sending it a second time would duplicate the turn.
+                _log(log_path, "prompt_already_submitted", marker=marker,
+                     chars=len(prompt_to_send), method="deeplink")
+            elif self.no_gui and hasattr(driver, "send_prompt_keyboard"):
+                driver.send_prompt_keyboard(prompt_to_send)
+                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                     method=interface_info.get("method"), input="keyboard")
+            else:
+                driver.send_prompt(prompt_to_send)
+                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                     method=interface_info.get("method"))
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
             # Never stall earlier than the measured profile threshold; the
             # discovery-written adapter_config may still carry an old 90s.
@@ -287,6 +306,8 @@ class GuiAutomationAdapter(BaseAdapter):
         return {"method": "gui", "fallback_reason": f"{app} 未实现程序接口"}
 
     def _attach(self, driver: Any, profile: GuiProfile) -> dict[str, Any]:
+        if self._driver is not None:
+            return driver.attach()
         deadline = time.monotonic() + max(20.0, float(profile.launch_timeout_seconds))
         while time.monotonic() < deadline:
             try:
@@ -296,6 +317,104 @@ class GuiAutomationAdapter(BaseAdapter):
                 break
             time.sleep(1.0)
         return driver.attach()
+
+    def set_model(self, model_key: str, *, workspace: str = "",
+                  log_path: str | Path | None = None) -> dict[str, Any]:
+        """Switch the agent's model through its programmatic interface.
+
+        Qoder: main.sqlite + transcript runtime-config (the desktop restores
+        the migrated session on restart). WorkBuddy: task deep link (no mouse
+        events) followed by the session DB read-back.
+        """
+        started = time.monotonic()
+        profile = self._profile()
+        app = str(profile.app or "")
+        evidence: dict[str, Any] = {"path": "", "requested": model_key}
+        try:
+            if app == "qoder_cn":
+                key = qoder_model_key(model_key)
+                target = workspace or str(self.config.get("model_probe_workspace") or "")
+                if not key:
+                    raise GuiAutomationError("MODEL_UNAVAILABLE", "模型为空")
+                if not target:
+                    raise GuiAutomationError(
+                        "MODEL_SWITCH_UNSUPPORTED",
+                        "Qoder 程序化模型切换需要 workspace（用于迁移会话）",
+                    )
+                outcome = prepare_qoder_session(workspace=target, model=key,
+                                                config=self.config)
+                evidence.update({"path": "db+transcript", "actual": key,
+                                 "session_id": outcome.evidence.get("session_id", ""),
+                                 "evidence": outcome.evidence})
+                if not outcome.ok:
+                    raise GuiAutomationError(
+                        outcome.error_code or "MODEL_SWITCH_UNSUPPORTED",
+                        outcome.reason or "Qoder 程序化模型写入失败",
+                        details=outcome.to_dict(),
+                    )
+                evidence["ok"] = True
+            elif app == "workbuddy":
+                key = workbuddy_model_key(model_key)
+                target = workspace or str(self.config.get("model_probe_workspace") or "")
+                if not key:
+                    raise GuiAutomationError("MODEL_UNAVAILABLE", "模型为空")
+                if not target:
+                    raise GuiAutomationError(
+                        "MODEL_SWITCH_UNSUPPORTED",
+                        "WorkBuddy 程序化模型切换需要 workspace",
+                    )
+                probe = (f"模型切换探针：只回复一行 AGENTMESH_MODEL_PROBE_OK。\n"
+                         f"<!-- {MARKER_PREFIX}: {uuid.uuid4().hex} -->\n")
+                outcome = prepare_workbuddy_task(
+                    workspace=target, model=model_key, prompt=probe,
+                    welcome_mode=str(self.config.get("workbuddy_welcome_mode") or "code"),
+                    permission_mode=str(self.config.get("workbuddy_permission_mode") or "fullAccess"),
+                    config=self.config,
+                )
+                evidence.update({"path": "deeplink", "actual": key,
+                                 "evidence": outcome.evidence})
+                if not outcome.ok:
+                    raise GuiAutomationError(
+                        outcome.error_code or "MODEL_SWITCH_UNSUPPORTED",
+                        outcome.reason or "WorkBuddy 深链接模型写入失败",
+                        details=outcome.to_dict(),
+                    )
+                row = None
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    from ..control.interfaces import _newest_workbuddy_session, workbuddy_db_path
+                    row = _newest_workbuddy_session(workbuddy_db_path(self.config),
+                                                    started_at=outcome.evidence["started_at"],
+                                                    workspace=target)
+                    if row and str(row.get("model") or "") == key:
+                        break
+                    time.sleep(0.5)
+                if not row:
+                    raise GuiAutomationError("MODEL_SWITCH_UNSUPPORTED",
+                                             "WorkBuddy 深链接没有创建会话")
+                evidence["actual"] = row.get("model", "")
+                evidence["session_id"] = row.get("session_id", "")
+                evidence["ok"] = str(row.get("model") or "") == key
+                if not evidence["ok"]:
+                    raise GuiAutomationError(
+                        "MODEL_MISMATCH",
+                        f"期望模型 {key}，实际 {row.get('model')}",
+                        details=evidence,
+                    )
+            else:
+                raise GuiAutomationError("MODEL_SWITCH_UNSUPPORTED",
+                                         f"{app} 没有程序化模型接口")
+            evidence["duration_ms"] = int((time.monotonic() - started) * 1000)
+            if log_path:
+                _log(Path(log_path), "model_switch", **evidence)
+            return evidence
+        except GuiAutomationError as exc:
+            evidence.update({"ok": False, "error_code": exc.code,
+                             "reason": exc.message,
+                             "duration_ms": int((time.monotonic() - started) * 1000)})
+            if log_path:
+                _log(Path(log_path), "model_switch", **evidence)
+            raise
 
     def set_model_programmatically(self, model: str) -> dict[str, Any]:
         outcome = set_model_programmatically(self.agent.product or self.agent.agent_id,

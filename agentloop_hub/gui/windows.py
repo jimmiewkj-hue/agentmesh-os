@@ -396,6 +396,51 @@ class WindowsGuiDriver:
                  selector=list(selector), item=list(item))
         return True
 
+    def _focus_no_click(self) -> None:
+        """Raise the window without any mouse event (zero-mouse mode)."""
+        if not self.hwnd:
+            raise GuiAutomationError("GUI_WINDOW_NOT_FOUND", "尚未 attach 窗口")
+        user32.ShowWindow(self.hwnd, 9)
+        user32.SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetForegroundWindow(self.hwnd)
+        user32.BringWindowToTop(self.hwnd)
+        time.sleep(0.5)
+        foreground = int(user32.GetForegroundWindow())
+        if foreground != self.hwnd:
+            current_tid = int(kernel32.GetCurrentThreadId())
+            fg_tid = int(user32.GetWindowThreadProcessId(wintypes.HWND(foreground), None))
+            attached = False
+            try:
+                attached = bool(user32.AttachThreadInput(current_tid, fg_tid, True))
+                user32.SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+                user32.SetForegroundWindow(self.hwnd)
+                user32.BringWindowToTop(self.hwnd)
+                time.sleep(0.5)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(current_tid, fg_tid, False)
+        if int(user32.GetForegroundWindow()) != self.hwnd:
+            raise GuiAutomationError("GUI_FOCUS_FAILED", "零鼠标模式无法获得窗口焦点")
+
+    def send_prompt_keyboard(self, text: str) -> None:
+        """Type/paste and submit without clicking or moving the cursor."""
+        self._focus_no_click()
+        _key_event(VK_CONTROL, 0)
+        _press(VK_A)
+        _key_event(VK_CONTROL, KEYEVENTF_KEYUP)
+        time.sleep(0.1)
+        _set_clipboard(text)
+        _key_event(VK_CONTROL, 0)
+        _press(VK_V)
+        _key_event(VK_CONTROL, KEYEVENTF_KEYUP)
+        time.sleep(0.8)
+        submit = SUBMIT_KEYS.get(str(self.config.get("submit_key") or self.profile.submit_key).upper(),
+                                 VK_RETURN)
+        _press(submit)
+        self.log("send_prompt_keyboard", chars=len(text))
+
     def send_prompt(self, text: str) -> None:
         self._focus()
         # First click activates the window, second click focuses the editor.
