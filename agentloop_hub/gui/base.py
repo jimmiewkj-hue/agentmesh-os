@@ -72,6 +72,7 @@ class GuiProfile:
     input_double_click: bool = True
     new_task_ratio: tuple[float, float] | None = None
     submit_key: str = "ENTER"
+    submit_button_ratio: tuple[float, float] | None = None
     model_selector_ratio: tuple[float, float] | None = None
     model_menu_scroll_ratio: tuple[float, float] | None = None
     model_item_ratio: dict[str, tuple[float, float]] = field(default_factory=dict)

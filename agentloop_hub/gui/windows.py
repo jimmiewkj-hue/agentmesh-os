@@ -368,7 +368,13 @@ class WindowsGuiDriver:
         submit = SUBMIT_KEYS.get(str(self.config.get("submit_key") or self.profile.submit_key).upper(),
                                  VK_RETURN)
         _press(submit)
-        self.log("send_prompt", chars=len(text), input_ratio=list(self.profile.input_ratio))
+        if self.profile.submit_button_ratio:
+            # Large pastes in Qoder CN become an attachment chip and Enter
+            # does not submit; click the explicit send button instead.
+            time.sleep(0.8)
+            self.click_ratio(self.profile.submit_button_ratio, times=1)
+        self.log("send_prompt", chars=len(text), input_ratio=list(self.profile.input_ratio),
+                 submit_button=list(self.profile.submit_button_ratio or []))
         time.sleep(0.8)
 
     # -- evidence --------------------------------------------------------

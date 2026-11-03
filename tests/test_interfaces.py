@@ -37,14 +37,15 @@ def _qoder_db(path: Path, *, cwd: str, model: str, session_id: str = "qoder-sess
                  "deleted_at integer, product_mode text)")
     conn.execute("create table chat_sessions (session_id text primary key, cwd text, "
                  "workspace_id text, model text, title text, session_kind text, "
-                 "deleted_at integer, updated_at integer)")
+                 "deleted_at integer, updated_at integer, execution_target_json text)")
     conn.execute("create table chat_model_preferences (model_key text primary key, "
                  "visible integer, context_window integer, reasoning_effort text, "
                  "updated_at integer)")
     conn.execute("insert into workspaces values (?,?,?,?,?,?,?,?,?,?)",
                  ("ws-old", "old", "local", json.dumps([cwd]), "{}", 1, 1, 0, None, "coding"))
-    conn.execute("insert into chat_sessions values (?,?,?,?,?,?,?,?)",
-                 (session_id, cwd, "ws-old", model, "probe", "standard", None, 1))
+    conn.execute("insert into chat_sessions values (?,?,?,?,?,?,?,?,?)",
+                 (session_id, cwd, "ws-old", model, "probe", "standard", None, 1,
+                  json.dumps({"workspace": {"id": "ws-old", "path": cwd}})))
     for key in ("dfmodel", "gfmodel"):
         conn.execute("insert into chat_model_preferences values (?,?,?,?,?)",
                      (key, 1, None, None, 1))

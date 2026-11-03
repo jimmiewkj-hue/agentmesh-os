@@ -42,6 +42,7 @@ def qoder_cn_profile() -> GuiProfile:
         # menu items appear above it.  These ratios are only used as the
         # explicit fallback after the programmatic model write is verified
         # not to affect the running runtime.
+        submit_button_ratio=(0.907, 0.894),
         model_selector_ratio=(0.738, 0.894),
         model_item_ratio={
             "dfmodel": (0.669, 0.636),

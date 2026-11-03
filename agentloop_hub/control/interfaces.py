@@ -28,6 +28,7 @@ and is always logged with a reason.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -436,14 +437,25 @@ def prepare_qoder_session(*, workspace: str, model: str,
                                 {}, reason="没有可用的 Qoder 会话",
                                 error_code="WORKSPACE_SWITCH_FAILED")
     ensure_dir(Path(workspace))
+    evidence: dict[str, Any] = {"session_id": current["session_id"], "db": str(db),
+                                "workspace": workspace}
+    try:
+        (stop_process or _stop_process)("Qoder CN")
+        time.sleep(3.0)
+    except Exception as exc:
+        return InterfaceOutcome(
+            False, "db_write", {"workspace": workspace, "model": key}, {},
+            evidence=evidence, reason=f"停止 Qoder 失败: {exc}",
+            error_code="WORKSPACE_SWITCH_FAILED",
+        )
+    current = _qoder_current_session(db) or current
     old_cwd = str(current["cwd"] or "")
     old_transcript = _transcript_for(projects, old_cwd, current["session_id"]) if old_cwd else Path()
     new_transcript = _transcript_for(projects, workspace, current["session_id"])
-    evidence: dict[str, Any] = {
-        "session_id": current["session_id"], "db": str(db),
-        "old_workspace": old_cwd, "workspace": workspace,
-        "old_transcript": str(old_transcript), "new_transcript": str(new_transcript),
-    }
+    evidence.update({
+        "old_workspace": old_cwd, "old_transcript": str(old_transcript),
+        "new_transcript": str(new_transcript),
+    })
     if not old_transcript.exists() and new_transcript.exists():
         old_transcript = new_transcript
     if not old_transcript.exists():
@@ -487,20 +499,125 @@ def prepare_qoder_session(*, workspace: str, model: str,
                 (workspace_id, Path(workspace).name, "local",
                  json.dumps([workspace]), "{}", stamp, stamp, 0, "coding"),
             )
+        target_row = conn.execute(
+            "select execution_target_json from chat_sessions where session_id=?",
+            (current["session_id"],),
+        ).fetchone()
+        target_json = {}
+        try:
+            target_json = json.loads(target_row["execution_target_json"] or "{}") \
+                if target_row else {}
+        except Exception:
+            target_json = {}
+        if isinstance(target_json, dict):
+            ws = target_json.get("workspace")
+            if not isinstance(ws, dict):
+                ws = {}
+            ws["id"] = workspace_id
+            ws["path"] = workspace
+            target_json["workspace"] = ws
         conn.execute(
-            "update chat_sessions set cwd=?, workspace_id=?, model=?, updated_at=? "
-            "where session_id=?",
-            (workspace, workspace_id, key, int(time.time() * 1000),
-             current["session_id"]),
+            "update chat_sessions set cwd=?, workspace_id=?, model=?, "
+            "execution_target_json=?, updated_at=? where session_id=?",
+            (workspace, workspace_id, key, json.dumps(target_json, ensure_ascii=False),
+             int(time.time() * 1000), current["session_id"]),
         )
         conn.commit()
     finally:
         conn.close()
     evidence["workspace_id"] = workspace_id
 
+    # The app restores its last route from Local Storage.  Drop that cache
+    # (after a backup) so the next launch reads the new cwd/workspace from
+    # main.sqlite instead of the old in-memory route.
     try:
-        (stop_process or _stop_process)("Qoder CN")
-        time.sleep(3.0)
+        local = db.parent / "Local Storage" / "leveldb"
+        if local.exists():
+            backup = db.parent / "Local Storage" / f"leveldb.agentmesh-{int(time.time())}"
+            if not backup.exists():
+                shutil.copytree(local, backup)
+            shutil.rmtree(local, ignore_errors=True)
+            evidence["local_storage_reset"] = str(backup)
+    except Exception as exc:
+        evidence["local_storage_reset_error"] = str(exc)
+
+    # Remove every stale copy of this session transcript so neither the
+    # reader nor the runtime can resume an older workspace.
+    try:
+        removed = []
+        for other in projects.rglob(f"{current['session_id']}.jsonl"):
+            if other == new_transcript:
+                continue
+            stale = other.with_suffix(".jsonl.agentmesh-old")
+            if not stale.exists():
+                shutil.copyfile(other, stale)
+            other.unlink()
+            removed.append(str(other))
+        evidence["removed_stale_transcripts"] = removed
+    except Exception as exc:
+        evidence["old_transcript_remove_error"] = str(exc)
+
+    # Move the encrypted per-session state folder; it also carries the
+    # workspace binding for the resumed session.
+    try:
+        old_state = projects / qoder_project_slug(old_cwd) / current["session_id"]
+        new_state = projects / qoder_project_slug(workspace) / current["session_id"]
+        if old_state.exists() and old_state != new_state:
+            # Do not copy the encrypted state: it still carries the old
+            # workspace binding.  Back it up and let the desktop rebuild the
+            # state from main.sqlite + the rewired transcript.
+            backup = old_state.parent / f"{current['session_id']}.agentmesh-old"
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            shutil.move(str(old_state), str(backup))
+            if new_state.exists():
+                stale = new_state.parent / f"{current['session_id']}.agentmesh-old"
+                if stale.exists():
+                    shutil.rmtree(stale, ignore_errors=True)
+                shutil.move(str(new_state), str(stale))
+            evidence["session_state"] = "dropped (backup: " + str(backup) + ")"
+    except Exception as exc:
+        evidence["session_state_error"] = str(exc)
+
+    # The site session file is the third state location the desktop uses to
+    # restore its agent panel.  Point it at the new workspace and keep only
+    # this session so a stale route cannot win.
+    try:
+        sites = _home() / ".qoder-cn" / "sites" / "sessions"
+        ensure_dir(sites)
+        kept = []
+        for path in sorted(sites.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            location = data.get("location") if isinstance(data, dict) else None
+            if not isinstance(location, dict):
+                continue
+            if str(location.get("sessionId") or "") != current["session_id"]:
+                backup = path.with_suffix(".json.agentmesh-old")
+                if not backup.exists():
+                    shutil.copyfile(path, backup)
+                path.unlink()
+                continue
+            location["projectRoot"] = workspace
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            kept.append(str(path))
+        if not kept:
+            name = hashlib.sha256(current["session_id"].encode()).hexdigest() + ".json"
+            path = sites / name
+            path.write_text(json.dumps({
+                "version": 2, "profile": "desktop", "productId": "qoder-cn",
+                "environment": "prod",
+                "location": {"sessionId": current["session_id"],
+                             "workspaceId": None, "projectRoot": workspace},
+            }, ensure_ascii=False), encoding="utf-8")
+            kept.append(str(path))
+        evidence["site_sessions"] = kept
+    except Exception as exc:
+        evidence["site_session_error"] = str(exc)
+
+    try:
         exe = str(config.get("executable") or
                   r"C:\Program Files\Qoder\Qoder CN\Qoder CN.exe")
         (start_app or _start_app)(exe)
