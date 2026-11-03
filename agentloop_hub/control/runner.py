@@ -390,7 +390,8 @@ class RunService:
         adapter = create_adapter(agent)
         outcome = adapter.execute(request)
         interface = (outcome.extras or {}).get("interface") or {}
-        verify = interface.get("verify") or {}
+        verify = interface.get("verify") if isinstance(interface, dict) else {}
+        verify = verify if isinstance(verify, dict) else {}
         if verify:
             self.audit.log("control-plane", "workspace.verified", subject=uid,
                            payload={"expected": verify.get("expected", {}),

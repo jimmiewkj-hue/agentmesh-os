@@ -165,7 +165,9 @@ class GuiAutomationAdapter(BaseAdapter):
                 duration_ms=_duration_ms(started), session_id=(reply.session_id if reply else ""),
                 extras={"gui_app": profile.app if 'profile' in locals() else "",
                         "screenshots": screenshots, "error_code": exc.code,
-                        "details": exc.details, "interface": interface_info},
+                        "details": exc.details,
+                        "interface": {k: ("<callable>" if callable(v) else v)
+                                      for k, v in interface_info.items()}},
                 text=(reply.text if reply else ""),
                 result_payload=None, result_path=request.result_path,
             )
@@ -230,6 +232,14 @@ class GuiAutomationAdapter(BaseAdapter):
             }
         if app == "qoder_cn":
             model_key = qoder_model_key(request.model) or "dfmodel"
+            prompt_dir = ensure_dir(Path(workspace) / ".agentmesh")
+            prompt_copy = prompt_dir / "interface-prompt.md"
+            atomic_write_text(prompt_copy, prompt_with_marker)
+            short_prompt = (
+                f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
+                "完成后按其中的输出契约写结果。\n"
+                f"<!-- {MARKER_PREFIX}: {marker} -->\n"
+            )
             outcome = prepare_qoder_session(
                 workspace=workspace, model=model_key, config=self.config,
             )
@@ -249,6 +259,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 )
             return {
                 "method": "qoder_db_transcript", "model_key": model_key,
+                "short_prompt": short_prompt, "prompt_file": str(prompt_copy),
                 "prepare": outcome.to_dict(),
                 "verify": lambda: verify_qoder_session(
                     workspace=workspace, model=request.model,
