@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -111,6 +112,37 @@ def test_workbuddy_reader_stall_state_is_per_transcript(tmp_path):
         thread.join(timeout=2)
     assert reply.transcript_path == str(done)
     assert reply.text == "final answer"
+
+
+def test_reader_candidates_are_not_crowded_out_by_utility_transcripts(tmp_path):
+    root = tmp_path / "projects"
+    root.mkdir()
+    marker = "AGENTMESH_GUI_MARKER_NOT_CROWDED"
+    marked = root / "marked.jsonl"
+    marked.write_text("\n".join([
+        _event("user", sessionId="marked",
+               message={"role": "user",
+                        "content": [{"type": "text", "text": f"task {marker}"}]}),
+        _event("assistant", sessionId="marked",
+               message={"role": "assistant", "model": "dfmodel", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "OK"}]}),
+    ]) + "\n", encoding="utf-8")
+    now = time.time()
+    os.utime(marked, (now - 1, now - 1))
+    for index in range(30):  # utility sessions are newer than the real chat
+        noise = root / f"noise-{index}.jsonl"
+        noise.write_text(_event("user", sessionId=f"n{index}",
+                                message={"role": "user",
+                                         "content": [{"type": "text", "text": "tick"}]}) + "\n",
+                        encoding="utf-8")
+        os.utime(noise, (now + index * 0.01, now + index * 0.01))
+    reader = QoderCnReader(
+        qoder_cn_profile(),
+        {"data_path": str(root), "poll_seconds": 0.05},
+    )
+    reply = reader.wait_reply(marker, started_at=now - 2, timeout=5,
+                              stall_seconds=5, expected_model="dfmodel")
+    assert reply.session_id == "marked"
 
 
 def test_qoder_reader_uses_answering_model_not_trailing_config(tmp_path):

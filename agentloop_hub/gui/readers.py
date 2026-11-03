@@ -11,7 +11,7 @@ from ..util import now_iso
 from .base import GuiAutomationError, GuiReply, GuiProfile, read_jsonl
 
 
-def _candidate_files(root: Path, started_at: float, *, limit: int = 20) -> list[Path]:
+def _candidate_files(root: Path, started_at: float, *, limit: int = 200) -> list[Path]:
     if not root.exists():
         return []
     files = [p for p in root.rglob("*.jsonl") if p.is_file()]
