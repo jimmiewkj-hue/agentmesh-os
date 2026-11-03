@@ -75,6 +75,17 @@ class GuiAutomationAdapter(BaseAdapter):
             model_key = interface_info.get("model_key") or \
                 resolve_model_key(request.model, profile.model_aliases)
 
+            if interface_info.get("method") == "qoder_db_transcript":
+                # The desktop restores its last route after the restart; the
+                # run workspace is listed first because prepare bumped it, so
+                # activate the row and open a new task inside it.  Without
+                # this the chat keeps running in the previous workspace.
+                time.sleep(2.0)
+                try:
+                    if driver.select_workspace(Path(request.workdir).name):
+                        _log(log_path, "workspace_selected", workspace=request.workdir)
+                except Exception as exc:
+                    _log(log_path, "workspace_select_failed", error=str(exc))
             if interface_info.get("method") == "qoder_db_transcript" and model_key:
                 # Evidence: Qoder resumes the model from encrypted session
                 # state; writing .models/default + chat_sessions.model +
@@ -134,7 +145,10 @@ class GuiAutomationAdapter(BaseAdapter):
                  model=reply.model, events=reply.events, chars=len(reply.text))
             verify = interface_info.get("verify")
             if verify:
-                outcome = verify()
+                if callable(verify):
+                    outcome = verify(reply.session_id)
+                else:
+                    outcome = verify
                 interface_info["verify"] = outcome.to_dict()
                 _log(log_path, "interface_verify", **outcome.to_dict())
                 if not outcome.ok:
@@ -224,7 +238,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 "method": "workbuddy_deeplink", "model_key": model_key,
                 "short_prompt": short_prompt, "prepare": outcome.to_dict(),
                 "prompt_file": str(prompt_copy),
-                "verify": lambda: verify_workbuddy_task(
+                "verify": lambda _sid="": verify_workbuddy_task(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, welcome_mode=welcome,
                     permission_mode=permission, config=self.config,
@@ -261,10 +275,10 @@ class GuiAutomationAdapter(BaseAdapter):
                 "method": "qoder_db_transcript", "model_key": model_key,
                 "short_prompt": short_prompt, "prompt_file": str(prompt_copy),
                 "prepare": outcome.to_dict(),
-                "verify": lambda: verify_qoder_session(
+                "verify": lambda sid="": verify_qoder_session(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, config=self.config,
-                    session_id=str(outcome.evidence.get("session_id") or ""),
+                    session_id=sid or str(outcome.evidence.get("session_id") or ""),
                 ),
             }
         return {"method": "gui", "fallback_reason": f"{app} 未实现程序接口"}

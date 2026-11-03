@@ -38,16 +38,18 @@ def qoder_cn_profile() -> GuiProfile:
         input_ratio=(0.524, 0.804),
         input_double_click=True,
         new_task_ratio=(0.036, 0.072),
-        # Measured 2026-11-03 on Qoder CN 0.5.1: selector at bottom-right,
-        # menu items appear above it.  These ratios are only used as the
-        # explicit fallback after the programmatic model write is verified
-        # not to affect the running runtime.
-        submit_button_ratio=(0.907, 0.894),
-        model_selector_ratio=(0.738, 0.894),
+        # Re-measured 2026-11-03 against the 1336x808 window: selector sits
+        # left of the mic at (0.678, 0.907); the menu opens above it and
+        # DeepSeek-Flash / GLM-5.3 are the 6th / 7th rows.
+        submit_button_ratio=(0.749, 0.907),
+        model_selector_ratio=(0.678, 0.907),
+        model_menu_scroll_ratio=(0.584, 0.620),
         model_item_ratio={
-            "dfmodel": (0.669, 0.636),
-            "gfmodel": (0.669, 0.741),
+            "dfmodel": (0.584, 0.734),
+            "gfmodel": (0.584, 0.781),
         },
+        workspace_row_ratio=(0.070, 0.282),
+        workspace_new_task_ratio=(0.177, 0.282),
         model_aliases={
             "dfmodel": "dfmodel",
             "DeepSeek-Flash": "dfmodel",

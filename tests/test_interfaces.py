@@ -180,6 +180,16 @@ def test_qoder_prepare_session_moves_transcript_and_updates_db(tmp_path, monkeyp
     assert row == (workspace, "dfmodel")
     new_path = projects / iface.qoder_project_slug(workspace) / "qoder-sess.jsonl"
     assert new_path.exists()
+    # The next turn answers with the model written by prepare; the old
+    # assistant events still carry the previous model, so append the run's
+    # answering event before verifying.
+    with new_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "type": "assistant", "sessionId": "qoder-sess",
+            "message": {"role": "assistant", "model": "dfmodel",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "OK"}]},
+        }) + "\n")
     verify = iface.verify_qoder_session(
         workspace=workspace, model="DeepSeek-Flash", started_at=0,
         config={"qoder_db": str(db), "qoder_projects": str(projects),
@@ -208,6 +218,59 @@ def test_qoder_daemon_cwd_mismatch_is_detected(tmp_path):
     )
     assert outcome.error_code == "WORKSPACE_MISMATCH"
     assert "daemon open_session cwd" in outcome.reason
+
+
+def test_qoder_daemon_cwd_lookup_is_per_session(tmp_path):
+    workspace = r"D:\agentmesh-e2e\q1-20261103"
+    db = _qoder_db(tmp_path / "main.sqlite", cwd=workspace, model="dfmodel",
+                   session_id="44264eef")
+    _qoder_transcript(tmp_path / "projects", workspace, "44264eef")
+    daemon_log = tmp_path / "qoder-agent-sdk.log"
+    daemon_log.write_text(
+        "[DaemonSession] sessionId=44264eef session opened cwd=D:\\agentmesh-e2e\\q1-20261103 workerArgs=69\n"
+        "[DaemonSession] sessionId=bb70ac03 session opened cwd=C:\\Users\\<user> workerArgs=49\n",
+        encoding="utf-8",
+    )
+    parsed = iface.qoder_daemon_cwd({"qoder_daemon_log": str(daemon_log)},
+                                    session_id="44264eef")
+    assert parsed["session_cwd"] == workspace
+    assert parsed["last_cwd"] == r"C:\Users\<user>"
+    outcome = iface.verify_qoder_session(
+        workspace=workspace, model="DeepSeek-Flash", started_at=0,
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects"),
+                "qoder_daemon_log": str(daemon_log)},
+        session_id="44264eef",
+    )
+    assert outcome.ok, outcome
+    assert outcome.actual["daemon_session_cwd"] == workspace
+
+
+def test_qoder_verify_uses_answering_model_over_trailing_runtime_config(tmp_path):
+    workspace = r"D:\run\model-ws"
+    db = _qoder_db(tmp_path / "main.sqlite", cwd=workspace, model="dfmodel")
+    folder = tmp_path / "projects" / iface.qoder_project_slug(workspace)
+    folder.mkdir(parents=True)
+    path = folder / "qoder-sess.jsonl"
+    events = [
+        {"type": "workspace-directories", "sessionId": "qoder-sess",
+         "directories": [workspace]},
+        {"type": "assistant", "sessionId": "qoder-sess",
+         "message": {"role": "assistant", "model": "dfmodel", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "OK"}]}},
+        # The desktop writes the next turn's config after the reply; it must
+        # not override the model that actually answered.
+        {"type": "runtime-config", "sessionId": "qoder-sess", "model": "auto"},
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    outcome = iface.verify_qoder_session(
+        workspace=workspace, model="DeepSeek-Flash", started_at=0,
+        config={"qoder_db": str(db), "qoder_projects": str(tmp_path / "projects"),
+                "qoder_daemon_log": str(tmp_path / "no-daemon.log")},
+        session_id="qoder-sess",
+    )
+    assert outcome.ok, outcome
+    assert outcome.actual["transcript_model"] == "dfmodel"
+    assert outcome.actual["runtime_config_model"] == "auto"
 
 
 def test_set_model_programmatically_writes_qoder_default(tmp_path):

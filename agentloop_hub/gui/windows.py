@@ -307,6 +307,27 @@ class WindowsGuiDriver:
         self.log("new_task", ratio=list(self.profile.new_task_ratio))
         return True
 
+    def select_workspace(self, workspace: str = "") -> bool:
+        """Open a new task inside the workspace row prepared for this run.
+
+        ``prepare_qoder_session`` inserts the run workspace and the desktop
+        lists the most recently updated workspace first, so the row sits at
+        a stable ratio.  The row must be activated before the inline ``+``
+        creates a task in that workspace.
+        """
+        row = self.profile.workspace_row_ratio
+        plus = self.profile.workspace_new_task_ratio
+        if not row or not plus:
+            return False
+        self._focus()
+        self.click_ratio(row, times=1)
+        time.sleep(0.8)
+        self.click_ratio(plus, times=1)
+        time.sleep(1.5)
+        self.log("select_workspace", workspace=workspace,
+                 row=list(row), new_task=list(plus))
+        return True
+
     def scroll_ratio(self, ratio: tuple[float, float], notches: int) -> None:
         left, top, right, bottom = self.rect
         x = left + int((right - left) * float(ratio[0]))
@@ -334,7 +355,7 @@ class WindowsGuiDriver:
             )
         self._focus()
         self.click_ratio(selector, times=1)
-        time.sleep(0.9)
+        time.sleep(1.5)
         # The menu auto-scrolls to the currently selected model. Reset to the
         # top so the measured GLM-5.3-Flash row is stable regardless of the
         # previous selection (e.g. after a mistaken Kimi/Hy click).
@@ -368,9 +389,11 @@ class WindowsGuiDriver:
         submit = SUBMIT_KEYS.get(str(self.config.get("submit_key") or self.profile.submit_key).upper(),
                                  VK_RETURN)
         _press(submit)
-        if self.profile.submit_button_ratio:
-            # Large pastes in Qoder CN become an attachment chip and Enter
-            # does not submit; click the explicit send button instead.
+        if self.profile.submit_button_ratio and \
+                str(self.config.get("submit_mode") or "").lower() == "button":
+            # Long pastes become an attachment chip and Enter does not submit;
+            # button mode is opt-in because the same spot is the "stop"
+            # control while a reply is streaming.
             time.sleep(0.8)
             self.click_ratio(self.profile.submit_button_ratio, times=1)
         self.log("send_prompt", chars=len(text), input_ratio=list(self.profile.input_ratio),

@@ -634,12 +634,15 @@ def prepare_qoder_session(*, workspace: str, model: str,
     )
 
 
-def qoder_daemon_cwd(config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Read the last ``open_session cwd=`` from the Qoder SDK daemon log.
+def qoder_daemon_cwd(config: dict[str, Any] | None = None,
+                     session_id: str = "") -> dict[str, Any]:
+    """Read ``sessionId=... session opened cwd=`` from the Qoder SDK daemon log.
 
     The SDK request is ``open_session({worker_args, cwd})``; the daemon logs
-    the effective cwd.  This is the authoritative runtime workspace, unlike
-    the desktop DB/site state.
+    the effective cwd per daemon session.  The daemon session id equals the
+    desktop chat session id that ran the turn, so a per-session lookup is the
+    authoritative runtime workspace (utility sessions share the same log and
+    usually run in the home directory).
     """
     configured = str((config or {}).get("qoder_daemon_log") or "").strip()
     if configured:
@@ -655,11 +658,25 @@ def qoder_daemon_cwd(config: dict[str, Any] | None = None) -> dict[str, Any]:
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        matches = re.findall(r"session opened cwd=(.*?) workerArgs=", text)
-        if matches:
-            return {"cwd": matches[-1].strip(), "log": str(path),
-                    "sessions": len(matches)}
-    return {"cwd": "", "log": "", "sessions": 0}
+        pairs = re.findall(r"sessionId=(\S+) session opened cwd=(.*?) workerArgs=", text)
+        if pairs:
+            per_session = {sid: cwd.strip() for sid, cwd in pairs}
+            wanted = str(session_id or "").strip()
+            chosen = per_session.get(wanted, "") if wanted else ""
+            return {
+                "cwd": chosen or pairs[-1][1].strip(),
+                "session_id": wanted if chosen else pairs[-1][0],
+                "session_cwd": chosen,
+                "last_cwd": pairs[-1][1].strip(),
+                "sessions": len(pairs), "log": str(path),
+            }
+        legacy = re.findall(r"session opened cwd=(.*?) workerArgs=", text)
+        if legacy:
+            return {"cwd": legacy[-1].strip(), "session_id": "",
+                    "session_cwd": "", "last_cwd": legacy[-1].strip(),
+                    "sessions": len(legacy), "log": str(path)}
+    return {"cwd": "", "session_id": "", "session_cwd": "", "last_cwd": "",
+            "sessions": 0, "log": ""}
 
 
 def verify_qoder_session(*, workspace: str, model: str, started_at: float,
@@ -668,8 +685,11 @@ def verify_qoder_session(*, workspace: str, model: str, started_at: float,
     projects = qoder_projects_root(config)
     db = qoder_db_path(config)
     conn = _qoder_connect(db)
+    started_ms = int(float(started_at) * 1000) - 2000
     try:
         if session_id:
+            # The GUI creates a fresh chat session for the run; the id comes
+            # from the transcript the adapter already read the reply from.
             row = conn.execute(
                 "select session_id, cwd, workspace_id, model from chat_sessions where session_id=?",
                 (session_id,),
@@ -677,24 +697,34 @@ def verify_qoder_session(*, workspace: str, model: str, started_at: float,
         else:
             row = conn.execute(
                 "select session_id, cwd, workspace_id, model from chat_sessions "
-                "order by updated_at desc limit 1"
+                "where deleted_at is null and session_kind='standard' and cwd=? "
+                "and updated_at >= ? order by updated_at desc limit 1",
+                (workspace, started_ms),
             ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "select session_id, cwd, workspace_id, model from chat_sessions "
+                    "order by updated_at desc limit 1"
+                ).fetchone()
     finally:
         conn.close()
     expected = {"workspace": workspace, "model": qoder_model_key(model)}
     if not row:
         return InterfaceOutcome(False, "transcript_read", expected, {},
                                 reason="Qoder 会话不存在", error_code="WORKSPACE_MISMATCH")
-    transcript = _transcript_for(projects, workspace, str(row["session_id"]))
+    sid = str(row["session_id"])
+    transcript = _transcript_for(projects, workspace, sid)
+    if not transcript.exists() and row["cwd"]:
+        transcript = _transcript_for(projects, str(row["cwd"]), sid)
     if not transcript.exists():
-        # The runtime may still be writing to the old folder; search this session.
-        candidates = sorted(projects.rglob(f"{row['session_id']}.jsonl"),
+        candidates = sorted(projects.rglob(f"{sid}.jsonl"),
                             key=lambda p: p.stat().st_mtime, reverse=True)
         transcript = candidates[0] if candidates else transcript
     actual: dict[str, Any] = {"workspace": row["cwd"], "model": row["model"],
-                              "session_id": row["session_id"]}
+                              "session_id": sid}
     evidence: dict[str, Any] = {"db": str(db), "transcript": str(transcript)}
     runtime_model = ""
+    assistant_model = ""
     workspace_dirs: list[str] = []
     completed = False
     if transcript.exists():
@@ -709,26 +739,37 @@ def verify_qoder_session(*, workspace: str, model: str, started_at: float,
                 runtime_model = str(event["model"])
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             if message.get("model") and event.get("type") == "assistant":
-                runtime_model = str(message["model"])
+                # The answering model is authoritative; runtime-config may
+                # trail the assistant event and describe the next turn.
+                assistant_model = str(message["model"])
                 if message.get("stop_reason") == "end_turn":
                     completed = True
-    actual["transcript_model"] = runtime_model
+    effective_model = assistant_model or runtime_model
+    actual["runtime_config_model"] = runtime_model
+    actual["transcript_model"] = effective_model
     actual["transcript_workspace"] = workspace_dirs[-1] if workspace_dirs else ""
     actual["completed"] = completed
-    daemon = qoder_daemon_cwd(config)
+    daemon = qoder_daemon_cwd(config, session_id=sid)
     actual["daemon_cwd"] = daemon.get("cwd", "")
+    actual["daemon_session_cwd"] = daemon.get("session_cwd", "")
+    actual["daemon_session_id"] = daemon.get("session_id", "")
+    actual["daemon_last_cwd"] = daemon.get("last_cwd", "")
     evidence["daemon_log"] = daemon.get("log", "")
     code, reason = "", ""
-    if daemon.get("cwd") and _norm_path(daemon["cwd"]) != _norm_path(workspace):
+    if session_id and daemon.get("log") and not daemon.get("session_cwd"):
+        code = "WORKSPACE_MISMATCH"
+        reason = (f"daemon open_session cwd 未记录会话 {sid}"
+                  f"（最后一条 cwd={daemon.get('last_cwd') or '(无)'}）")
+    elif daemon.get("cwd") and _norm_path(daemon["cwd"]) != _norm_path(workspace):
         code = "WORKSPACE_MISMATCH"
         reason = f"daemon open_session cwd={daemon['cwd']}，期望 {workspace}"
     elif not workspace_dirs or _norm_path(workspace_dirs[-1]) != _norm_path(workspace):
         code = "WORKSPACE_MISMATCH"
         reason = f"期望工作区 {workspace}，实际 transcript={workspace_dirs[-1] if workspace_dirs else '(无)'}"
-    elif runtime_model and runtime_model != expected["model"]:
+    elif effective_model and effective_model != expected["model"]:
         code = "GUI_MODEL_SWITCH_FAILED"
-        reason = f"期望模型 {expected['model']}，实际 {runtime_model}"
-    elif not runtime_model:
+        reason = f"期望模型 {expected['model']}，实际 {effective_model}"
+    elif not effective_model:
         code = "GUI_MODEL_SWITCH_FAILED"
         reason = "transcript 中没有 runtime-config 模型"
     return InterfaceOutcome(not code, "transcript_read", expected, actual,

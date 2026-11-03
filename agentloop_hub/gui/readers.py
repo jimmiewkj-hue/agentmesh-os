@@ -67,19 +67,23 @@ class QoderCnReader:
                 found_any = True
                 texts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
-                model = ""
+                runtime_model = ""
+                assistant_model = ""
                 usage: dict[str, Any] = {}
                 completed = False
                 for event in events[index:]:
                     etype = event.get("type")
                     if etype == "runtime-config" and event.get("model"):
-                        model = str(event["model"])
+                        # Runtime config can be written after the assistant
+                        # message and describes the next turn, so it is only
+                        # a fallback behind the model that actually answered.
+                        runtime_model = str(event["model"])
                     if etype != "assistant":
                         continue
                     message = event.get("message") or {}
                     if not isinstance(message, dict):
                         continue
-                    model = str(message.get("model") or model)
+                    assistant_model = str(message.get("model") or assistant_model)
                     blocks = message.get("content")
                     texts.append(_text_from_blocks(blocks, ("text",)))
                     if isinstance(blocks, list):
@@ -102,6 +106,7 @@ class QoderCnReader:
                     if message.get("stop_reason") == "end_turn":
                         completed = True
                 if completed and any(texts):
+                    model = assistant_model or runtime_model
                     text = "\n".join(t for t in texts if t).strip()
                     if expected_model and model and model != expected_model:
                         raise GuiAutomationError(

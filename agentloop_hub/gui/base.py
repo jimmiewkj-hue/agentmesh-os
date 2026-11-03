@@ -76,6 +76,8 @@ class GuiProfile:
     model_selector_ratio: tuple[float, float] | None = None
     model_menu_scroll_ratio: tuple[float, float] | None = None
     model_item_ratio: dict[str, tuple[float, float]] = field(default_factory=dict)
+    workspace_row_ratio: tuple[float, float] | None = None
+    workspace_new_task_ratio: tuple[float, float] | None = None
     model_aliases: dict[str, str] = field(default_factory=dict)
     model_switch_supported: bool = False
     display_model: str = ""

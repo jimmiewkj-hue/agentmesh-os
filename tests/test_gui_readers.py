@@ -6,8 +6,8 @@ import threading
 import time
 from pathlib import Path
 
-from agentloop_hub.gui.profiles import workbuddy_profile
-from agentloop_hub.gui.readers import WorkBuddyReader
+from agentloop_hub.gui.profiles import qoder_cn_profile, workbuddy_profile
+from agentloop_hub.gui.readers import QoderCnReader, WorkBuddyReader
 
 
 def _event(kind: str, **payload) -> str:
@@ -62,3 +62,28 @@ def test_workbuddy_reader_waits_for_final_turn(tmp_path):
     assert "final answer" in reply.text
     assert reply.usage["total_tokens"] == 15
     assert len(reply.tool_calls) == 1
+
+
+def test_qoder_reader_uses_answering_model_not_trailing_config(tmp_path):
+    root = tmp_path / "projects" / "J--agentmesh-e2e-q1-20261103"
+    root.mkdir(parents=True)
+    marker = "AGENTMESH_GUI_MARKER_QODER"
+    transcript = root / "sess.jsonl"
+    transcript.write_text("\n".join([
+        _event("user", sessionId="sess",
+               message={"role": "user",
+                        "content": [{"type": "text", "text": f"task {marker}"}]}),
+        _event("assistant", sessionId="sess",
+               message={"role": "assistant", "model": "dfmodel", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "QODER_DF_OK"}]}),
+        _event("runtime-config", sessionId="sess", model="auto"),
+    ]) + "\n", encoding="utf-8")
+    reader = QoderCnReader(
+        qoder_cn_profile(),
+        {"data_path": str(tmp_path / "projects"), "poll_seconds": 0.1},
+    )
+    reply = reader.wait_reply(marker, started_at=time.time() - 1, timeout=5,
+                              stall_seconds=3, expected_model="dfmodel")
+    assert reply.session_id == "sess"
+    assert reply.model == "dfmodel"
+    assert reply.text == "QODER_DF_OK"
