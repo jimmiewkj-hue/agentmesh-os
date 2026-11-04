@@ -97,9 +97,23 @@ Trae 与 Qoder 各含国际版/CN 版，因此注册表实际有 14 个 Agent ID
 - 实测：新建任务 → 模型菜单选择 GLM-5.3-Flash → 粘贴最小指令 → 回车 → 从 transcript + sessions DB 校验模型并读取回复，耗时约 17.3s，usage 31281/43 tokens，credits 0.47。
 - 截图：`logs/reverse-20261103/workbuddy-gui-ok.png`、`workbuddy-glm-selected4.png`。
 
-## 4. 结论
+## 4. 零 OS 输入接口（2026-11-04 实测）
 
-- 11 类 Agent 在注册表中已齐全；Qoder CN、WorkBuddy 现在是 `gui_automation`，`is_auto_executable=true`，P0 自动执行门禁按能力放行。
-- Qoder CN 的真实可用模型：`DeepSeek-Flash`（`dfmodel`）；WorkBuddy 的真实可用模型：`GLM-5.3-Flash`（`glm-5.3-flash`）。
-- 其余 GUI 产品仍保留 file_relay，原因是尚未完成同等强度的 GUI 定位/回读验证；不伪造自动执行能力。
-- 真实闭环结果：`qoder_cn`+DeepSeek-Flash 主 / `workbuddy`+GLM-5.3-Flash 子，run `run_6eb19690a433` 最终 `released`，合并 commit `e9c35b52`。详见 `docs/GUI自动化实测报告.md`。
+以下通道全部不产生 OS 输入事件；`agentloop_hub/gui/windows.py` 的坐标点击/剪贴板路径已加入零输入守卫，默认拒绝，仅 `AGENTMESH_ALLOW_OS_INPUT=1` 显式诊断时可用。
+
+| Agent | 打开/激活 | 工作区注入 | 模型 | 开发模式 | 发起对话 | 回读证据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qoder CN | 程序拉起 `Qoder CN.exe`，`/json/list` 就绪 | `main.sqlite` `chat_sessions.cwd` + transcript `workspace-directories` | `runtime-config.model`（`dfmodel`/`gfmodel`） | 会话恢复即继承 | CDP `Runtime.evaluate` 插入文本 + 点击“发送消息”按钮 | daemon `open_session` cwd、transcript `assistant.model` |
+| WorkBuddy | `--remote-debugging-port=9223` 拉起/复用 | `workbuddy://task?...cwd=` 预填 + DB `sessions.cwd` | `workbuddy://...&model=` + DB `sessions.model` / `providerData.requestModelName` | `welcomeMode=code`+`permissionMode=fullAccess` → DB `source_mode=craft` | deeplink 仅预填（`prepareInput`，无 autoSend）→ CDP 点击“发送”按钮 | `sessions` 行 `cwd/model/source_mode/permission_mode/status` |
+
+关键结论：
+- WorkBuddy 深链接**不会自动发送**：asar 中 `task-deeplink-coordinator` 只调用 `prepareInput`；提交必须点击渲染器“发送”按钮（CDP DOM，零按键）。旧文档“深链接自动提交”的说法作废。
+- Qoder CN 发送同样走 CDP DOM：`execCommand('insertText')` + 按钮点击；不使用回车键、不用剪贴板。
+- 两者均实测成功跑通跨 Agent 闭环，详见 `logs/zero-input-e2e-20261104/`。
+
+## 5. 结论
+
+- 11 类 Agent 在注册表中齐全（14 个 ID）；`/api/surface` 与 CLI `surface` 输出逐 Agent 的 5 能力矩阵（`verified / partial / unsupported / not_installed`），无证据的能力不标 verified。
+- Qoder CN、WorkBuddy 已具备**零 OS 输入**的打开、工作区、模型、模式与对话五能力；其余 GUI 产品仍为 file_relay 或未安装，原因与缺口逐条列在 matrix 的 `gap` 字段。
+- 2026-11-04 跨 Agent 闭环：Qoder CN 主 + WorkBuddy 子、WorkBuddy 主 + Qoder CN 子，均在 `AGENTMESH_DISABLE_GUI_INPUT=1` 下完成并发布，日志在 `logs/zero-input-e2e-20261104/<combo>/`。
+
