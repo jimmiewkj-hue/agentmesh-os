@@ -57,14 +57,26 @@ def send_prompt_via_cdp(text: str, *, port: int = 9222,
         value = result.get("result", {}).get("result", {}).get("value")
         if value != "FOCUSED":
             raise GuiAutomationError("GUI_SEND_FAILED", f"CDP 未找到输入框: {value}")
-        _call(ws, 2, "Input.insertText", {"text": text})
-        for call_id, event_type in ((3, "keyDown"), (4, "keyUp")):
-            _call(ws, call_id, "Input.dispatchKeyEvent", {
-                "type": event_type, "key": "Enter", "code": "Enter",
-                "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
-                **({"text": "\r"} if event_type == "keyDown" else {}),
-            })
-        return {"ok": True, "path": "cdp", "target": page.get("id"),
+        # A custom rich editor ignores Input.insertText unless its own input
+        # pipeline runs; a real clipboard paste updates both DOM and state.
+        from .windows import _set_clipboard
+        _set_clipboard(text)
+        for call_id, params in (
+            (2, {"type": "keyDown", "key": "Control", "code": "ControlLeft",
+                 "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17}),
+            (3, {"type": "keyDown", "key": "v", "code": "KeyV",
+                 "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86, "modifiers": 2}),
+            (4, {"type": "keyUp", "key": "v", "code": "KeyV",
+                 "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86, "modifiers": 2}),
+            (5, {"type": "keyUp", "key": "Control", "code": "ControlLeft",
+                 "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17}),
+            (6, {"type": "keyDown", "key": "Enter", "code": "Enter",
+                 "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"}),
+            (7, {"type": "keyUp", "key": "Enter", "code": "Enter",
+                 "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}),
+        ):
+            _call(ws, call_id, "Input.dispatchKeyEvent", params)
+        return {"ok": True, "path": "cdp-paste", "target": page.get("id"),
                 "chars": len(text)}
     finally:
         try:

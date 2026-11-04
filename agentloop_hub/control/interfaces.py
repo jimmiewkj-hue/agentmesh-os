@@ -141,10 +141,17 @@ def qoder_projects_root(config: dict[str, Any] | None = None) -> Path:
 
 
 def qoder_project_slug(path: str | Path) -> str:
-    """Qoder's project folder name: ``D:\\a\\b`` -> ``J--a-b``."""
+    """Qoder's project folder name: ``D:\\a\\b`` -> ``J--a-b``.
+
+    Qoder replaces every non-alphanumeric separator (``\\``, ``.``, ``_``,
+    space) with ``-`` individually, so ``...\\.agentloop\\plan_x`` becomes
+    ``...--agentloop-plan-x``.  Matching this exactly is required for the
+    desktop to find the migrated transcript.
+    """
     text = str(path).replace("/", "\\").rstrip("\\")
     text = re.sub(r":\\", "--", text, count=1)
-    return text.replace("\\", "-").replace(":", "-")
+    return (text.replace("\\", "-").replace(".", "-").replace("_", "-")
+            .replace(" ", "-").replace(":", "-"))
 
 
 def list_workbuddy_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:

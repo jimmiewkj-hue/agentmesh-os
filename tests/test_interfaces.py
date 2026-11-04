@@ -121,6 +121,9 @@ def test_workbuddy_workspace_and_mode_verification(tmp_path):
 
 def test_qoder_project_slug_and_transcript_rewrite(tmp_path):
     assert iface.qoder_project_slug(r"D:\qoder\agent-hub") == "J--qoder-agent-hub"
+    assert iface.qoder_project_slug(
+        r"D:\a\.agentloop\planning\plan_x\workspace"
+    ) == "J--a--agentloop-planning-plan-x-workspace"
     path = _qoder_transcript(tmp_path / "projects", r"D:\old", "s1")
     changed = iface._rewrite_qoder_transcript(
         path, workspace=r"D:\new", model_key="gfmodel",
