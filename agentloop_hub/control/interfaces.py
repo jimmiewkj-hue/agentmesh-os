@@ -462,7 +462,11 @@ def _stop_process(name: str) -> None:
 
 
 def _start_app(exe: str) -> None:
-    subprocess.Popen([exe], close_fds=True)
+    args: list[str] = []
+    port = str(os.environ.get("AGENTMESH_QODER_CDP_PORT") or "").strip()
+    if port:
+        args = [f"--remote-debugging-port={port}", "--remote-allow-origins=*"]
+    subprocess.Popen([exe, *args], close_fds=True)
 
 
 def prepare_qoder_session(*, workspace: str, model: str,

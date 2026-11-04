@@ -441,6 +441,14 @@ class WindowsGuiDriver:
         _press(submit)
         self.log("send_prompt_keyboard", chars=len(text))
 
+    def submit_keyboard(self) -> None:
+        """Submit the current composer contents with Enter (no mouse)."""
+        self._focus_no_click()
+        submit = SUBMIT_KEYS.get(str(self.config.get("submit_key") or self.profile.submit_key).upper(),
+                                 VK_RETURN)
+        _press(submit)
+        self.log("submit_keyboard")
+
     def send_prompt(self, text: str) -> None:
         self._focus()
         # First click activates the window, second click focuses the editor.

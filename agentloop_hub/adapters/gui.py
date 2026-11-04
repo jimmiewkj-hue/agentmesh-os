@@ -44,6 +44,8 @@ class GuiAutomationAdapter(BaseAdapter):
         self._reader = reader
         self.no_gui = (str(self.config.get("no_gui_fallback") or "").lower() in ("1", "true", "yes")
                        or os.environ.get("AGENTMESH_DISABLE_GUI_INPUT") == "1")
+        if self.no_gui and str(self.config.get("gui_app") or "") == "qoder_cn":
+            os.environ.setdefault("AGENTMESH_QODER_CDP_PORT", "9222")
 
     # -- public contract -------------------------------------------------
     def execute(self, request: ExecutionRequest) -> ExecutionOutcome:
@@ -83,7 +85,10 @@ class GuiAutomationAdapter(BaseAdapter):
                     # prepare_qoder_session already wrote the model into
                     # main.sqlite and the transcript runtime-config; the
                     # desktop restores that session on restart, so neither the
-                    # workspace nor the model needs a mouse click.
+                    # workspace nor the model needs a mouse click.  The
+                    # desktop shows a boot splash for ~15s before the composer
+                    # exists, so wait for it before keyboard-only send.
+                    time.sleep(float(self.config.get("qoder_ready_seconds") or 18))
                     _log(log_path, "model_programmatic", model=model_key,
                          path="db+transcript", no_gui=True)
                 else:
@@ -141,11 +146,22 @@ class GuiAutomationAdapter(BaseAdapter):
             if shot:
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
-            if interface_info.get("method") == "workbuddy_deeplink":
-                # The deep link already submitted the prompt with the model;
-                # sending it a second time would duplicate the turn.
-                _log(log_path, "prompt_already_submitted", marker=marker,
-                     chars=len(prompt_to_send), method="deeplink")
+            if interface_info.get("method") == "workbuddy_deeplink" and self.no_gui \
+                    and hasattr(driver, "submit_keyboard"):
+                # The deep link only pre-fills the home composer in some
+                # states; Enter submits it without any mouse event.
+                driver.submit_keyboard()
+                _log(log_path, "prompt_submitted", marker=marker,
+                     chars=len(prompt_to_send), method="deeplink+keyboard")
+            elif interface_info.get("method") == "workbuddy_deeplink":
+                driver.send_prompt(prompt_to_send)
+                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                     method=interface_info.get("method"))
+            elif self.no_gui and interface_info.get("method") == "qoder_db_transcript":
+                from ..gui.cdp import send_prompt_via_cdp
+                cdp_result = send_prompt_via_cdp(prompt_to_send)
+                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                     method=interface_info.get("method"), input="cdp", cdp=cdp_result)
             elif self.no_gui and hasattr(driver, "send_prompt_keyboard"):
                 driver.send_prompt_keyboard(prompt_to_send)
                 _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
