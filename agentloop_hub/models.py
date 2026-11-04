@@ -266,10 +266,20 @@ def _string_list(value: Any, name: str, *, require_non_empty: bool = False) -> l
     return out
 
 
+_WORKSPACE_SCOPE_PREFIX = re.compile(
+    r"^(?:当前工作区|当前工作目录|current\s+workspace|current\s+working\s+directory)/",
+    re.IGNORECASE,
+)
+
+
 def normalize_scope_path(path: str) -> str:
     p = path.replace("\\", "/").strip()
-    while p.startswith("./"):
-        p = p[2:]
+    # Planners may describe scope as "当前工作区/calc.py"; scope checks compare
+    # repo-relative paths, so the workspace qualifier must not count as a path
+    # segment.
+    p = _WORKSPACE_SCOPE_PREFIX.sub("", p)
+    while p.startswith("./") or p.startswith("/"):
+        p = p[2:] if p.startswith("./") else p[1:]
     p = re.sub(r"/+", "/", p)
     return p
 

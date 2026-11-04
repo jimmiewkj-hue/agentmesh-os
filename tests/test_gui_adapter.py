@@ -101,7 +101,11 @@ def test_gui_adapter_builds_strict_result_package(tmp_path):
         usage={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
     ))
     driver = StubDriver()
-    adapter = GuiAutomationAdapter(make_agent(), driver=driver, reader=reader)
+    adapter = GuiAutomationAdapter(
+        make_agent(), driver=driver, reader=reader,
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
+    )
     outcome = adapter.execute(request)
 
     assert outcome.status == "completed"
@@ -139,7 +143,11 @@ def test_gui_adapter_plan_extracts_fenced_json(tmp_path):
     text = "计划如下：\n```json\n" + json.dumps(plan, ensure_ascii=False) + "\n```\n"
     reader = StubReader(GuiReply(session_id="sess-plan", text=text, model="dfmodel",
                                  transcript_path=str(tmp_path / "p.jsonl")))
-    outcome = GuiAutomationAdapter(make_agent(), driver=StubDriver(), reader=reader).execute(request)
+    outcome = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=reader,
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
+    ).execute(request)
     assert outcome.status == "completed"
     written = json.loads(Path(request.result_path).read_text(encoding="utf-8"))
     assert written["goal"] == "修复 calc.py"
@@ -158,6 +166,8 @@ def test_gui_adapter_error_codes_are_stable(tmp_path):
 
     outcome = GuiAutomationAdapter(
         make_agent(), driver=StubDriver(), reader=StubReader(error="GUI_STALLED"),
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
     ).execute(request)
     assert outcome.status == "timeout"
     assert outcome.error_code == "GUI_STALLED"
@@ -165,6 +175,8 @@ def test_gui_adapter_error_codes_are_stable(tmp_path):
     outcome = GuiAutomationAdapter(
         make_agent("workbuddy"), driver=StubDriver(model_ok=False),
         reader=StubReader(),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "allow_gui_model_fallback": True},
     ).execute(make_request(tmp_path))
     assert outcome.status == "failed"
     assert outcome.error_code == "GUI_MODEL_SWITCH_FAILED"
@@ -172,6 +184,8 @@ def test_gui_adapter_error_codes_are_stable(tmp_path):
     outcome = GuiAutomationAdapter(
         make_agent("workbuddy"), driver=StubDriver(),
         reader=StubReader(error="GUI_MODEL_SWITCH_FAILED"),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "allow_gui_model_fallback": True},
     ).execute(make_request(tmp_path))
     assert outcome.error_code == "GUI_MODEL_SWITCH_FAILED"
 
@@ -186,10 +200,22 @@ def test_gui_adapter_model_mismatch_uses_reader_expected_model(tmp_path):
             seen["expected"] = expected_model
             raise GuiAutomationError("GUI_MODEL_SWITCH_FAILED", "mismatch")
 
-    outcome = GuiAutomationAdapter(make_agent("workbuddy"), driver=StubDriver(),
-                                   reader=ModelReader()).execute(request)
+    outcome = GuiAutomationAdapter(
+        make_agent("workbuddy"), driver=StubDriver(), reader=ModelReader(),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "allow_gui_model_fallback": True},
+    ).execute(request)
     assert seen["expected"] == "glm-5.3-flash"
     assert outcome.error_code == "GUI_MODEL_SWITCH_FAILED"
+
+
+def test_gui_model_click_requires_explicit_opt_in(tmp_path):
+    outcome = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=StubReader(),
+        config={"mode": "gui_automation", "gui_app": "qoder_cn"},
+    ).execute(make_request(tmp_path))
+    assert outcome.status == "failed"
+    assert outcome.error_code == "MODEL_GUI_FORBIDDEN"
 
 
 def test_no_gui_mode_forbids_gui_model_fallback(tmp_path):
@@ -225,6 +251,50 @@ def test_set_model_qoder_uses_db_transcript_path(tmp_path, monkeypatch):
     assert result["path"] == "db+transcript"
     assert result["actual"] == "dfmodel"
     assert calls == [(str(tmp_path / "ws"), "dfmodel")]
+
+
+def test_set_model_workbuddy_readback_mismatch(tmp_path, monkeypatch):
+    from agentloop_hub.adapters import gui as gui_module
+    from agentloop_hub.control import interfaces as iface
+    from agentloop_hub.control.interfaces import InterfaceOutcome
+
+    def fake_prepare(**kwargs):
+        return InterfaceOutcome(
+            True, "deeplink", {"model": kwargs["model"]},
+            {"model": kwargs["model"]}, evidence={"started_at": 1000.0},
+        )
+
+    monkeypatch.setattr(gui_module, "prepare_workbuddy_task", fake_prepare)
+    monkeypatch.setattr(iface, "workbuddy_db_path", lambda config: tmp_path / "wb.db")
+    monkeypatch.setattr(
+        iface, "_newest_workbuddy_session",
+        lambda *args, **kwargs: {"model": "glm-5.2", "session_id": "sess-mismatch"},
+    )
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def time(self):
+            self.now += 1.0
+            return self.now
+
+        def monotonic(self):
+            self.now += 1.0
+            return self.now
+
+        @staticmethod
+        def sleep(_seconds):
+            return None
+
+    monkeypatch.setattr(gui_module, "time", FakeClock())
+    adapter = GuiAutomationAdapter(make_agent("workbuddy"), config={
+        "mode": "gui_automation", "gui_app": "workbuddy",
+        "no_gui_fallback": True,
+    })
+    with pytest.raises(GuiAutomationError) as info:
+        adapter.set_model("GLM-5.3-Flash", workspace=str(tmp_path / "ws"))
+    assert info.value.code == "MODEL_MISMATCH"
 
 
 def test_set_model_without_workspace_is_unsupported(tmp_path):

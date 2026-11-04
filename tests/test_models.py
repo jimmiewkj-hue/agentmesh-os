@@ -103,6 +103,9 @@ def test_scope_matching_patterns():
     assert scope_matches("src/", "src/auth/token.ts")
     assert not scope_matches("src/auth/**", "tests/auth/test.ts")
     assert scope_matches("**/package-lock.json", "a/b/package-lock.json")
+    assert scope_matches("calc.py", "当前工作区/calc.py")
+    assert scope_matches("当前工作区/calc.py", "calc.py")
+    assert not scope_matches("当前工作区/calc.py", "test_calc.py")
 
 
 def test_files_in_scope():

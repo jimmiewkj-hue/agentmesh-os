@@ -46,6 +46,11 @@ class GuiAutomationAdapter(BaseAdapter):
                        or os.environ.get("AGENTMESH_DISABLE_GUI_INPUT") == "1")
         if self.no_gui and str(self.config.get("gui_app") or "") == "qoder_cn":
             os.environ.setdefault("AGENTMESH_QODER_CDP_PORT", "9222")
+        # GUI model clicks are diagnostic only; they require an explicit opt-in
+        # even outside zero-mouse mode.
+        self.allow_gui_model_fallback = str(
+            self.config.get("allow_gui_model_fallback") or ""
+        ).lower() in ("1", "true", "yes")
 
     # -- public contract -------------------------------------------------
     def execute(self, request: ExecutionRequest) -> ExecutionOutcome:
@@ -100,7 +105,8 @@ class GuiAutomationAdapter(BaseAdapter):
                             _log(log_path, "workspace_selected", workspace=request.workdir)
                     except Exception as exc:
                         _log(log_path, "workspace_select_failed", error=str(exc))
-            if interface_info.get("method") == "qoder_db_transcript" and model_key and not self.no_gui:
+            if interface_info.get("method") == "qoder_db_transcript" and model_key \
+                    and not self.no_gui and self.allow_gui_model_fallback:
                 # Diagnostic-only GUI fallback; forbidden in zero-mouse mode.
                 try:
                     if driver.select_model(model_key):
@@ -125,6 +131,13 @@ class GuiAutomationAdapter(BaseAdapter):
                         _log(log_path, "new_task_failed", error=str(exc))
             if interface_info.get("method") == "gui" and model_key:
                 if profile.model_switch_supported:
+                    if self.no_gui or not self.allow_gui_model_fallback:
+                        raise GuiAutomationError(
+                            "MODEL_GUI_FORBIDDEN",
+                            "GUI 模型点击未显式启用（allow_gui_model_fallback）",
+                        )
+                    _log(log_path, "model_gui_fallback", model=model_key,
+                         reason="legacy gui path")
                     if not driver.select_model(model_key):
                         raise GuiAutomationError(
                             "GUI_MODEL_SWITCH_FAILED",
