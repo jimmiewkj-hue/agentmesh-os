@@ -349,7 +349,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
         def _route_get(self, path: str, query: dict[str, str]) -> None:
             parts = [p for p in path.strip("/").split("/") if p]
             if path == "/api/health":
-                self._json(200, {"status": "ok", "time": now_iso()})
+                from ..control.zero_input import status as zero_status
+                self._json(200, {"status": "ok", "time": now_iso(),
+                                 "zero_input": zero_status()})
                 return
             if path == "/api/workspace":
                 self._json(200, provider.info())  # type: ignore[union-attr]
@@ -384,6 +386,20 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if path == "/api/connectors":
                 self._json(200, hub.connector_manifest())
+                return
+            if path == "/api/surface":
+                from ..control.agent_surface import surface_report
+                self._json(200, surface_report(hub.project.project_id,
+                                               records=hub.list_agents()))
+                return
+            if len(parts) == 3 and parts[1] == "surface":
+                from ..control.agent_surface import agent_surface
+                try:
+                    self._json(200, agent_surface(parts[2], hub.project.project_id,
+                                                  records=hub.list_agents()))
+                except KeyError as exc:
+                    self._json(404, {"error": {"code": "not_found",
+                                               "message": str(exc)}})
                 return
             if len(parts) == 4 and parts[1] == "agents" and parts[3] == "health":
                 self._json(200, hub.agent_health(parts[2]))

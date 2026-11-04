@@ -17,8 +17,17 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
+from ..control.zero_input import OsInputBlocked, require_os_input
 from ..util import atomic_write_text, ensure_dir, now_iso, read_json
 from .base import GuiAutomationError, GuiProfile
+
+
+def _guard_os_input(kind: str) -> None:
+    """Enforce the zero-input policy before any Win32 input synthesis."""
+    try:
+        require_os_input(kind, detail="WindowsGuiDriver")
+    except OsInputBlocked as exc:
+        raise GuiAutomationError(exc.code, str(exc), details=exc.details) from exc
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -97,6 +106,7 @@ def find_window(title_part: str) -> tuple[int, tuple[int, int, int, int]] | None
 
 
 def _set_clipboard(text: str) -> None:
+    _guard_os_input("clipboard")
     data = text.encode("utf-16-le") + b"\x00\x00"
     if not user32.OpenClipboard(0):
         raise GuiAutomationError("GUI_SEND_FAILED", "打开剪贴板失败")
@@ -117,6 +127,7 @@ def _set_clipboard(text: str) -> None:
 
 
 def _key_event(vk: int, flags: int = 0) -> None:
+    _guard_os_input("keyboard")
     user32.keybd_event(vk, 0, flags, 0)
     time.sleep(0.04)
 
@@ -278,6 +289,7 @@ class WindowsGuiDriver:
             time.sleep(0.4)
 
     def _click(self, x: int, y: int) -> None:
+        _guard_os_input("mouse")
         user32.SetCursorPos(int(x), int(y))
         time.sleep(0.15)
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
@@ -329,6 +341,7 @@ class WindowsGuiDriver:
         return True
 
     def scroll_ratio(self, ratio: tuple[float, float], notches: int) -> None:
+        _guard_os_input("mouse")
         left, top, right, bottom = self.rect
         x = left + int((right - left) * float(ratio[0]))
         y = top + int((bottom - top) * float(ratio[1]))

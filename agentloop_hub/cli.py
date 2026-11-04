@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="显示项目总览")
     sub.add_parser("doctor", help="环境与 Agent 健康检查")
     sub.add_parser("connectors", help="Agent Connector 统一能力清单")
+    surface = sub.add_parser("surface", help="统一 5 能力矩阵（零 OS 输入证据）")
+    surface.add_argument("--agent", default="", help="只输出指定 Agent")
     models = sub.add_parser("models", help="Agent 支持的模型清单")
     models.add_argument("--refresh", action="store_true", help="重新探测本机 Agent 模型")
     models.add_argument("--agent", default="", help="只刷新指定 Agent")
@@ -381,6 +383,11 @@ def _dispatch(hub: Hub, args: argparse.Namespace) -> Any:
         return hub.doctor()
     if cmd == "connectors":
         return hub.connector_manifest()
+    if cmd == "surface":
+        from .control.agent_surface import agent_surface, surface_report
+        if args.agent:
+            return agent_surface(args.agent, hub.project.project_id)
+        return surface_report(hub.project.project_id)
     if cmd == "models":
         if args.refresh:
             return hub.refresh_agent_models(args.agent)

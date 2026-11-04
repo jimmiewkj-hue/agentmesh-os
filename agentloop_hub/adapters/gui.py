@@ -22,6 +22,7 @@ from ..control.interfaces import (
     set_model_programmatically, verify_qoder_session, verify_workbuddy_task,
     workbuddy_model_key,
 )
+from ..control.zero_input import os_input_allowed
 from ..gui import (
     GUI_ERROR_CODES, GuiAutomationError, GuiProfile, GuiReply, WindowsGuiDriver,
     create_reader, find_window, profile_for_app, resolve_model_key,
@@ -44,8 +45,16 @@ class GuiAutomationAdapter(BaseAdapter):
         self._reader = reader
         self.no_gui = (str(self.config.get("no_gui_fallback") or "").lower() in ("1", "true", "yes")
                        or os.environ.get("AGENTMESH_DISABLE_GUI_INPUT") == "1")
-        if self.no_gui and str(self.config.get("gui_app") or "") == "qoder_cn":
-            os.environ.setdefault("AGENTMESH_QODER_CDP_PORT", "9222")
+        self.qoder_cdp_port = int(
+            self.config.get("qoder_cdp_port")
+            or os.environ.get("AGENTMESH_QODER_CDP_PORT")
+            or 9222
+        )
+        if str(self.config.get("gui_app") or "") == "qoder_cn":
+            # Qoder's prompt path always runs through the renderer DOM, so the
+            # restarted desktop must expose DevTools regardless of the legacy
+            # no_gui flag.
+            os.environ.setdefault("AGENTMESH_QODER_CDP_PORT", str(self.qoder_cdp_port))
         # GUI model clicks are diagnostic only; they require an explicit opt-in
         # even outside zero-mouse mode.
         self.allow_gui_model_fallback = str(
@@ -86,27 +95,24 @@ class GuiAutomationAdapter(BaseAdapter):
                 resolve_model_key(request.model, profile.model_aliases)
 
             if interface_info.get("method") == "qoder_db_transcript":
-                if self.no_gui:
-                    # prepare_qoder_session already wrote the model into
-                    # main.sqlite and the transcript runtime-config; the
-                    # desktop restores that session on restart, so neither the
-                    # workspace nor the model needs a mouse click.  The
-                    # desktop shows a boot splash for ~15s before the composer
-                    # exists, so wait for it before keyboard-only send.
-                    time.sleep(float(self.config.get("qoder_ready_seconds") or 18))
-                    _log(log_path, "model_programmatic", model=model_key,
-                         path="db+transcript", no_gui=True)
-                else:
-                    # The desktop restores its last route after the restart;
-                    # activate the workspace row and open a new task inside it.
-                    time.sleep(2.0)
-                    try:
-                        if driver.select_workspace(Path(request.workdir).name):
-                            _log(log_path, "workspace_selected", workspace=request.workdir)
-                    except Exception as exc:
-                        _log(log_path, "workspace_select_failed", error=str(exc))
+                # prepare_qoder_session already wrote the model into main.sqlite
+                # and the transcript runtime-config; the desktop restores that
+                # session on restart, so neither the workspace nor the model
+                # needs a GUI click.  Wait for the renderer's DevTools endpoint
+                # instead of a fixed boot sleep: the composer only exists once
+                # the page is ready.
+                from ..gui.cdp import wait_for_cdp
+                ready = wait_for_cdp(
+                    self.qoder_cdp_port,
+                    timeout=float(self.config.get("qoder_cdp_timeout_seconds") or 60),
+                )
+                interface_info["cdp_port"] = self.qoder_cdp_port
+                interface_info["cdp_target"] = ready.get("page", {}).get("id", "")
+                _log(log_path, "model_programmatic", model=model_key,
+                     path="db+transcript", cdp="ready",
+                     target=interface_info["cdp_target"])
             if interface_info.get("method") == "qoder_db_transcript" and model_key \
-                    and not self.no_gui and self.allow_gui_model_fallback:
+                    and self.allow_gui_model_fallback and os_input_allowed():
                 # Diagnostic-only GUI fallback; forbidden in zero-mouse mode.
                 try:
                     if driver.select_model(model_key):
@@ -118,6 +124,11 @@ class GuiAutomationAdapter(BaseAdapter):
                          error=str(exc))
 
             if interface_info.get("method") == "gui":
+                if self._driver is None and not os_input_allowed():
+                    raise GuiAutomationError(
+                        "GUI_INPUT_FORBIDDEN",
+                        "零 OS 输入策略禁止通用 GUI 主链：该 Agent 没有可用的进程内接口",
+                    )
                 if self.no_gui:
                     raise GuiAutomationError(
                         "MODEL_GUI_FORBIDDEN",
@@ -131,7 +142,8 @@ class GuiAutomationAdapter(BaseAdapter):
                         _log(log_path, "new_task_failed", error=str(exc))
             if interface_info.get("method") == "gui" and model_key:
                 if profile.model_switch_supported:
-                    if self.no_gui or not self.allow_gui_model_fallback:
+                    if self.no_gui or not self.allow_gui_model_fallback \
+                            or (self._driver is None and not os_input_allowed()):
                         raise GuiAutomationError(
                             "MODEL_GUI_FORBIDDEN",
                             "GUI 模型点击未显式启用（allow_gui_model_fallback）",
@@ -159,30 +171,23 @@ class GuiAutomationAdapter(BaseAdapter):
             if shot:
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
-            if interface_info.get("method") == "workbuddy_deeplink" and self.no_gui \
-                    and hasattr(driver, "submit_keyboard"):
-                # The deep link only pre-fills the home composer in some
-                # states; Enter submits it without any mouse event.
-                driver.submit_keyboard()
+            if interface_info.get("method") == "workbuddy_deeplink":
+                # The deep link carries action=start, so the target app submits
+                # the prompt itself.  No Enter key, no mouse click.
                 _log(log_path, "prompt_submitted", marker=marker,
-                     chars=len(prompt_to_send), method="deeplink+keyboard")
-            elif interface_info.get("method") == "workbuddy_deeplink":
-                driver.send_prompt(prompt_to_send)
-                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"))
-            elif self.no_gui and interface_info.get("method") == "qoder_db_transcript":
+                     chars=len(prompt_to_send), method="deeplink",
+                     cdp=interface_info.get("deeplink", ""))
+            elif interface_info.get("method") == "qoder_db_transcript":
                 from ..gui.cdp import send_prompt_via_cdp
-                cdp_result = send_prompt_via_cdp(prompt_to_send)
+                cdp_result = send_prompt_via_cdp(
+                    prompt_to_send, port=self.qoder_cdp_port,
+                )
                 _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"), input="cdp", cdp=cdp_result)
-            elif self.no_gui and hasattr(driver, "send_prompt_keyboard"):
-                driver.send_prompt_keyboard(prompt_to_send)
-                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"), input="keyboard")
+                     method=interface_info.get("method"), input="cdp-dom", cdp=cdp_result)
             else:
                 driver.send_prompt(prompt_to_send)
                 _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"))
+                     method=interface_info.get("method"), input="diagnostic-gui")
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
             # Never stall earlier than the measured profile threshold; the
             # discovery-written adapter_config may still carry an old 90s.
@@ -289,6 +294,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 "method": "workbuddy_deeplink", "model_key": model_key,
                 "short_prompt": short_prompt, "prepare": outcome.to_dict(),
                 "prompt_file": str(prompt_copy),
+                "deeplink": str(outcome.evidence.get("deeplink") or ""),
                 "verify": lambda _sid="": verify_workbuddy_task(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, welcome_mode=welcome,

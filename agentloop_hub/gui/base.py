@@ -23,6 +23,7 @@ GUI_ERROR_CODES: dict[str, str] = {
     "GUI_RESULT_MISSING": "Agent 未产出成果包",
     "GUI_SCREENSHOT_FAILED": "截图失败",
     "GUI_DRIVER_ERROR": "GUI 驱动内部错误",
+    "GUI_INPUT_FORBIDDEN": "零 OS 输入策略禁止键鼠/剪贴板合成",
     "WORKSPACE_MISMATCH": "实际工作区与期望工作区不一致",
     "WORKSPACE_SWITCH_FAILED": "无法通过程序接口创建工作区/切换会话",
     "GUI_MODE_MISMATCH": "实际模式或权限与期望值不一致",

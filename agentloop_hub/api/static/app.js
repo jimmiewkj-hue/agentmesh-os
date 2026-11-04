@@ -3,6 +3,7 @@ const state = {
   workspace: null, overview: null, plans: [], runs: [], tasks: [], approvals: [],
   costs: null, usage: [], audit: [], conversations: [], memories: [], bus: [],
   busStats: null, busSubs: [], sync: null, models: null, versionStatus: null,
+  surface: null,
   mcp: null, selected: null, view: 'command', stream: null, lastSeq: 0,
   consoleLines: 0, reconnectTimer: null, refreshTimer: null,
 };
@@ -83,6 +84,7 @@ async function refresh() {
     state.sync = sync;
     state.models = models;
     state.versionStatus = versionStatus;
+    state.surface = await api('/api/surface').catch(() => null);
     if (state.selected) {
       const fresh = state.tasks.find((x) => x.uid === state.selected.uid);
       if (fresh) state.selected = fresh;
@@ -366,6 +368,32 @@ function renderAgents() {
       </div>
     </div>`;
   }).join('') || '<div class="empty">未发现 Agent，点击上方按钮探测</div>';
+}
+
+function renderSurface() {
+  const box = $('surfaceTable');
+  if (!box) return;
+  const report = state.surface;
+  if (!report || !report.agents) {
+    box.innerHTML = '<div class="empty">能力矩阵未加载（/api/surface）</div>';
+    return;
+  }
+  const labels = { open_activate: '打开', workspace: '工作区', model: '模型', dev_mode: '开发模式', chat: '对话' };
+  const statusText = { verified: '通过', partial: '部分', unsupported: '未通', not_installed: '未装' };
+  const statusPill = { verified: 'ok', partial: 'warn', unsupported: 'bad', not_installed: '' };
+  const head = '<tr><th>Agent</th>' + Object.keys(labels).map((k) => `<th>${labels[k]}</th>`).join('') + '<th>零输入</th></tr>';
+  const rows = report.agents.map((a) => {
+    const cells = Object.keys(labels).map((k) => {
+      const c = a.capabilities[k] || {};
+      const tip = esc(c.gap || c.interface || '');
+      return `<td title="${tip}"><span class="pill ${statusPill[c.status] || ''}">${statusText[c.status] || esc(c.status)}</span></td>`;
+    }).join('');
+    return `<tr><td><b>${esc(a.name)}</b><div class="sub">${esc(a.agent_id)}</div></td>${cells}
+      <td><span class="pill ${a.zero_input ? 'ok' : 'bad'}">${a.zero_input ? '是' : '否'}</span></td></tr>`;
+  }).join('');
+  const s = report.summary || {};
+  box.innerHTML = `<div class="sub" style="margin-bottom:6px">${esc((report.zero_input || {}).mode || 'blocked')} · 已验证 ${esc(s.verified || 0)} / 部分 ${esc(s.partial || 0)} / 未通 ${esc(s.unsupported || 0)} / 未装 ${esc(s.not_installed || 0)}</div>
+    <table class="table">${head}${rows}</table>`;
 }
 
 async function setAgentModelFromCard(agentId, model) {
@@ -999,6 +1027,7 @@ function render() {
     if (current && sessionAgents.some((a) => a.agent_id === current)) sa.value = current;
   }
   renderAgents();
+  renderSurface();
   renderVersions();
   renderGraph();
   renderTask();

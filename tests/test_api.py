@@ -62,13 +62,28 @@ def test_static_and_core_endpoints(api):
     assert status == 200 and json.loads(body)["status"] == "ok"
     for path in ("/api/overview", "/api/agents", "/api/tasks", "/api/approvals",
                  "/api/costs", "/api/audit", "/api/memory", "/api/conversations",
-                 "/api/connectors", "/api/bus", "/api/bus/stats", "/api/bus/verify",
+                 "/api/connectors", "/api/surface", "/api/bus", "/api/bus/stats", "/api/bus/verify",
                  "/api/bus/subscriptions", "/api/router/rank?task_type=analysis",
                  "/api/router/scores", "/api/router/decisions", "/api/benchmark",
                  "/api/cost/report", "/api/sync", "/api/memory/bootstrap",
                  "/api/tasks/run_none:T1/logs"):
         status, _ = get(base, path)
         assert status in (200, 404), (path, status)
+
+
+def test_surface_and_zero_input_health(api):
+    base, hub, _ = api
+    status, body = get(base, "/api/surface")
+    assert status == 200
+    data = json.loads(body)
+    assert data["zero_input"]["mode"] == "blocked"
+    assert {a["agent_id"] for a in data["agents"]} == {"mock_main", "mock_worker", "mock_verifier"}
+    status, body = get(base, "/api/surface/mock_main")
+    assert status == 200 and json.loads(body)["agent_id"] == "mock_main"
+    status, body = get(base, "/api/surface/nope")
+    assert status == 404
+    status, body = get(base, "/api/health")
+    assert json.loads(body)["zero_input"]["os_input"] == "blocked"
 
 
 def test_plan_import_approve_and_run_via_api(api):
