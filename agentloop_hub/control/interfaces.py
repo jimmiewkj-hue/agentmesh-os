@@ -5,8 +5,11 @@ Verified entry points on this machine (2026-11-03):
 * WorkBuddy 5.9.3 ships a task deeplink handler
   (``workbuddy://task?action=start``).  ``cwd``, ``model``, ``welcomeMode``
   (code/work/design -> source_mode craft/working/design), ``permissionMode``
-  and ``mode`` are applied before the prompt is submitted.  A real probe
-  produced a session row with ``cwd=D:/.../probe-ws``,
+  and ``mode`` are applied and the prompt is **prefilled only**; the deeplink
+  does not send.  Submission goes through the renderer's own 发送 button via
+  CDP (``--remote-debugging-port``, see ``ensure_workbuddy_cdp``).  A real
+  2026-11-04 probe produced a session row with
+  ``cwd=D:/agentmesh-e2e/zero-input-20261104/project``,
   ``model=deepseek-v4.1-flash``, ``source_mode=craft`` and
   ``permission_mode=fullAccess`` in ``~/.workbuddy/workbuddy.db``.
 
@@ -36,6 +39,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,6 +269,58 @@ def _norm_path(value: str | Path) -> str:
         return os.path.normcase(os.path.normpath(str(value))).replace("/", "\\")
     except Exception:
         return str(value)
+
+
+def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
+                         timeout_seconds: float = 40.0) -> InterfaceOutcome:
+    """Make sure WorkBuddy's renderer exposes DevTools.
+
+    WorkBuddy's task deeplink only calls ``prepareInput``; it does not send.
+    The zero-input path submits by clicking the composer's own send button via
+    CDP, which requires the Electron process to be launched with
+    ``--remote-debugging-port``.  If the port is already live the running
+    instance is reused; otherwise all WorkBuddy processes are stopped (process
+    control, not input synthesis) and one instance is relaunched with the flag.
+    """
+    def _probe() -> bool:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(port)}/json/list", timeout=3
+            ) as response:
+                targets = json.loads(response.read().decode("utf-8"))
+            return any(item.get("type") == "page" for item in targets)
+        except Exception:
+            return False
+
+    if _probe():
+        return InterfaceOutcome(True, "cdp", {"port": int(port), "reused": True},
+                                {"source": f"http://127.0.0.1:{port}/json/list"},
+                                evidence={"port": int(port), "reused": True})
+    if not executable or not Path(executable).exists():
+        return InterfaceOutcome(False, "cdp", {"port": int(port)}, {},
+                                reason=f"WorkBuddy 可执行文件不存在: {executable}",
+                                error_code="GUI_DRIVER_ERROR")
+    subprocess.run(["taskkill", "/IM", "WorkBuddy.exe", "/F"],
+                   capture_output=True, text=True, timeout=15)
+    time.sleep(1.5)
+    subprocess.Popen(
+        [executable, f"--remote-debugging-port={int(port)}",
+         "--remote-allow-origins=*"],
+        close_fds=True, creationflags=0x00000008,
+    )
+    deadline = time.time() + float(timeout_seconds)
+    while time.time() < deadline:
+        if _probe():
+            return InterfaceOutcome(
+                True, "cdp", {"port": int(port), "reused": False},
+                {"source": f"http://127.0.0.1:{port}/json/list"},
+                evidence={"port": int(port), "reused": False,
+                          "executable": executable},
+            )
+        time.sleep(1.0)
+    return InterfaceOutcome(False, "cdp", {"port": int(port)}, {},
+                            reason=f"WorkBuddy CDP 端口 {port} 在 {timeout_seconds}s 内未就绪",
+                            error_code="GUI_SEND_FAILED")
 
 
 def prepare_workbuddy_task(*, workspace: str, model: str, prompt: str,

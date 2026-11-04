@@ -145,6 +145,7 @@ SUBMIT_JS = r"""(() => {
   const roots = [];
   let node = composer;
   for (let i = 0; i < 5 && node; i += 1) { roots.push(node); node = node.parentElement; }
+  let sawDisabled = false;
   const seen = new Set();
   const candidates = [];
   const collect = (root) => {
@@ -155,15 +156,19 @@ SUBMIT_JS = r"""(() => {
   };
   roots.forEach(collect);
   if (!candidates.length) collect(document);
-  const bad = /(stop|停止|cancel|取消|interrupt|中断)/i;
-  const good = /(send|发送|submit|提交|start|开始|run|运行|生成|create)/i;
+  // Qoder CN exposes "开始语音输入" next to "发送消息"; a naive /开始|start/
+  // match clicks the microphone instead of sending.  Exclude every non-send
+  // composer control before matching the send affordance.
+  const bad = /(stop|停止|cancel|取消|interrupt|中断|语音|voice|mic|microphone|听写|dictation|附件|attach|上下文|context|权限|permission|模型|model|文件|file|编辑|视图|帮助|工作区|workspace|任务|task)/i;
+  const good = /(send|发送|submit|提交)/i;
   for (const btn of candidates) {
     const label = [
       btn.getAttribute('aria-label'), btn.getAttribute('title'),
       btn.getAttribute('data-testid'), btn.textContent,
     ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
     if (!label || bad.test(label)) continue;
-    if (good.test(label) && !btn.disabled) {
+    if (good.test(label)) {
+      if (btn.disabled) { sawDisabled = true; continue; }
       btn.click();
       return {ok: true, method: 'button-click', label: label.slice(0, 80)};
     }
@@ -177,8 +182,94 @@ SUBMIT_JS = r"""(() => {
     if (form.requestSubmit) form.requestSubmit(); else form.submit();
     return {ok: true, method: 'form.requestSubmit'};
   }
-  return {ok: false, reason: 'NO_SUBMIT'};
+  return {ok: false, reason: sawDisabled ? 'SEND_DISABLED' : 'NO_SUBMIT'};
 })()"""
+
+
+COMPOSER_TEXT_JS = r"""(() => {
+  const c = document.querySelector('[contenteditable="true"]')
+    || document.querySelector('[role="textbox"]')
+    || document.querySelector('textarea');
+  if (!c) return {ok: false, reason: 'NO_COMPOSER'};
+  const text = (c.innerText || c.value || '').trim();
+  return {ok: true, chars: text.length, text: text.slice(0, 300)};
+})()"""
+
+
+def composer_text_via_cdp(port: int = 9223, *, timeout: float = 10.0,
+                          transport: CdpTransport | None = None) -> dict[str, Any]:
+    own = transport is None
+    if own:
+        chosen = _pick_page(_targets(port))
+        if not chosen:
+            raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
+        transport = WebSocketTransport(chosen["webSocketDebuggerUrl"],
+                                       origin=f"http://127.0.0.1:{int(port)}",
+                                       timeout=timeout)
+    try:
+        return _evaluate(transport, COMPOSER_TEXT_JS, timeout) or {"ok": False}
+    finally:
+        if own:
+            transport.close()
+
+
+def submit_composer_via_cdp(port: int = 9223, *, timeout: float = 10.0,
+                            prefill_timeout: float = 20.0,
+                            submit_retries: int = 12,
+                            submit_interval: float = 0.4,
+                            transport: CdpTransport | None = None) -> dict[str, Any]:
+    """Submit an already-prefilled composer (WorkBuddy deeplink path).
+
+    The deeplink only calls ``prepareInput``; no send happens.  This function
+    waits until the prompt text appears in the renderer and then clicks the
+    composer's own send control.  No text is inserted and no key event is sent.
+    """
+    own = transport is None
+    if own:
+        chosen = _pick_page(_targets(port))
+        if not chosen:
+            raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
+        transport = WebSocketTransport(chosen["webSocketDebuggerUrl"],
+                                       origin=f"http://127.0.0.1:{int(port)}",
+                                       timeout=timeout)
+    try:
+        deadline = time.time() + float(prefill_timeout)
+        prefill: dict[str, Any] = {"ok": False, "chars": 0}
+        while time.time() < deadline:
+            prefill = _evaluate(transport, COMPOSER_TEXT_JS, timeout) or {"ok": False}
+            if prefill.get("ok") and int(prefill.get("chars") or 0) > 0:
+                break
+            time.sleep(0.5)
+        if not prefill.get("ok"):
+            raise GuiAutomationError(
+                "GUI_SEND_FAILED", f"CDP 未找到输入框: {prefill.get('reason')}",
+                details={"prefill": prefill},
+            )
+        if int(prefill.get("chars") or 0) <= 0:
+            raise GuiAutomationError(
+                "GUI_SEND_FAILED", "deeplink 已打开但输入框为空，拒绝空提交",
+                details={"prefill": prefill},
+            )
+        submitted: dict[str, Any] = {"ok": False, "reason": "SEND_DISABLED"}
+        for attempt in range(max(1, int(submit_retries))):
+            time.sleep(0.35 if attempt == 0 else submit_interval)
+            submitted = _evaluate(transport, SUBMIT_JS, timeout) or {}
+            if submitted.get("ok"):
+                submitted["attempts"] = attempt + 1
+                break
+            if submitted.get("reason") not in ("SEND_DISABLED", "NO_SUBMIT"):
+                break
+        if not submitted.get("ok"):
+            raise GuiAutomationError(
+                "GUI_SEND_FAILED",
+                f"CDP 未找到可用的提交按钮: {submitted.get('reason')}",
+                details={"prefill": prefill, "submit": submitted},
+            )
+        return {"ok": True, "path": "cdp-submit-prefilled",
+                "prefill": prefill, "submit": submitted}
+    finally:
+        if own:
+            transport.close()
 
 
 def wait_for_cdp(port: int = 9222, *, timeout: float = 60.0,
@@ -205,7 +296,8 @@ def wait_for_cdp(port: int = 9222, *, timeout: float = 60.0,
 
 def send_prompt_via_cdp(text: str, *, port: int = 9222, timeout: float = 10.0,
                         submit: bool = True, transport: CdpTransport | None = None,
-                        page_id: str = "") -> dict[str, Any]:
+                        page_id: str = "", submit_retries: int = 12,
+                        submit_interval: float = 0.4) -> dict[str, Any]:
     """Insert ``text`` into the composer and submit it without OS input.
 
     ``transport`` is injectable so tests can exercise the DOM sequence without a
@@ -233,14 +325,23 @@ def send_prompt_via_cdp(text: str, *, port: int = 9222, timeout: float = 10.0,
                 f"CDP 未写入输入框: {inserted.get('reason') or inserted}",
                 details={"insert": inserted},
             )
-        time.sleep(0.35)
         submitted: dict[str, Any] = {"ok": False, "reason": "skipped"}
         if submit:
-            submitted = _evaluate(transport, SUBMIT_JS, timeout) or {}
+            # React-style composers enable the send button after their own
+            # state update; poll for up to ~5s instead of clicking a disabled
+            # control once.
+            for attempt in range(max(1, int(submit_retries))):
+                time.sleep(0.35 if attempt == 0 else submit_interval)
+                submitted = _evaluate(transport, SUBMIT_JS, timeout) or {}
+                if submitted.get("ok"):
+                    submitted["attempts"] = attempt + 1
+                    break
+                if submitted.get("reason") not in ("SEND_DISABLED", "NO_SUBMIT"):
+                    break
             if not submitted.get("ok"):
                 raise GuiAutomationError(
                     "GUI_SEND_FAILED",
-                    f"CDP 未找到提交按钮: {submitted.get('reason') or submitted}",
+                    f"CDP 未找到可用的提交按钮: {submitted.get('reason') or submitted}",
                     details={"insert": inserted, "submit": submitted},
                 )
         return {
@@ -252,5 +353,5 @@ def send_prompt_via_cdp(text: str, *, port: int = 9222, timeout: float = 10.0,
             transport.close()
 
 
-__all__ = ["send_prompt_via_cdp", "wait_for_cdp", "WebSocketTransport",
-           "INSERT_JS", "SUBMIT_JS"]
+__all__ = ["send_prompt_via_cdp", "submit_composer_via_cdp", "composer_text_via_cdp",
+           "wait_for_cdp", "WebSocketTransport", "INSERT_JS", "SUBMIT_JS"]

@@ -300,8 +300,10 @@ def _build_one(record: Any, home: Path) -> dict[str, Any]:
                              "workbuddy://task?...&welcomeMode=craft&permissionMode=fullAccess",
                              readback="sessions.source_mode + sessions.permission_mode",
                              evidence=wb),
-            "chat": _cap("verified", "deeplink (action=start)", "deeplink 携带 prompt，应用自身提交",
-                         readback="projects/<cwd>/<session>.jsonl 回复事件", evidence=wb),
+            "chat": _cap("verified", "deeplink + cdp-dom",
+                         "deeplink 预填 prompt，CDP Runtime.evaluate 点击渲染器“发送”按钮",
+                         readback="sessions 行 + projects/<cwd>/<session>.jsonl 回复事件",
+                         evidence=wb),
         }
     elif agent_id == "qoder_cn":
         caps = {

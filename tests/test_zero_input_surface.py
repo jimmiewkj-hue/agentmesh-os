@@ -10,7 +10,7 @@ import pytest
 from agentloop_hub.control.zero_input import (
     OsInputBlocked, current_policy, os_input_allowed, require_os_input, status,
 )
-from agentloop_hub.gui.cdp import send_prompt_via_cdp
+from agentloop_hub.gui.cdp import SUBMIT_JS, send_prompt_via_cdp
 from agentloop_hub.gui.base import GuiAutomationError
 
 
@@ -101,6 +101,14 @@ def test_cdp_dom_insert_and_submit_without_input_events():
     assert "生成结果" in expressions[0]
 
 
+def test_cdp_submit_excludes_voice_and_non_send_controls():
+    assert "语音" in SUBMIT_JS and "voice" in SUBMIT_JS
+    assert "发送" in SUBMIT_JS and "send" in SUBMIT_JS
+    # 开始/start 不再是正向匹配词，否则会点到“开始语音输入”
+    good_line = next(line for line in SUBMIT_JS.splitlines() if "const good" in line)
+    assert "开始" not in good_line and "start" not in good_line
+
+
 def test_cdp_missing_composer_is_explicit():
     transport = FakeTransport([_value({"ok": False, "reason": "NO_COMPOSER"})])
     with pytest.raises(GuiAutomationError) as info:
@@ -109,13 +117,50 @@ def test_cdp_missing_composer_is_explicit():
     assert "NO_COMPOSER" in info.value.message
 
 
+def test_cdp_polls_until_send_button_enables():
+    transport = FakeTransport([
+        _value({"ok": True, "method": "execCommand.insertText"}),
+        _value({"ok": False, "reason": "SEND_DISABLED"}),
+        _value({"ok": False, "reason": "SEND_DISABLED"}),
+        _value({"ok": True, "method": "button-click", "label": "发送消息"}),
+    ])
+    result = send_prompt_via_cdp("x", transport=transport, submit_interval=0)
+    assert result["submit"]["ok"] is True
+    assert result["submit"]["attempts"] == 3
+
+
+def test_cdp_submit_prefilled_workbuddy_composer():
+    from agentloop_hub.gui.cdp import submit_composer_via_cdp
+    transport = FakeTransport([
+        _value({"ok": True, "chars": 7, "text": "task..."}),
+        _value({"ok": True, "method": "button-click", "label": "发送"}),
+    ])
+    result = submit_composer_via_cdp(transport=transport, submit_interval=0)
+    assert result["path"] == "cdp-submit-prefilled"
+    assert result["prefill"]["chars"] == 7
+    assert result["submit"]["label"] == "发送"
+    expressions = [params["expression"] for _, params in transport.calls]
+    assert all("Input." not in expr for expr in expressions)
+    assert any("const text = (c.innerText" in expr for expr in expressions)
+
+
+def test_cdp_refuses_empty_prefilled_composer():
+    from agentloop_hub.gui.cdp import submit_composer_via_cdp
+    transport = FakeTransport([_value({"ok": True, "chars": 0})])
+    with pytest.raises(GuiAutomationError) as info:
+        # 0.05s keeps the probe to a single deterministic evaluate call.
+        submit_composer_via_cdp(transport=transport, prefill_timeout=0.05)
+    assert info.value.code == "GUI_SEND_FAILED"
+    assert "空提交" in str(info.value)
+
+
 def test_cdp_missing_submit_button_is_explicit():
     transport = FakeTransport([
         _value({"ok": True, "method": "execCommand.insertText"}),
         _value({"ok": False, "reason": "NO_SUBMIT"}),
     ])
     with pytest.raises(GuiAutomationError) as info:
-        send_prompt_via_cdp("x", transport=transport)
+        send_prompt_via_cdp("x", transport=transport, submit_retries=1)
     assert info.value.code == "GUI_SEND_FAILED"
     assert info.value.details["submit"]["reason"] == "NO_SUBMIT"
 

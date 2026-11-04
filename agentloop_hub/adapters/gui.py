@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from ..control.interfaces import (
-    prepare_qoder_session, prepare_workbuddy_task, qoder_model_key,
-    set_model_programmatically, verify_qoder_session, verify_workbuddy_task,
-    workbuddy_model_key,
+    ensure_workbuddy_cdp, prepare_qoder_session, prepare_workbuddy_task,
+    qoder_model_key, set_model_programmatically, verify_qoder_session,
+    verify_workbuddy_task, workbuddy_model_key,
 )
 from ..control.zero_input import os_input_allowed
 from ..gui import (
@@ -49,6 +49,11 @@ class GuiAutomationAdapter(BaseAdapter):
             self.config.get("qoder_cdp_port")
             or os.environ.get("AGENTMESH_QODER_CDP_PORT")
             or 9222
+        )
+        self.workbuddy_cdp_port = int(
+            self.config.get("workbuddy_cdp_port")
+            or os.environ.get("AGENTMESH_WORKBUDDY_CDP_PORT")
+            or 9223
         )
         if str(self.config.get("gui_app") or "") == "qoder_cn":
             # Qoder's prompt path always runs through the renderer DOM, so the
@@ -172,11 +177,42 @@ class GuiAutomationAdapter(BaseAdapter):
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
             if interface_info.get("method") == "workbuddy_deeplink":
-                # The deep link carries action=start, so the target app submits
-                # the prompt itself.  No Enter key, no mouse click.
+                # Verified in WorkBuddy 5.9.3: the task deeplink calls
+                # prepareInput and does NOT send.  Submit through the renderer:
+                # wait until the prefilled text is visible, then click the
+                # composer's own 发送 button.  No Enter key, no OS input.
+                from ..gui.cdp import submit_composer_via_cdp
+                # A freshly restarted renderer can keep the send button
+                # disabled while React settles; retry, and re-issue the
+                # deeplink once (it re-prefills the same text) before failing.
+                for attempt in (1, 2):
+                    try:
+                        cdp_result = submit_composer_via_cdp(
+                            port=self.workbuddy_cdp_port,
+                            prefill_timeout=float(
+                                self.config.get("workbuddy_prefill_timeout_seconds") or 20
+                            ),
+                            submit_retries=int(
+                                self.config.get("workbuddy_submit_retries") or 30
+                            ),
+                            submit_interval=0.5,
+                        )
+                        break
+                    except GuiAutomationError as exc:
+                        if attempt == 2:
+                            raise
+                        _log(log_path, "submit_retry_deeplink", error=str(exc))
+                        prepare_workbuddy_task(
+                            workspace=str(interface_info.get("workspace") or ""),
+                            model=request.model, prompt=prompt_to_send,
+                            welcome_mode=str(interface_info.get("welcome_mode") or "code"),
+                            permission_mode=str(interface_info.get("permission_mode")
+                                                or "fullAccess"),
+                            config=self.config,
+                        )
                 _log(log_path, "prompt_submitted", marker=marker,
-                     chars=len(prompt_to_send), method="deeplink",
-                     cdp=interface_info.get("deeplink", ""))
+                     chars=len(prompt_to_send), method="deeplink+cdp-dom",
+                     cdp=cdp_result, deeplink=interface_info.get("deeplink", ""))
             elif interface_info.get("method") == "qoder_db_transcript":
                 from ..gui.cdp import send_prompt_via_cdp
                 cdp_result = send_prompt_via_cdp(
@@ -279,6 +315,17 @@ class GuiAutomationAdapter(BaseAdapter):
                 "完成后按其中的输出契约写结果。\n"
                 f"<!-- {MARKER_PREFIX}: {marker} -->\n"
             )
+            cdp = ensure_workbuddy_cdp(
+                executable=str(self.config.get("executable") or ""),
+                port=self.workbuddy_cdp_port,
+            )
+            _log(log_path, "cdp_ready", app=app, **cdp.to_dict())
+            if not cdp.ok:
+                raise GuiAutomationError(
+                    cdp.error_code or "GUI_SEND_FAILED",
+                    cdp.reason or "WorkBuddy CDP 未就绪",
+                    details=cdp.to_dict(),
+                )
             outcome = prepare_workbuddy_task(
                 workspace=workspace, model=request.model, prompt=short_prompt,
                 welcome_mode=welcome, permission_mode=permission, config=self.config,
@@ -293,8 +340,10 @@ class GuiAutomationAdapter(BaseAdapter):
             return {
                 "method": "workbuddy_deeplink", "model_key": model_key,
                 "short_prompt": short_prompt, "prepare": outcome.to_dict(),
-                "prompt_file": str(prompt_copy),
-                "deeplink": str(outcome.evidence.get("deeplink") or ""),
+                "prompt_file": str(prompt_copy), "workspace": workspace,
+                "welcome_mode": welcome, "permission_mode": permission,
+                "deeplink": str(outcome.evidence.get("uri")
+                                or outcome.evidence.get("deeplink") or ""),
                 "verify": lambda _sid="": verify_workbuddy_task(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, welcome_mode=welcome,
