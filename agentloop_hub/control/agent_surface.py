@@ -170,6 +170,12 @@ def _dsh_evidence(home: Path) -> dict[str, Any]:
 
 
 def _trae_evidence(record: Any) -> dict[str, Any]:
+    """Legacy evidence for the ENCRYPTED ai-agent database.
+
+    The verified zero-input interface does not use this file at all: it writes
+    ``User/globalStorage/state.vscdb`` (plain SQLite), which is reported by
+    ``trae_interface.probe`` below.
+    """
     path = Path(str((record.adapter_config or {}).get("data_path") or ""))
     out: dict[str, Any] = {"data_path": str(path), "exists": path.is_file()}
     if path.is_file():
@@ -180,6 +186,13 @@ def _trae_evidence(record: Any) -> dict[str, Any]:
         except Exception as exc:
             out["error"] = str(exc)
     return out
+
+
+def _trae_programmatic_evidence(record: Any) -> dict[str, Any]:
+    config = dict(record.adapter_config or {})
+    app = str(config.get("gui_app") or record.agent_id)
+    from . import trae_interface
+    return trae_interface.probe(app, config)
 
 
 def _models(record: Any) -> list[str]:
@@ -331,22 +344,52 @@ def _build_one(record: Any, home: Path) -> dict[str, Any]:
         caps["dev_mode"] = _cap("partial", "cli-arg --auto", "opencode run --auto",
                                 readback="进程参数", gap="无运行时模式回读")
     elif agent_id in ("trae", "trae_cn"):
-        ev = _trae_evidence(record)
-        caps = _file_relay_surface(
-            record,
-            reason=(f"{Path(str((record.adapter_config or {}).get('data_path') or '')).name} "
-                    "文件头非 'SQLite format 3'（加密/私有格式），未发现可写接口"),
-            evidence=ev,
-        )
+        config = dict(record.adapter_config or {})
+        if config.get("mode") == "gui_automation" and config.get("trae_state_db"):
+            ev = _trae_programmatic_evidence(record)
+            good = bool(ev.get("state_db_plain_sqlite") and ev.get("model_count"))
+            caps = {
+                "open_activate": _cap("verified" if good else "partial",
+                                      "process-launch + cdp",
+                                      '"Trae CN.exe" --remote-debugging-port=9342 --folder-uri=file:///...',
+                                      readback="/json/version + 窗口标题", evidence=ev),
+                "workspace": _cap("verified" if good else "partial", "state.vscdb",
+                                  "solo-lite.local-project-folders / project-workspace-cache / mode-state-map.session.workspacePath",
+                                  readback="mode-state-map workspacePath + route", evidence=ev),
+                "model": _cap("verified" if good else "partial", "state.vscdb",
+                              "<uid>:AI.agent.model.recent_user_selection_by_agent_label -> modelId",
+                              readback="state.vscdb ItemTable", evidence=ev),
+                "dev_mode": _cap("verified" if good else "partial", "state.vscdb",
+                                 "solo-lite-mode-state-map-<uid>: work / code / design",
+                                 readback="mode-state-map 当前 session.mode", evidence=ev),
+                "chat": _cap("verified" if good else "partial", "cdp-dom",
+                             "Runtime.evaluate insertText + click .icube-chat-input-action-btn-send",
+                             readback="document.body.innerText + assistant_task_status=finished",
+                             evidence=ev,
+                             gap="" if good else "state.vscdb 未通过明文/模型清单校验"),
+            }
+        else:
+            ev = _trae_evidence(record)
+            caps = _file_relay_surface(
+                record,
+                reason=(f"{Path(str((record.adapter_config or {}).get('data_path') or '')).name} "
+                        "文件头非 'SQLite format 3'（加密/私有格式）；本次未发现可用的程序接口"),
+                evidence=ev,
+            )
     elif agent_id == "qoder":
         ev = {"projects": str(getattr(record, "data_path", "") or ""),
-              "models": _models(record), "note": "transcript jsonl 可读"}
+              "models": _models(record), "note": "transcript jsonl 可读；main.sqlite 为明文"}
         caps = _file_relay_surface(record,
-                                   reason="国际版仅登记 file_relay；未做写会话/重启回读验证",
+                                   reason="国际版仅登记 file_relay；零输入聊天通道未在本机验证",
                                    evidence=ev)
-        caps["model"] = _cap("partial", "transcript jsonl read", "read assistant.model",
-                             readback="~/.qoder/projects/**/*.jsonl", evidence=ev,
-                             gap="可回读历史模型，无 set_model 写入")
+        caps["workspace"] = _cap(
+            "partial", "sqlite read",
+            "com.qoder.app.stable/main.sqlite workspaces.root_paths_json + chat_sessions.cwd",
+            readback="main.sqlite chat_sessions.cwd", evidence=ev,
+            gap="与 CN 版同构，但未做写会话/重启回读实测，暂不启用")
+        caps["model"] = _cap("partial", "sqlite read", "chat_model_preferences.model_key (含 gfmodel)",
+                             readback="~/.qoder/projects/**/*.jsonl assistant.model", evidence=ev,
+                             gap="可回读历史模型与真实 key，无已验证的写入/生效路径")
     elif agent_id == "zcode":
         caps = _zcode_surface(record, zc)
     elif agent_id == "dsh":

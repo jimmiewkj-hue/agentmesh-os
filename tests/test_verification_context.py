@@ -175,7 +175,8 @@ def test_budget_and_pricing(tmp_path):
     project = Project(project_id="prj", name="p", root=str(tmp_path), workspace_id="w",
                       repository_id="r", worktree_id="t", extra={"token_budget": 200})
     store.save_project(project)
-    config = HubConfig(pricing={"mock-model": {"input": 1.0, "output": 2.0}})
+    config = HubConfig(pricing={"mock-model": {"input": 1.0, "output": 2.0}},
+                       budget_hard_stop=True)
     budget = BudgetManager(store, project, config)
     task = Task(uid="run:T", project_id="prj", plan_id="plan", run_id="run",
                 spec=TaskSpec(task_id="T", title="t", objective="o", token_budget=150,

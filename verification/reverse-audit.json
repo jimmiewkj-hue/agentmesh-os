@@ -1,0 +1,579 @@
+{
+  "generated_at": "2026-11-04T14:18:57",
+  "policy": {
+    "os_input": "blocked (AGENTMESH_DISABLE_GUI_INPUT=1)",
+    "vendor_http_api": "never used; all channels are the applications' own stores/CLI/CDP/deeplinks",
+    "scope": "all locally installed agents; uninstalled products are marked not_installed"
+  },
+  "agents": {
+    "trae": {
+      "product": "Trae",
+      "executable": "C:\\Users\\<user>\\AppData\\Local\\Programs\\Trae\\Trae.exe",
+      "installed": true,
+      "protocol": "trae",
+      "state_db": "C:\\Users\\<user>\\AppData\\Roaming\\Trae\\User\\globalStorage\\state.vscdb",
+      "state_db_plain_sqlite": true,
+      "state_keys": [
+        "7593242438585041937_AI.agent.mode",
+        "7593242438585041937_AI.agent.mode.op_version",
+        "7593242438585041937_AI.agent.modeListMap",
+        "7593242438585041937_AI.agent.model.model_list_map",
+        "7593242438585041937_AI.agent.model.selected_model",
+        "7593242438585041937_ai-chat:sessionRelation:globalModeMap",
+        "7593242438585041937_ai-chat:sessionRelation:globalModelMap",
+        "7593242438585041937_ai-chat:sessionRelation:modelMaxModeMap",
+        "7613641117829284877_AI.agent.modeListMap",
+        "7613641117829284877_AI.agent.model.model_list_map",
+        "7613641117829284877_ai-chat:sessionRelation:globalModeMap",
+        "7613641117829284877_ai-chat:sessionRelation:globalModelMap",
+        "7618107242328376328:AI.agent.model.max_mode_by_agent_model",
+        "7618107242328376328:AI.agent.model.model_list_map",
+        "7618107242328376328:AI.agent.model.recent_user_selection_by_agent_label",
+        "7618107242328376328:AI.agent.model.session_selected_model",
+        "7618107242328376328_AI.agent.mode.op_version",
+        "7618107242328376328_AI.agent.modeListMap",
+        "7618107242328376328_AI.agent.model.model_list_map",
+        "7618107242328376328_ai-chat:sessionRelation:globalModeMap",
+        "7618107242328376328_ai-chat:sessionRelation:globalModelMap",
+        "7618107242328376328_ai-chat:sessionRelation:modelMaxModeMap",
+        "ADD_MODEL_HAS_BEEN_SEEN",
+        "AI.toolcall.acceptMode.migrated.completed",
+        "BUILDER_MODEL_HAS_NEW_BADGE",
+        "chat.workspaceTransfer",
+        "content.trust.model.key",
+        "markdownPreview.lastManualMode",
+        "notifications.perSourceDoNotDisturbMode",
+        "previousAgentDataLeaveIDEMode_7593242438585041937"
+      ],
+      "model_catalog": {
+        "source": "<uid>:AI.agent.model.model_list_map (ItemTable)",
+        "count": 91,
+        "sample": [
+          "Dola-Seed-2.0-Code",
+          "gpt-6.1-sol",
+          "gpt-6.1-terra",
+          "gpt-6-astra",
+          "gpt-6-sol",
+          "gpt-6-luna",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.2"
+        ],
+        "deepseek_v4_1_flash": true,
+        "glm_5_3_flash": false,
+        "selected": {
+          "solo_agent": {
+            "modelId": "solo_agent_1__gpt-5.4",
+            "mode": 0
+          },
+          "solo_coder": {
+            "modelId": "solo_coder_1__gpt-5",
+            "mode": 0
+          }
+        }
+      },
+      "workspace_channel": [
+        "solo-lite.local-project-folders",
+        "solo-lite.project-workspace-cache",
+        "solo-lite-mode-state-map-<uid> session.local_folder/mainFolder/workspacePath",
+        "solo-lite:route:<uid>",
+        "--folder-uri (out/cli.js)"
+      ],
+      "dev_mode_channel": "solo-lite-mode-state-map-<uid>: work / code / design",
+      "chat_channel": [
+        "CDP Runtime.evaluate insertText + click .icube-chat-input-action-btn-send",
+        "deeplink <protocol>://GitHub.copilot-chat?agent=&prompt= (prefill only)",
+        "CLI `chat <prompt> -m <mode>` (out/cli.js)"
+      ],
+      "readback_channel": [
+        "<uid>:AI.agent.model.recent_user_selection_by_agent_label",
+        "solo-lite-mode-state-map-<uid> (workspacePath / mode)",
+        "CDP document.body.innerText (visible conversation)",
+        "~/.trae-cn/memory/projects/**/session_memory_*.jsonl (summary only)"
+      ],
+      "cdp": "verified: --remote-debugging-port works after removing ELECTRON_RUN_AS_NODE",
+      "evidence": [
+        "resources/app/product.json:39 urlProtocol",
+        "resources/app/out/cli.js:29 --folder-uri / chat subcommand",
+        "resources/app/out/vs/workbench/workbench.desktop.main.js:2844 chat deeplink",
+        "resources/app/out/vs/workbench/workbench.desktop.main.js:3777 send button class",
+        "resources/app/node_modules/@byted-icube/solo-lite/dist/5806.88847ced.mjs:2772 model keys",
+        "resources/app/out/main.js:2645 patchSelections writes applicationStorage"
+      ],
+      "status": "verified"
+    },
+    "trae_cn": {
+      "product": "Trae CN",
+      "executable": "C:\\Users\\<user>\\AppData\\Local\\Programs\\Trae CN\\Trae CN.exe",
+      "installed": true,
+      "protocol": "trae-cn",
+      "state_db": "C:\\Users\\<user>\\AppData\\Roaming\\Trae CN\\User\\globalStorage\\state.vscdb",
+      "state_db_plain_sqlite": true,
+      "state_keys": [
+        "3059310181236400:AI.agent.model.max_mode_by_agent_model",
+        "3059310181236400:AI.agent.model.model_list_map",
+        "3059310181236400:AI.agent.model.reasoning_effort_level_by_agent_model_v2",
+        "3059310181236400:AI.agent.model.recent_user_selection_by_agent_label",
+        "3059310181236400:AI.agent.model.session_selected_model",
+        "3059310181236400:workspace-selector.recent.v1",
+        "3059310181236400_AI.agent.mode",
+        "3059310181236400_AI.agent.mode.op_version",
+        "3059310181236400_AI.agent.modeListMap",
+        "3059310181236400_AI.agent.model.model_list_map",
+        "3059310181236400_AI.agent.model.selected_model",
+        "3059310181236400_AI.agent.model.snapshot_before_switch_to_web_builder",
+        "3059310181236400_AI.agent.model.snapshot_by_agent-type_solo_coder",
+        "3059310181236400_AI.agent.soloAgent.autoModeDisabled",
+        "3059310181236400_ai-chat:sessionRelation:globalModeMap",
+        "3059310181236400_ai-chat:sessionRelation:globalModelMap",
+        "ADD_MODEL_HAS_BEEN_SEEN",
+        "AI.agent.model",
+        "AI.agent.modelList",
+        "AI.model",
+        "AI.modelList",
+        "AI.modelSelectionReset.boot.v1",
+        "AI.toolcall.acceptMode.migrated.completed",
+        "BUILDER_MODEL_HAS_NEW_BADGE",
+        "CHAT_MODEL_HAS_NEW_BADGE",
+        "chat.workspaceTransfer",
+        "content.trust.model.key",
+        "localModelData_3059310181236400_6944cc76b3556d2bde76830b",
+        "localModelData_3059310181236400_695f707765a1eb607beab502",
+        "localModelModeList_3059310181236400_6944cc76b3556d2bde76830b"
+      ],
+      "model_catalog": {
+        "source": "<uid>:AI.agent.model.model_list_map (ItemTable)",
+        "count": 155,
+        "sample": [
+          "Doubao-Seed-2.1-Turbo",
+          "Doubao-Seed-2.1-Pro",
+          "Doubao-Seed-Evolving",
+          "Doubao-Seed-Code",
+          "glm-5.3-flash",
+          "glm-5.3-flashx",
+          "glm-5.3",
+          "deepseek-v4.1-flash",
+          "DeepSeek-V4-Pro-Official",
+          "kimi-k3.1-pro",
+          "kimi-k3",
+          "mimo-v2.6-flash"
+        ],
+        "deepseek_v4_1_flash": true,
+        "glm_5_3_flash": true,
+        "selected": {
+          "solo_agent": {
+            "modelId": "solo_agent_1__deepseek-v4.1-flash",
+            "mode": 0
+          }
+        }
+      },
+      "workspace_channel": [
+        "solo-lite.local-project-folders",
+        "solo-lite.project-workspace-cache",
+        "solo-lite-mode-state-map-<uid> session.local_folder/mainFolder/workspacePath",
+        "solo-lite:route:<uid>",
+        "--folder-uri (out/cli.js)"
+      ],
+      "dev_mode_channel": "solo-lite-mode-state-map-<uid>: work / code / design",
+      "chat_channel": [
+        "CDP Runtime.evaluate insertText + click .icube-chat-input-action-btn-send",
+        "deeplink <protocol>://GitHub.copilot-chat?agent=&prompt= (prefill only)",
+        "CLI `chat <prompt> -m <mode>` (out/cli.js)"
+      ],
+      "readback_channel": [
+        "<uid>:AI.agent.model.recent_user_selection_by_agent_label",
+        "solo-lite-mode-state-map-<uid> (workspacePath / mode)",
+        "CDP document.body.innerText (visible conversation)",
+        "~/.trae-cn/memory/projects/**/session_memory_*.jsonl (summary only)"
+      ],
+      "cdp": "verified: --remote-debugging-port works after removing ELECTRON_RUN_AS_NODE",
+      "evidence": [
+        "resources/app/product.json:39 urlProtocol",
+        "resources/app/out/cli.js:29 --folder-uri / chat subcommand",
+        "resources/app/out/vs/workbench/workbench.desktop.main.js:2844 chat deeplink",
+        "resources/app/out/vs/workbench/workbench.desktop.main.js:3777 send button class",
+        "resources/app/node_modules/@byted-icube/solo-lite/dist/5806.88847ced.mjs:2772 model keys",
+        "resources/app/out/main.js:2645 patchSelections writes applicationStorage"
+      ],
+      "status": "verified"
+    },
+    "qoder": {
+      "product": "Qoder",
+      "executable": "C:\\Program Files\\Qoder\\Qoder\\Qoder.exe",
+      "installed": true,
+      "state_db": "C:\\Users\\<user>\\AppData\\Roaming\\com.qoder.app.stable\\main.sqlite",
+      "state_db_plain_sqlite": true,
+      "state_tables": [
+        "account_profiles",
+        "agent_data_import_accounts",
+        "agent_data_import_failures",
+        "agent_data_import_runs",
+        "agent_inbox_items",
+        "agent_inbox_progress",
+        "agent_profile_details",
+        "agent_profiles",
+        "agent_registration_outbox",
+        "agent_runtimes",
+        "agent_team_members",
+        "agent_teams",
+        "app_settings",
+        "application_sdk_authorizations",
+        "attention_completions",
+        "byok_model_capability_metadata",
+        "byok_model_credentials",
+        "byok_model_profiles",
+        "chat_attachment_assets",
+        "chat_generated_image_assets"
+      ],
+      "model_catalog": {
+        "source": "chat_model_preferences.model_key + chat_sessions.model",
+        "count": 15,
+        "keys": [
+          "auto",
+          "cmodel",
+          "dfmodel",
+          "dmodel",
+          "efficient",
+          "fast",
+          "gfmodel",
+          "gmodel",
+          "kmodel",
+          "kmodel_latest",
+          "mmodel",
+          "qfmodel",
+          "qmodel_38max",
+          "smodel",
+          "ultimate"
+        ],
+        "glm_5_3_flash": true
+      },
+      "workspace_channel": [
+        "main.sqlite workspaces.root_paths_json",
+        "chat_sessions.cwd / workspace_id / execution_target_json",
+        "transcript workspace-directories event",
+        "sites/sessions/*.json location.projectRoot"
+      ],
+      "dev_mode_channel": "product_mode column (coding) + transcript runtime-config",
+      "chat_channel": "CDP Runtime.evaluate insertText + send button click",
+      "readback_channel": [
+        "main.sqlite chat_sessions.cwd/model",
+        "~/.qoder-cn/projects/<slug>/<session>.jsonl runtime-config + assistant.model",
+        "qoder-agent-sdk.log `session opened cwd=`"
+      ],
+      "cdp": "verified for Qoder CN (AGENTMESH_QODER_CDP_PORT=9222)",
+      "evidence": [
+        "com.qodercn.app.stable/main.sqlite (plain SQLite, chat_sessions/workspaces)",
+        "~/.qoder-cn/projects/**/*.jsonl transcript events",
+        "interfaces.py prepare_qoder_session / verify_qoder_session"
+      ],
+      "status": "partial"
+    },
+    "qoder_cn": {
+      "product": "Qoder CN",
+      "executable": "C:\\Program Files\\Qoder\\Qoder CN\\Qoder CN.exe",
+      "installed": true,
+      "state_db": "C:\\Users\\<user>\\AppData\\Roaming\\com.qodercn.app.stable\\main.sqlite",
+      "state_db_plain_sqlite": true,
+      "state_tables": [
+        "account_profiles",
+        "agent_data_import_accounts",
+        "agent_data_import_failures",
+        "agent_data_import_runs",
+        "agent_inbox_items",
+        "agent_inbox_progress",
+        "agent_profile_details",
+        "agent_profiles",
+        "agent_registration_outbox",
+        "agent_runtimes",
+        "agent_team_members",
+        "agent_teams",
+        "app_settings",
+        "application_sdk_authorizations",
+        "attention_completions",
+        "byok_model_capability_metadata",
+        "byok_model_credentials",
+        "byok_model_profiles",
+        "chat_attachment_assets",
+        "chat_generated_image_assets"
+      ],
+      "model_catalog": {
+        "source": "chat_model_preferences.model_key + chat_sessions.model",
+        "count": 11,
+        "keys": [
+          "auto",
+          "dfmodel",
+          "dmodel",
+          "fast",
+          "gfmodel",
+          "gmodel",
+          "kmodel",
+          "kmodel_latest",
+          "mmodel",
+          "qfmodel",
+          "qmodel_38max"
+        ],
+        "glm_5_3_flash": true
+      },
+      "workspace_channel": [
+        "main.sqlite workspaces.root_paths_json",
+        "chat_sessions.cwd / workspace_id / execution_target_json",
+        "transcript workspace-directories event",
+        "sites/sessions/*.json location.projectRoot"
+      ],
+      "dev_mode_channel": "product_mode column (coding) + transcript runtime-config",
+      "chat_channel": "CDP Runtime.evaluate insertText + send button click",
+      "readback_channel": [
+        "main.sqlite chat_sessions.cwd/model",
+        "~/.qoder-cn/projects/<slug>/<session>.jsonl runtime-config + assistant.model",
+        "qoder-agent-sdk.log `session opened cwd=`"
+      ],
+      "cdp": "verified for Qoder CN (AGENTMESH_QODER_CDP_PORT=9222)",
+      "evidence": [
+        "com.qodercn.app.stable/main.sqlite (plain SQLite, chat_sessions/workspaces)",
+        "~/.qoder-cn/projects/**/*.jsonl transcript events",
+        "interfaces.py prepare_qoder_session / verify_qoder_session"
+      ],
+      "status": "verified"
+    },
+    "workbuddy": {
+      "product": "WorkBuddy",
+      "executable": "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+      "installed": true,
+      "state_db": "C:\\Users\\<user>\\.workbuddy\\workbuddy.db",
+      "state_db_plain_sqlite": true,
+      "model_catalog": {
+        "source": "~/.workbuddy/local_storage/*.info product manifest",
+        "count": 59,
+        "ids": [
+          "auto",
+          "balanced-model",
+          "codewise-completions",
+          "codewise-jump",
+          "codewise-nes-a4-027-aide",
+          "codewise-rewrite",
+          "completion-gf",
+          "deep-model",
+          "deepseek-r1-0528",
+          "deepseek-r1-0528-lkeap",
+          "deepseek-v3-0324",
+          "deepseek-v3-0324-lkeap",
+          "deepseek-v3-0324-taco-completion",
+          "deepseek-v3-1",
+          "deepseek-v3-1-lkeap",
+          "deepseek-v3-1-volc",
+          "deepseek-v3-2-volc",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "deepseek-v4.1-flash"
+        ]
+      },
+      "workspace_channel": "workbuddy://task?action=start&cwd=&model=&welcomeMode=&permissionMode=&mode=",
+      "dev_mode_channel": "welcomeMode code/work/design -> sessions.source_mode craft/working/design",
+      "chat_channel": "deeplink prefills composer; CDP DOM click on 发送 button (no autoSend)",
+      "readback_channel": "~/.workbuddy/workbuddy.db sessions.cwd/model/source_mode/permission_mode",
+      "cdp": "verified --remote-debugging-port=9223",
+      "evidence": [
+        "app.asar task-deeplink-coordinator prepareInput (no autoSend)",
+        "workbuddy.db sessions table",
+        "interfaces.py prepare_workbuddy_task"
+      ],
+      "status": "verified"
+    },
+    "opencode": {
+      "product": "OpenCode",
+      "installed": true,
+      "adapter": "opencode",
+      "model_catalog": {
+        "source": "opencode CLI models output",
+        "count": 41,
+        "glm_5_3_flash_free": true,
+        "sample": [
+          "opencode-go/glm-5.2",
+          "opencode-go/glm-5.3",
+          "opencode-go/glm-5.3-flash",
+          "opencode/glm-5.3-flash-free"
+        ]
+      },
+      "workspace_channel": "process cwd = task worktree (subprocess)",
+      "dev_mode_channel": "CLI non-interactive run (no interactive mode)",
+      "chat_channel": "opencode run --format json --model <id> (stdio, non-interactive)",
+      "readback_channel": "stdout JSON event stream (step_finish usage/cost)",
+      "evidence": [
+        "adapters/cli.py run_process",
+        "adapters/opencode.py JSONL parser",
+        "adapters/discovery.py model probe"
+      ],
+      "status": "verified"
+    },
+    "zcode": {
+      "product": "ZCode",
+      "executable": "C:\\Program Files\\ZCode\\ZCode.exe",
+      "installed": true,
+      "state_db": "C:\\Users\\<user>\\.zcode\\cli\\db\\db.sqlite",
+      "state_db_plain_sqlite": true,
+      "state_tables": [
+        "dwf_actor",
+        "dwf_event",
+        "dwf_node",
+        "dwf_run",
+        "input_history",
+        "local_setting",
+        "message",
+        "model_usage",
+        "part",
+        "permission",
+        "schema_migration",
+        "session",
+        "session_entry",
+        "session_input",
+        "session_target",
+        "session_task_link",
+        "sqlite_sequence",
+        "todo",
+        "tool_usage",
+        "turn_usage",
+        "workflow_activity",
+        "workflow_definition"
+      ],
+      "model_catalog": {
+        "source": "~/.zcode/cli/rollout/model-io-sess_*.jsonl + provider_config + local_setting",
+        "sample": [
+          "DeepSeek-V4.1-Flash",
+          "GLM-5.3-Flash",
+          "deepseek-v4-pro",
+          "glm-5.2",
+          "glm-5.3",
+          "glm-5.3-flash"
+        ]
+      },
+      "workspace_channel": "cli/db/db.sqlite session.directory / session.path / project_id (plain SQLite)",
+      "dev_mode_channel": "cli/db/db.sqlite local_setting(permission.mode=yolo) + session.permission",
+      "chat_channel": "NOT FOUND (Electron GUI, no verified IPC/CLI send path)",
+      "readback_channel": "cli/db/db.sqlite session.* + model_usage.model_id + rollout jsonl",
+      "evidence": [
+        "~/.zcode/cli/db/db.sqlite tables session/local_setting/model_usage",
+        "~/.zcode/cli/rollout/model-io-sess_*.jsonl",
+        "C:/Program Files/ZCode/resources app bundle"
+      ],
+      "status": "partial"
+    },
+    "dsh": {
+      "product": "DeepSeek Harness",
+      "installed": false,
+      "settings": "C:\\Users\\<user>\\.dsh\\settings.yaml",
+      "catalog": "C:\\Users\\<user>\\.dsh\\.workbuddy-catalog.json",
+      "catalog_exists": true,
+      "sessions_dir": "C:\\Users\\<user>\\.dsh\\sessions",
+      "session_files": 323,
+      "model_catalog": {
+        "source": "settings.yaml + .workbuddy-catalog.json",
+        "sample": [
+          "Deepseek-V4.1-Flash",
+          "GLM-5.3-Flash",
+          "deepseek-v4-pro"
+        ]
+      },
+      "workspace_channel": "session directory naming (~/.dsh/sessions/<project>)",
+      "dev_mode_channel": "NOT FOUND",
+      "chat_channel": "NOT FOUND (zstd session files, no verified IPC/CLI send path)",
+      "readback_channel": "settings.yaml + .jsonl.zstd sessions (zstandard)",
+      "evidence": [
+        "~/.dsh/settings.yaml",
+        "~/.dsh/.workbuddy-catalog.json",
+        "~/.dsh/sessions/**/*.jsonl.zstd"
+      ],
+      "status": "partial"
+    },
+    "cursor": {
+      "product": "Cursor",
+      "executable": "C:\\Users\\<user>\\AppData\\Local\\Programs\\cursor\\Cursor.exe",
+      "installed": true,
+      "state_db": "C:\\Users\\<user>\\AppData\\Roaming\\Cursor\\User\\globalStorage\\state.vscdb",
+      "state_db_plain_sqlite": true,
+      "state_keys": [
+        "composer.composerHeaders.version",
+        "composer.hasReopenedOnce",
+        "composer.planMigrationToHomeDirCompleted",
+        "cursor.modelCatalogOwnKey.gateEnabled",
+        "cursor.plugins.installedIds.no-team|file:///g%3A/downloads/claude-code/claude-code-rev-main_two_model",
+        "cursor.plugins.installedIds.no-team|file:///g%3A/downloads/claude-code/claude-code-rev-main_two_model-1",
+        "cursor.plugins.installedIds.no-team|no-workspace",
+        "cursor/composerAutocompleteHeuristicsAutoApplied",
+        "cursor/composerAutocompleteHeuristicsEnabled",
+        "cursor/initialModelState",
+        "cursor/layoutControl.autoOpenFlyoutOnFirstWorkspaceLaunch",
+        "cursor/newChatAutoSwitchApplied",
+        "cursorai/donotchange/hasReconciledNewPrivacyModeWithServerOnUpgrade",
+        "cursorai/donotchange/newPrivacyMode2",
+        "cursorai/donotchange/newPrivacyModeHoursRemainingInGracePeriod",
+        "cursorai/donotchange/privacyMode",
+        "notifications.perSourceDoNotDisturbMode",
+        "workbench.backgroundComposer.persistentData",
+        "workbench.panel.composerChatViewPane.0307b7ee-c46c-453b-93d4-68c83dd55440.hidden",
+        "workbench.panel.composerChatViewPane.9dec9316-8431-435e-ae83-b2a5a6571160.hidden"
+      ],
+      "model_catalog": {
+        "source": "cursor/initialModelState + cursorDiskKV (ItemTable)",
+        "sample": []
+      },
+      "workspace_channel": "CLI --folder-uri (VSCode fork) + workspaceStorage/<id>/state.vscdb",
+      "dev_mode_channel": "NOT FOUND (no verified mode key)",
+      "chat_channel": "NOT FOUND (no verified zero-input send path)",
+      "readback_channel": "conversation-search.db + composerHeaders (plain SQLite)",
+      "evidence": [
+        "AppData/Roaming/Cursor/User/globalStorage/state.vscdb ItemTable",
+        "AppData/Roaming/Cursor/User/globalStorage/conversation-search.db",
+        "AppData/Local/Programs/cursor/Cursor.exe"
+      ],
+      "status": "partial"
+    },
+    "rea": {
+      "product": "REA Studio",
+      "installed": true,
+      "model_catalog": {
+        "source": "MCP tools/list (229 tools)",
+        "count": 0
+      },
+      "workspace_channel": "NOT APPLICABLE (tool service, no session workspace)",
+      "dev_mode_channel": "NOT APPLICABLE",
+      "chat_channel": "MCP stdio tools/call (not a chat agent)",
+      "readback_channel": "MCP tools/list + tools/call response",
+      "evidence": [
+        "project .mcp.json rea-agents 6.8.0",
+        "adapters/mcp.py initialize/tools"
+      ],
+      "status": "verified (tool service, no LLM model)"
+    },
+    "claude_code": {
+      "product": "Claude Code",
+      "installed": false,
+      "status": "not_installed",
+      "cli": "claude -p",
+      "note": "未安装，无本机可逆向的软件接口；不做任何猜测"
+    },
+    "gemini_cli": {
+      "product": "Gemini CLI",
+      "installed": false,
+      "status": "not_installed",
+      "cli": "gemini -p",
+      "note": "未安装，无本机可逆向的软件接口；不做任何猜测"
+    },
+    "codex_cli": {
+      "product": "Codex CLI",
+      "installed": false,
+      "status": "not_installed",
+      "cli": "codex exec",
+      "note": "未安装，无本机可逆向的软件接口；不做任何猜测"
+    },
+    "aider": {
+      "product": "Aider",
+      "installed": false,
+      "status": "not_installed",
+      "cli": "aider --message",
+      "note": "未安装，无本机可逆向的软件接口；不做任何猜测"
+    }
+  }
+}

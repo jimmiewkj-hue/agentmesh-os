@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 from ..adapters.discovery import DiscoveryContext, detect_models_for_agent
@@ -18,6 +19,7 @@ from ..config import HubConfig
 from .interfaces import list_qoder_models, list_workbuddy_models
 from ..errors import NotFoundError, ValidationError
 from ..models import AgentRecord, Project
+from ..util import now_iso
 from ..storage.repo import Store
 
 
@@ -28,6 +30,70 @@ SOURCE_LABELS: dict[str, str] = {
     "registered": "Agent 登记",
     "user": "用户登记",
 }
+
+
+def _display_name(agent_id: str, model: str) -> str:
+    """Human name exactly as the agent's own UI renders it."""
+    name = str(model or "")
+    if agent_id in ("trae", "trae_cn"):
+        try:
+            from . import trae_interface
+            row = trae_interface.resolve_trae_model(name, app=agent_id)
+            return str((row or {}).get("display_name") or name)
+        except Exception:
+            return name
+    if agent_id in ("qoder", "qoder_cn"):
+        from .interfaces import QODER_MODEL_LABELS
+        return QODER_MODEL_LABELS.get(name, name)
+    if agent_id == "workbuddy":
+        from .interfaces import WORKBUDDY_MODEL_LABELS
+        row = _workbuddy_map().get(name)
+        if row:
+            return str(row.get("name") or name)
+        if name in WORKBUDDY_MODEL_LABELS:
+            return name  # already the human label
+        return WORKBUDDY_MODEL_LABELS.get(name, name)
+    return name
+
+
+@lru_cache(maxsize=1)
+def _workbuddy_map() -> dict[str, dict[str, Any]]:
+    from .interfaces import list_workbuddy_models
+    try:
+        return {row["id"]: row for row in list_workbuddy_models()}
+    except Exception:
+        return {}
+
+
+def _model_rate(agent_id: str, model: str) -> float | None:
+    if agent_id == "workbuddy":
+        from .interfaces import WORKBUDDY_MODEL_LABELS
+        mapping = _workbuddy_map()
+        row = mapping.get(str(model))
+        if not row and str(model) in WORKBUDDY_MODEL_LABELS:
+            row = mapping.get(WORKBUDDY_MODEL_LABELS[str(model)])
+        return (row or {}).get("rate")
+    if agent_id not in ("trae", "trae_cn"):
+        return None
+    try:
+        from . import trae_interface
+        row = trae_interface.resolve_trae_model(model, app=agent_id)
+        return (row or {}).get("rate")
+    except Exception:
+        return None
+
+
+def _dedupe_by_display(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per human model name (ids and labels can both be registered)."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in models:
+        key = str(item.get("display_name") or item.get("name") or "").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 class ModelCatalogService:
@@ -66,12 +132,16 @@ class ModelCatalogService:
                 selected = str(main.get("model") or "")
             models = [
                 {
-                    "name": entry["model"], "source": entry["source"],
+                    "name": entry["model"],
+                    "display_name": _display_name(agent.agent_id, entry["model"]),
+                    "rate": _model_rate(agent.agent_id, entry["model"]),
+                    "source": entry["source"],
                     "source_label": SOURCE_LABELS.get(entry["source"], entry["source"]),
                     "note": entry.get("note", ""),
                 }
                 for entry in sorted(entries, key=lambda e: (e.get("source", ""), e["model"]))
             ]
+            models = _dedupe_by_display(models)
             item = {
                 "agent_id": agent.agent_id, "name": agent.name, "product": agent.product,
                 "status": agent.status, "version": agent.version,
@@ -105,22 +175,20 @@ class ModelCatalogService:
     # ------------------------------------------------------------------
     # Refresh / register / select
     # ------------------------------------------------------------------
-    def refresh(self, *, agent_id: str = "") -> dict[str, Any]:
+    def refresh(self, *, agent_id: str = "", source: str = "discovered") -> dict[str, Any]:
         agents = [self._agent(agent_id)] if agent_id else self.store.list_agents()
         refreshed: list[dict[str, Any]] = []
         for agent in agents:
             detected = list(detect_models_for_agent(agent, self.discovery_ctx))
             if agent.agent_id == "workbuddy":
-                for row in list_workbuddy_models():
-                    detected.extend([row["id"], row["name"]])
+                detected.extend([row["id"] for row in list_workbuddy_models()])
             elif agent.agent_id == "qoder_cn":
-                for row in list_qoder_models():
-                    detected.extend([row["id"], row["name"]])
+                detected.extend([row["id"] for row in list_qoder_models()])
             detected = sorted({str(item) for item in detected if str(item).strip()})
             if detected:
                 self.store.replace_discovered_models(
                     self.project.project_id, agent.agent_id, detected,
-                    source="discovered",
+                    source=source,
                 )
             rows = self.store.list_agent_models(self.project.project_id, agent_id=agent.agent_id)
             models = sorted({row["model"] for row in rows} | set(agent.models or []))
@@ -133,6 +201,20 @@ class ModelCatalogService:
             })
         return {"status": "refreshed", "agents": refreshed,
                 "catalog": self.catalog()}
+
+    def sync_all(self, *, agent_id: str = "") -> dict[str, Any]:
+        """Refresh every agent's real catalog and report per-agent coverage."""
+        result = self.refresh(agent_id=agent_id, source="sync")
+        return {
+            "status": "synced",
+            "synced_at": now_iso(),
+            "agents": [
+                {"agent_id": row["agent_id"], "detected": len(row.get("detected") or []),
+                 "total": row.get("total", 0)}
+                for row in result.get("agents", [])
+            ],
+            "catalog": result.get("catalog"),
+        }
 
     def register(self, agent_id: str, models: list[str], *, source: str = "user",
                  note: str = "") -> dict[str, Any]:

@@ -425,6 +425,13 @@ def detect_models_for_agent(agent: AgentRecord, ctx: DiscoveryContext | None = N
         projects = data_path or ctx.home / ".qoder" / "projects"
         if agent.agent_id == "qoder_cn":
             return _models_from_qoder_cn(ctx.home, projects)
+        try:
+            from ..control.interfaces import list_qoder_models
+            rows = list_qoder_models({"qoder_db": str(cfg.get("qoder_db") or "")})
+            if rows:
+                return sorted({row["id"] for row in rows})
+        except Exception:
+            pass
         return _models_from_jsonl_projects(projects, kind="qoder")
     if reader == "workbuddy":
         return _models_from_workbuddy_real(ctx.home, data_path)
@@ -434,9 +441,16 @@ def detect_models_for_agent(agent: AgentRecord, ctx: DiscoveryContext | None = N
         return sorted(set(_models_from_dsh(ctx.home / ".dsh"))
                       | set(_models_from_dsh_sessions(ctx.home / ".dsh" / "sessions")))
     if agent.agent_id in ("trae", "trae_cn"):
-        # Trae stores its model state in an encrypted database; return nothing
-        # rather than inventing model names. Users can register names manually.
-        return []
+        # The encrypted ai-agent DB is not the model source: the plain
+        # state.vscdb carries the real catalog.  Return the SOLO composer's
+        # model ids (the same set the in-app menu offers).
+        try:
+            from ..control import trae_interface
+            rows = trae_interface.list_trae_models(agent.agent_id, cfg)
+            return sorted({row["id"] for row in rows
+                           if row.get("agent_label") == trae_interface.AGENT_LABEL})
+        except Exception:
+            return []
     if agent.adapter_type == AdapterType.MCP.value:
         return []
     return sorted(set(agent.models or []))
@@ -532,6 +546,47 @@ def _trae_db(ctx: DiscoveryContext, edition: str) -> Path:
     return ctx.appdata / app_name / "ModularData" / "ai-agent" / "database.db"
 
 
+def _trae_state_db(ctx: DiscoveryContext, edition: str) -> Path:
+    """Plain SQLite applicationStorage (NOT the encrypted ai-agent DB)."""
+    app_name = "Trae CN" if edition == "cn" else "Trae"
+    return ctx.appdata / app_name / "User" / "globalStorage" / "state.vscdb"
+
+
+def _trae_programmatic(ctx: DiscoveryContext, app: str, edition: str,
+                       exe: Path | None) -> tuple[dict[str, Any], list[str]] | None:
+    """Evidence gate: only register zero-input automation when it is verifiable.
+
+    Requires the real executable, a plain SQLite applicationStorage and at
+    least one real model in the app's own catalog.  Anything else stays on the
+    honest file-relay path.
+    """
+    if exe is None:
+        return None
+    config = {"trae_state_db": str(_trae_state_db(ctx, edition))}
+    try:
+        from ..control import trae_interface
+        if not trae_interface.trae_state_db(app, config).exists():
+            return None
+        models = trae_interface.list_trae_models(app, config)
+    except Exception:
+        return None
+    if not models:
+        return None
+    gui_config = {
+        "mode": "gui_automation",
+        "gui_app": app,
+        "executable": str(exe),
+        "trae_state_db": str(_trae_state_db(ctx, edition)),
+        "trae_dev_mode": "code",
+        "trae_cdp_port": int(os.environ.get("AGENTMESH_TRAE_CDP_PORT")
+                             or trae_interface.CDP_DEFAULT_PORT),
+        "session_reader": app,
+        "data_path": str(_trae_db(ctx, edition)),
+    }
+    return gui_config, sorted({m["id"] for m in models
+                               if m["agent_label"] == trae_interface.AGENT_LABEL})
+
+
 def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -> list[AgentRecord]:
     ctx = ctx or DiscoveryContext.from_env()
     out: list[AgentRecord] = []
@@ -543,12 +598,21 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
     ])
     trae_data = _trae_db(ctx, "intl")
     trae_home = ctx.home / ".trae"
-    out.append(_make_agent(
+    trae_programmatic = _trae_programmatic(ctx, "trae", "intl", trae_exe)
+    trae_record = _make_agent(
         agent_id="trae", name="Trae", product="Trae", edition="international",
         exe=trae_exe, data_path=trae_data if trae_data.exists() else (trae_home if trae_home.exists() else None),
-        reader="trae", project_id=project_id, access_level=AccessLevel.L2.value if trae_exe or trae_data.exists() else AccessLevel.L1.value,
-        structured=False, adapter_config=_file_relay_config(str(trae_data), "trae"),
-    ))
+        reader="trae", project_id=project_id,
+        access_level=AccessLevel.L3.value if trae_programmatic else
+            (AccessLevel.L2.value if trae_exe or trae_data.exists() else AccessLevel.L1.value),
+        structured=bool(trae_programmatic),
+        adapter_type=(AdapterType.GUI_AUTOMATION.value if trae_programmatic
+                      else AdapterType.FILE_RELAY.value),
+        adapter_config=(trae_programmatic[0] if trae_programmatic
+                        else _file_relay_config(str(trae_data), "trae")),
+        models=(trae_programmatic[1] if trae_programmatic else []),
+    )
+    out.append(trae_record)
 
     trae_cn_exe = _first_existing([
         ctx.localappdata / "Programs" / "Trae CN" / "Trae CN.exe",
@@ -556,14 +620,37 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
     ])
     trae_cn_data = _trae_db(ctx, "cn")
     trae_cn_home = ctx.home / ".trae-cn"
-    out.append(_make_agent(
+    trae_cn_programmatic = _trae_programmatic(ctx, "trae_cn", "cn", trae_cn_exe)
+    trae_cn_record = _make_agent(
         agent_id="trae_cn", name="Trae CN", product="Trae CN", edition="domestic",
         exe=trae_cn_exe,
         data_path=trae_cn_data if trae_cn_data.exists() else (trae_cn_home if trae_cn_home.exists() else None),
         reader="trae", project_id=project_id,
-        access_level=AccessLevel.L2.value if trae_cn_exe or trae_cn_data.exists() else AccessLevel.L1.value,
-        structured=False, adapter_config=_file_relay_config(str(trae_cn_data), "trae"),
-    ))
+        access_level=AccessLevel.L3.value if trae_cn_programmatic else
+            (AccessLevel.L2.value if trae_cn_exe or trae_cn_data.exists() else AccessLevel.L1.value),
+        structured=bool(trae_cn_programmatic),
+        adapter_type=(AdapterType.GUI_AUTOMATION.value if trae_cn_programmatic
+                      else AdapterType.FILE_RELAY.value),
+        adapter_config=(trae_cn_programmatic[0] if trae_cn_programmatic
+                        else _file_relay_config(str(trae_cn_data), "trae")),
+        models=(trae_cn_programmatic[1] if trae_cn_programmatic else []),
+    )
+    out.append(trae_cn_record)
+    for app_id, record, programmatic in (
+        ("trae", trae_record, trae_programmatic),
+        ("trae_cn", trae_cn_record, trae_cn_programmatic),
+    ):
+        if programmatic:
+            record.capabilities.update({
+                "gui_control": True, "auto_executable": True,
+                "structured_output": True, "background": True,
+            })
+            record.extra["gui_automation"] = {
+                "app": app_id,
+                "window_title": "Trae CN" if app_id == "trae_cn" else "Trae",
+                "interface": "state.vscdb + cdp-dom",
+                "model_count": len(programmatic[1]),
+            }
 
     # --- Qoder ------------------------------------------------------------
     qoder_exe = _first_existing([
@@ -571,13 +658,20 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         ctx.localappdata / "Programs" / "Qoder IDE" / "Qoder IDE.exe",
     ])
     qoder_projects = ctx.home / ".qoder" / "projects"
-    out.append(_make_agent(
+    qoder_intl_record = _make_agent(
         agent_id="qoder", name="Qoder", product="Qoder", edition="international",
         exe=qoder_exe, data_path=qoder_projects if qoder_projects.exists() else None,
         reader="qoder", project_id=project_id,
         access_level=AccessLevel.L2.value if qoder_exe or qoder_projects.exists() else AccessLevel.L1.value,
         structured=False, models=_models_from_jsonl_projects(qoder_projects, kind="qoder"),
-    ))
+    )
+    qoder_intl_record.adapter_config.update({
+        "qoder_db": str(ctx.appdata / "com.qoder.app.stable" / "main.sqlite"),
+        "qoder_projects": str(qoder_projects),
+        "qoder_image": "Qoder.exe",
+        "gui_app": "qoder",
+    })
+    out.append(qoder_intl_record)
 
     qoder_cn_exe = _first_existing([
         ctx.programfiles / "Qoder" / "Qoder CN" / "Qoder CN.exe",

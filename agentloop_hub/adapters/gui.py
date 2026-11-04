@@ -22,6 +22,7 @@ from ..control.interfaces import (
     qoder_model_key, set_model_programmatically, verify_qoder_session,
     verify_workbuddy_task, workbuddy_model_key,
 )
+from ..control import trae_interface
 from ..control.zero_input import os_input_allowed
 from ..gui import (
     GUI_ERROR_CODES, GuiAutomationError, GuiProfile, GuiReply, WindowsGuiDriver,
@@ -54,6 +55,11 @@ class GuiAutomationAdapter(BaseAdapter):
             self.config.get("workbuddy_cdp_port")
             or os.environ.get("AGENTMESH_WORKBUDDY_CDP_PORT")
             or 9223
+        )
+        self.trae_cdp_port = int(
+            self.config.get("trae_cdp_port")
+            or os.environ.get("AGENTMESH_TRAE_CDP_PORT")
+            or trae_interface.CDP_DEFAULT_PORT
         )
         if str(self.config.get("gui_app") or "") == "qoder_cn":
             # Qoder's prompt path always runs through the renderer DOM, so the
@@ -220,6 +226,12 @@ class GuiAutomationAdapter(BaseAdapter):
                 )
                 _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
                      method=interface_info.get("method"), input="cdp-dom", cdp=cdp_result)
+            elif interface_info.get("method") == "trae_state_vscdb":
+                cdp_result = trae_interface.send_trae_prompt(
+                    prompt_to_send, port=self.trae_cdp_port,
+                )
+                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                     method="trae_state_vscdb", input="cdp-dom", cdp=cdp_result)
             else:
                 driver.send_prompt(prompt_to_send)
                 _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
@@ -387,6 +399,91 @@ class GuiAutomationAdapter(BaseAdapter):
                     session_id=sid or str(outcome.evidence.get("session_id") or ""),
                 ),
             }
+        if app in ("trae_cn", "trae"):
+            # Trae / Trae CN 1.107.1: plain SQLite applicationStorage +
+            # CDP DOM.  The encrypted ai-agent database is never touched.
+            dev_mode = str(self.config.get("trae_dev_mode") or "code")
+            model_key = trae_interface.model_key(app, request.model, self.config)
+            if not model_key:
+                available = sorted({m["id"] for m in
+                                    trae_interface.list_trae_models(app, self.config)})[:20]
+                raise GuiAutomationError(
+                    "MODEL_UNAVAILABLE",
+                    f"Trae 真实模型清单中没有 {request.model}",
+                    details={"requested": request.model, "available": available},
+                )
+            prompt_dir = ensure_dir(Path(workspace) / ".agentmesh")
+            prompt_copy = prompt_dir / "interface-prompt.md"
+            atomic_write_text(prompt_copy, prompt_with_marker)
+            short_prompt = (
+                f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
+                "完成后按其中的输出契约写结果。\n"
+                f"<!-- {MARKER_PREFIX}: {marker} -->\n"
+            )
+            applied: list[Any] = []
+
+            def _apply_state() -> None:
+                applied.append(trae_interface.set_trae_workspace(
+                    workspace=workspace, app=app, dev_mode=dev_mode, config=self.config))
+
+            cdp = trae_interface.ensure_trae_cdp(
+                app=app, port=self.trae_cdp_port, workspace=workspace,
+                executable=str(self.config.get("executable") or ""),
+                config=self.config, force_restart=True, before_launch=_apply_state,
+            )
+            _log(log_path, "cdp_ready", app=app, **cdp.to_dict())
+            if not cdp.ok:
+                raise GuiAutomationError(cdp.error_code or "GUI_SEND_FAILED",
+                                         cdp.reason or "Trae CDP 未就绪",
+                                         details=cdp.to_dict())
+            workspace_outcome = applied[0] if applied else None
+            if workspace_outcome is not None and not workspace_outcome.ok:
+                raise GuiAutomationError(
+                    workspace_outcome.error_code or "INTERFACE_WRITE_FAILED",
+                    workspace_outcome.reason or "Trae 工作区写入失败",
+                    details=workspace_outcome.to_dict(),
+                )
+            # Model selection must happen while the renderer is alive: the SOLO
+            # preference is server-synced and the composer is the authority.
+            resolved = trae_interface.resolve_trae_model(
+                request.model, app=app, config=self.config) or {}
+            expected_display = str(resolved.get("display_name") or request.model)
+            model_outcome = trae_interface.set_trae_model(
+                model=request.model, app=app, config=self.config,
+                cdp_port=self.trae_cdp_port,
+            )
+            applied.append(model_outcome)
+            _log(log_path, "interface_prepare", app=app,
+                 applied=[o.to_dict() for o in applied])
+            if not model_outcome.ok:
+                raise GuiAutomationError(
+                    model_outcome.error_code or "MODEL_SWITCH_UNSUPPORTED",
+                    model_outcome.reason or "Trae 模型切换失败",
+                    details=model_outcome.to_dict(),
+                )
+            visible = str(model_outcome.actual.get("visible_model") or "")
+            _log(log_path, "trae_visible_model", visible=visible,
+                 expected=expected_display)
+            if visible.lower() != expected_display.lower():
+                raise GuiAutomationError(
+                    "MODEL_MISMATCH",
+                    f"Trae 输入框显示模型为 {visible or '(空)'}，期望 {expected_display}",
+                    details={"visible_model": visible, "expected": expected_display,
+                             "model_outcome": model_outcome.to_dict()},
+                )
+            return {
+                "method": "trae_state_vscdb", "model_key": model_key,
+                "short_prompt": short_prompt, "prompt_file": str(prompt_copy),
+                "prepare": {
+                    "workspace": workspace_outcome.to_dict() if workspace_outcome else {},
+                    "model": model_outcome.to_dict() if model_outcome else {},
+                    "cdp": cdp.to_dict(),
+                },
+                "verify": lambda _sid="": trae_interface.verify_trae_session(
+                    workspace=workspace, model=request.model, dev_mode=dev_mode,
+                    app=app, config=self.config, cdp_port=self.trae_cdp_port,
+                ),
+            }
         return {"method": "gui", "fallback_reason": f"{app} 未实现程序接口"}
 
     def _attach(self, driver: Any, profile: GuiProfile) -> dict[str, Any]:
@@ -485,6 +582,45 @@ class GuiAutomationAdapter(BaseAdapter):
                         f"期望模型 {key}，实际 {row.get('model')}",
                         details=evidence,
                     )
+            elif app in ("trae_cn", "trae"):
+                key = trae_interface.model_key(app, model_key, self.config)
+                if not key:
+                    raise GuiAutomationError(
+                        "MODEL_UNAVAILABLE",
+                        f"Trae 真实模型清单中没有 {model_key}",
+                    )
+                cdp = trae_interface.ensure_trae_cdp(
+                    app=app, port=self.trae_cdp_port,
+                    workspace=str(self.config.get("model_probe_workspace") or ""),
+                    config=self.config,
+                )
+                if not cdp.ok:
+                    raise GuiAutomationError(cdp.error_code or "GUI_SEND_FAILED",
+                                             cdp.reason or "Trae CDP 未就绪",
+                                             details=cdp.to_dict())
+                outcome = trae_interface.set_trae_model(
+                    model=model_key, app=app, config=self.config,
+                    cdp_port=self.trae_cdp_port,
+                )
+                evidence.update({"path": outcome.method, "actual": key,
+                                 "visible": outcome.actual.get("visible_model", ""),
+                                 "evidence": outcome.evidence})
+                if not outcome.ok:
+                    raise GuiAutomationError(
+                        outcome.error_code or "MODEL_SWITCH_UNSUPPORTED",
+                        outcome.reason or "Trae 模型切换失败",
+                        details=outcome.to_dict(),
+                    )
+                verified = trae_interface.verify_trae_session(
+                    workspace=str(self.config.get("model_probe_workspace") or ""),
+                    model=model_key,
+                    dev_mode=str(self.config.get("trae_dev_mode") or "code"),
+                    app=app, config=self.config, cdp_port=self.trae_cdp_port,
+                )
+                if not verified.ok and verified.error_code == "GUI_MODEL_SWITCH_FAILED":
+                    raise GuiAutomationError("MODEL_MISMATCH", verified.reason,
+                                             details=verified.to_dict())
+                evidence["ok"] = True
             else:
                 raise GuiAutomationError("MODEL_SWITCH_UNSUPPORTED",
                                          f"{app} 没有程序化模型接口")

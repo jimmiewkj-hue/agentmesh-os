@@ -48,6 +48,11 @@ class BudgetManager:
         return max(0, self.project_budget - self.used_project())
 
     def can_start(self, task: Task) -> tuple[bool, str]:
+        # Budget is an advisory statistic by default.  Starting/stopping a task
+        # is always a human decision; only an explicit budget_hard_stop=True
+        # turns the counter into a gate.
+        if not self.config.budget_hard_stop:
+            return True, ""
         if not self.project_budget:
             return True, ""
         used = self.used_project()

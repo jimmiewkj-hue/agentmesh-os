@@ -51,7 +51,12 @@ class OpenCodeAdapter(CliAgentAdapter):
         agent_name = str(self.config.get("agent") or "")
         if agent_name:
             args += ["--agent", agent_name]
-        if self.config.get("auto_approve"):
+        # A headless task that needs to write a file otherwise blocks on the
+        # interactive permission prompt and produces no output at all.  Auto
+        # approval is the default for control-plane runs; callers can still
+        # disable it explicitly with ``auto_approve: false``.
+        auto = self.config.get("auto_approve", True)
+        if str(auto).lower() not in ("0", "false", "no", "off"):
             args.append("--auto")
         if continue_session:
             args.append("--continue")

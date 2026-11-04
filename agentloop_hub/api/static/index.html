@@ -138,7 +138,7 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
         <button onclick="openWorkspace()">打开已有项目</button>
       </div>
       <div class="row" style="margin-top:8px">
-        <input id="budgetTokens" type="number" min="0" placeholder="项目 token 预算（0 表示不限）" style="max-width:260px">
+        <input id="budgetTokens" type="number" min="0" placeholder="Token 预算：0 = 不限（仅统计，不会自动停止任务）" style="max-width:320px">
         <button onclick="saveBudget()">保存预算</button>
         <span class="sub">计费 token 不含缓存 token；达到 80% 会在顶部告警。</span>
       </div>
@@ -174,8 +174,10 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
             <button onclick="autoMain()">自动选择主节点</button>
             <button onclick="discoverAgents()">重新探测 Agent</button>
             <button onclick="refreshModels()">刷新全部模型</button>
+            <button onclick="syncModels()">同步模型（全部）</button>
           </div>
           <div id="mainInfo" class="sub" style="margin-top:10px"></div>
+          <div id="modelSyncInfo" class="sub" style="margin-top:6px"></div>
         </div>
         <div>
           <div class="row" style="justify-content:space-between;align-items:center">
@@ -186,6 +188,27 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
           <div class="hint">选择模型后立即保存到该 Agent；任务执行、规划与验证都会优先使用这里的选配结果。</div>
         </div>
       </div>
+    </div>
+
+    <div class="card step">
+      <div class="step-head"><div class="step-no">3.5</div><div><h3>多 Agent 链路（工作区 / Agent / 模型固定）</h3><div class="sub">每个阶段锁定一个 Agent 与该 Agent 真实模型清单中的模型；执行只经应用自身软件接口（store / CLI / CDP），不合成 OS 键鼠。</div></div></div>
+      <textarea id="chainGoal" placeholder="链路目标">用三步完成一次代码巡检：扫描当前项目 → 检查缺陷 → 生成测试。</textarea>
+      <div id="chainStages" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:10px">
+        <select id="chainPolicy" style="max-width:150px" title="选型策略">
+          <option value="cost_first">最省优先</option>
+          <option value="balanced" selected>均衡</option>
+          <option value="quality_first">效果优先</option>
+        </select>
+        <button class="primary" onclick="runChain()">配置并运行链路</button>
+        <button onclick="autoSelectChain()">智能选型</button>
+        <button onclick="preflightChain()">预检并打开 Agent</button>
+        <button onclick="renderChain()">重置阶段</button>
+        <span class="sub" id="chainStatus"></span>
+      </div>
+      <div id="chainRecommend" class="sub" style="margin-top:8px"></div>
+      <div id="chainPreflight" style="margin-top:10px"></div>
+      <div id="chainResult" style="margin-top:12px"></div>
     </div>
 
     <div class="card step">

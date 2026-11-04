@@ -3,9 +3,11 @@ const state = {
   workspace: null, overview: null, plans: [], runs: [], tasks: [], approvals: [],
   costs: null, usage: [], audit: [], conversations: [], memories: [], bus: [],
   busStats: null, busSubs: [], sync: null, models: null, versionStatus: null,
+  modelsSync: null,
   surface: null,
   mcp: null, selected: null, view: 'command', stream: null, lastSeq: 0,
   consoleLines: 0, reconnectTimer: null, refreshTimer: null,
+  chainDraft: null, chainRunId: '', chainTimer: null,
 };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
@@ -61,12 +63,13 @@ async function refresh() {
       return;
     }
     const [ov, plans, runs, tasks, approvals, costs, usage, audit, conversations, memory,
-      bus, busStats, busSubs, sync, models, versionStatus] = await Promise.all([
+      bus, busStats, busSubs, sync, models, versionStatus, modelsSync] = await Promise.all([
       api('/api/overview'), api('/api/plans'), api('/api/runs'), api('/api/tasks'),
       api('/api/approvals'), api('/api/costs'), api('/api/costs'), api('/api/audit?limit=300'),
       api('/api/conversations'), api('/api/memory'), api('/api/bus?limit=120'),
       api('/api/bus/stats'), api('/api/bus/subscriptions'), api('/api/sync'),
       api('/api/agents/models'), api('/api/agents/version-status'),
+      api('/api/agents/models/sync').catch(() => null),
     ]);
     state.overview = ov;
     state.plans = plans.plans || [];
@@ -84,6 +87,7 @@ async function refresh() {
     state.sync = sync;
     state.models = models;
     state.versionStatus = versionStatus;
+    state.modelsSync = modelsSync;
     state.surface = await api('/api/surface').catch(() => null);
     if (state.selected) {
       const fresh = state.tasks.find((x) => x.uid === state.selected.uid);
@@ -174,7 +178,9 @@ function modelOptions(agentId, selected) {
   const names = [];
   (item.models || []).forEach((m) => {
     names.push(m.name);
-    html += `<option value="${esc(m.name)}" ${m.name === selected ? 'selected' : ''}>${esc(m.name)} · ${esc(m.source_label || m.source)}</option>`;
+    const label = m.display_name || m.name;
+    const rate = (m.rate != null) ? ` · x${m.rate}` : '';
+    html += `<option value="${esc(m.name)}" ${m.name === selected ? 'selected' : ''}>${esc(label)}${rate} · ${esc(m.source_label || m.source)}</option>`;
   });
   if (selected && !names.includes(selected)) {
     html += `<option value="${esc(selected)}" selected>${esc(selected)} · 手动</option>`;
@@ -243,6 +249,14 @@ async function autoMain() {
   } catch (e) { toast(e.message, true); }
 }
 
+async function pauseRun(runId) {
+  try {
+    await post('/api/runs/' + encodeURIComponent(runId) + '/pause', { reason: '用户暂停' });
+    toast('已暂停：当前任务会跑完，后续任务不再派发');
+    refresh();
+  } catch (e) { toast('暂停失败：' + e.message, true); }
+}
+
 async function saveBudget() {
   try {
     const r = await post('/api/budget', { tokens: Number($('budgetTokens').value || 0) });
@@ -307,7 +321,7 @@ function renderCommandRun() {
   </dl>
   <div class="row" style="margin-top:10px">
     ${run.status === 'ready' ? `<button class="primary" onclick="startRun('${esc(run.run_id)}')">开始执行</button>` : ''}
-    ${run.status === 'running' ? '<button onclick="refresh()">刷新进度</button>' : ''}
+    ${run.status === 'running' ? `<button class="danger" onclick="pauseRun('${esc(run.run_id)}')">暂停运行</button><button onclick="refresh()">刷新进度</button>` : ''}
     ${['waiting_user', 'paused'].includes(run.status) ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
     ${run.status === 'pending_acceptance' ? `<button onclick="location.hash='#approvals'">验收确认</button>` : ''}
     ${run.status === 'pending_merge' ? `<button class="primary" onclick="mergeRun('${esc(run.run_id)}')">批准并合并</button>` : ''}
@@ -401,6 +415,249 @@ async function setAgentModelFromCard(agentId, model) {
     await post('/api/agents/' + encodeURIComponent(agentId) + '/model', { model });
     toast(`${agentId} 模型已更新`); refresh();
   } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Multi-agent chain: one agent + one real model per stage             */
+/* ------------------------------------------------------------------ */
+const CHAIN_STAGES = [
+  { agent: 'trae_cn', type: 'analysis', label: '阶段 1 · 扫描' },
+  { agent: 'qoder_cn', type: 'review', label: '阶段 2 · 查 Bug' },
+  { agent: 'opencode', type: 'implementation', label: '阶段 3 · 生成测试' },
+];
+
+function chainAgentList() {
+  return (((state.overview || {}).agents || {}).list || []);
+}
+
+function chainModelOptions(agentId, selected) {
+  const item = ((state.models || {}).by_agent || {})[agentId] || { models: [] };
+  const names = (item.models || []).map((m) => m.name);
+  let html = '';
+  names.forEach((name) => {
+    html += `<option value="${esc(name)}" ${name === selected ? 'selected' : ''}>${esc(name)}</option>`;
+  });
+  if (selected && !names.includes(selected)) {
+    html += `<option value="${esc(selected)}" selected>${esc(selected)} · 手动</option>`;
+  }
+  return html || '<option value="">该 Agent 暂无真实模型清单</option>';
+}
+
+function renderChain() {
+  const box = $('chainStages');
+  if (!box) return;
+  const agents = chainAgentList();
+  if (!agents.length) {
+    box.innerHTML = '<div class="empty">尚未打开项目或没有 Agent</div>';
+    return;
+  }
+  const rows = CHAIN_STAGES.map((stage, index) => {
+    const current = (state.chainDraft || [])[index] || {};
+    const agentId = current.agent || stage.agent;
+    const agentOptions = agents.map((a) => (
+      `<option value="${esc(a.agent_id)}" ${a.agent_id === agentId ? 'selected' : ''}>${esc(a.name)} · ${esc(a.adapter_type || '')}</option>`
+    )).join('');
+    const modelId = current.model || '';
+    return `<div class="row" style="align-items:flex-end;gap:8px;margin-bottom:8px">
+      <div style="min-width:88px"><label>${esc(stage.label)}</label></div>
+      <div class="grow"><label>Agent</label>
+        <select id="chainAgent${index}" onchange="onChainAgentChange(${index})">${agentOptions}</select></div>
+      <div class="grow"><label>模型（真实清单）</label>
+        <select id="chainModel${index}">${chainModelOptions(agentId, modelId)}</select></div>
+      <div style="min-width:150px"><label>任务类型</label>
+        <select id="chainType${index}">
+          ${['analysis', 'review', 'implementation', 'verification', 'documentation', 'architecture']
+    .map((t) => `<option value="${t}" ${t === (current.type || stage.type) ? 'selected' : ''}>${t}</option>`).join('')}
+        </select></div>
+    </div>`;
+  }).join('');
+  box.innerHTML = rows;
+}
+
+function onChainAgentChange(index) {
+  const agentId = $('chainAgent' + index).value;
+  $('chainModel' + index).innerHTML = chainModelOptions(agentId, '');
+}
+
+function chainCollect() {
+  const stages = [];
+  CHAIN_STAGES.forEach((_, index) => {
+    stages.push({
+      agent_id: $('chainAgent' + index).value,
+      model: $('chainModel' + index).value,
+      type: $('chainType' + index).value,
+    });
+  });
+  return stages;
+}
+
+async function autoSelectChain() {
+  $('chainStatus').textContent = '正在计算最省且够用的组合…';
+  const reasons = [];
+  try {
+    for (let i = 0; i < CHAIN_STAGES.length; i += 1) {
+      const type = $('chainType' + i).value;
+      const policy = ($('chainPolicy') && $('chainPolicy').value) || 'balanced';
+      const rec = await api('/api/models/recommend?task_type=' + encodeURIComponent(type)
+        + '&limit=8&profile=' + encodeURIComponent(policy));
+      const pick = rec.recommended;
+      if (!pick) { reasons.push(`${type}: 无可用组合`); continue; }
+      $('chainAgent' + i).value = pick.agent_id;
+      $('chainModel' + i).innerHTML = chainModelOptions(pick.agent_id, pick.model);
+      $('chainModel' + i).value = pick.model;
+      reasons.push(`${type}: ${pick.agent_name} / ${pick.model}（成本 ${pick.cost} · ${pick.cost_source}）`);
+    }
+    $('chainRecommend').innerHTML = reasons.map((r) => `<div>· ${esc(r)}</div>`).join('');
+    $('chainStatus').textContent = '已按“质量阈值内最低成本”填好';
+    toast('智能选型完成');
+  } catch (e) {
+    $('chainStatus').textContent = '选型失败';
+    toast('智能选型失败：' + e.message, true);
+  }
+}
+
+async function preflightChain() {
+  const stages = chainCollect();
+  if (stages.some((s) => !s.agent_id || !s.model)) {
+    toast('每个阶段都必须选择 Agent 和模型', true);
+    return;
+  }
+  $('chainStatus').textContent = '正在打开 Agent 并绑定工作区/模型…（可能需要 1-3 分钟）';
+  $('chainPreflight').innerHTML = '<div class="sub">执行中：会重启 Trae/Qoder 等桌面应用，请勿操作。</div>';
+  try {
+    const result = await post('/api/preflight', {
+      stages,
+      workspace: (state.workspace && state.workspace.root) || '',
+      open_apps: true,
+    });
+    const rows = (result.agents || []).map((a) => `<tr>
+      <td>${esc(a.agent_id)}</td>
+      <td>${esc(a.process || '')}</td>
+      <td class="mono">${esc(a.visible_model || a.model || '')}</td>
+      <td>${a.workspace_set ? '✅' : '—'}</td>
+      <td>${a.model_set ? '✅' : '—'}</td>
+      <td>${a.ok ? '✅ ready' : '❌ ' + esc((a.error || a.stage || '').slice(0, 90))}</td>
+    </tr>`).join('');
+    $('chainPreflight').innerHTML = `<div class="sub" style="margin-bottom:6px">
+      工作区 ${esc(result.workspace || '')} · 就绪 ${result.ready}/${result.total}</div>
+      <table class="table"><thead><tr><th>Agent</th><th>进程</th><th>实际模型</th>
+      <th>工作区</th><th>模型</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>`;
+    $('chainStatus').textContent = `预检完成 ${result.ready}/${result.total}`;
+    toast(`预检完成：${result.ready}/${result.total} 就绪`);
+  } catch (e) {
+    $('chainStatus').textContent = '预检失败';
+    $('chainPreflight').innerHTML = `<div class="sub">${esc(e.message)}</div>`;
+    toast('预检失败：' + e.message, true);
+  }
+}
+
+async function runChain() {
+  const goal = ($('chainGoal').value || '').trim();
+  if (!goal) { toast('请填写链路目标', true); return; }
+  const stages = chainCollect();
+  if (stages.some((s) => !s.agent_id || !s.model)) {
+    toast('每个阶段都必须选择一个 Agent 和它的真实模型', true);
+    return;
+  }
+  $('chainStatus').textContent = '正在配置…';
+  try {
+    const result = await post('/api/chain', {
+      goal, stages, start: true, background: true,
+      main_agent_id: ($('mainAgent').value || ''), max_parallel: 1,
+    });
+    state.chainDraft = stages;
+    state.chainRunId = result.run_id;
+    $('chainStatus').textContent = `已启动 ${result.run_id}`;
+    toast('链路已配置并启动');
+    renderChainResult(result);
+    refresh();
+    pollChain(result.run_id);
+  } catch (e) {
+    $('chainStatus').textContent = '配置失败';
+    toast('链路配置失败：' + e.message, true);
+  }
+}
+
+function renderChainResult(payload) {
+  const stages = payload.stages || [];
+  if (!stages.length) { $('chainResult').innerHTML = ''; return; }
+  const rows = stages.map((s) => `<tr>
+    <td>${esc(s.task_id || '')}</td>
+    <td>${esc(s.agent_name || s.agent_id || '')}</td>
+    <td class="mono">${esc(s.model || '')}</td>
+    <td>${esc(s.status || payload.status || '')}</td>
+    <td>${esc(s.verification || '')}</td>
+    <td class="sub">${esc((s.error || '').slice(0, 120))}</td>
+  </tr>`).join('');
+  $('chainResult').innerHTML = `<table class="table">
+    <thead><tr><th>任务</th><th>Agent</th><th>模型</th><th>状态</th><th>验证</th><th>错误</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function renderChainBindings(payload) {
+  const rows = (payload.stages || []).map((s) => `<tr>
+    <td>${esc(s.task_id)}</td>
+    <td>${esc(s.agent_name || s.agent_id || '')}</td>
+    <td class="mono">${esc(s.model || '')}</td>
+    <td class="mono">${esc((s.workspace || '').split('\\').slice(-2).join('\\'))}</td>
+    <td>${esc(s.status)}</td>
+    <td>${s.verified ? '✅ ' + esc(s.verify_method || '') : '—'}</td>
+    <td class="sub">${esc((s.error || '').slice(0, 100))}</td>
+  </tr>`).join('');
+  $('chainResult').innerHTML = `<div class="sub" style="margin:10px 0 6px">
+    运行 ${esc(payload.run_id)} · 每阶段实际绑定</div>
+    <table class="table"><thead><tr><th>任务</th><th>Agent</th><th>模型</th>
+    <th>工作区</th><th>状态</th><th>接口核验</th><th>错误</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function pollChain(runId) {
+  if (state.chainTimer) clearInterval(state.chainTimer);
+  state.chainTimer = setInterval(async () => {
+    try {
+      const data = await api('/api/chain?run_id=' + encodeURIComponent(runId));
+      renderChainResult(data);
+      $('chainStatus').textContent = `${data.status} · 验收 ${data.acceptance_status || '-'}`;
+      if (['completed', 'released', 'failed', 'pending_acceptance', 'paused'].includes(data.status)) {
+        clearInterval(state.chainTimer);
+        state.chainTimer = null;
+        try {
+          const bindings = await api('/api/runs/' + encodeURIComponent(runId) + '/bindings');
+          renderChainBindings(bindings);
+        } catch (e) { /* 绑定报告不影响主流程 */ }
+        refresh();
+      }
+    } catch (e) {
+      clearInterval(state.chainTimer);
+      state.chainTimer = null;
+    }
+  }, 3000);
+}
+
+async function syncModels() {
+  const box = $('modelSyncInfo');
+  if (box) box.textContent = '正在同步全部 Agent 的真实模型目录…';
+  try {
+    const r = await post('/api/agents/models/sync', {});
+    const n = (r.agents || []).length;
+    toast(`模型目录已同步：${n} 个 Agent`);
+    await refresh();
+  } catch (e) {
+    toast('同步失败：' + e.message, true);
+  }
+}
+
+function renderModelSync() {
+  const box = $('modelSyncInfo');
+  if (!box) return;
+  const s = state.modelsSync || {};
+  if (!s.synced_at) {
+    box.textContent = '模型目录尚未同步（每天自动同步；也可点“同步模型”）';
+    return;
+  }
+  const age = (s.age_hours == null) ? '未知' : `${s.age_hours} 小时前`;
+  box.innerHTML = `模型目录上次同步：<span class="mono">${esc(s.synced_at)}</span>（${esc(age)}）`
+    + (s.stale ? ' <span class="pill warn">已过期，将自动同步</span>' : ' <span class="pill ok">最新</span>');
 }
 
 function renderVersions() {
@@ -632,8 +889,50 @@ function renderAudit() {
     <dt>节省来源</dt><dd>${savingTags}</dd>
   </dl><h3 style="margin-top:12px">Agent Benchmark</h3>${benchHtml}`;
   $('auditSummary').innerHTML = `<div class="sub">共 ${state.audit.length} 条已加载事件。审计链只追加，任何修改都会使校验失败。</div>`;
-  $('usageTable').innerHTML = `<table class="table"><thead><tr><th>Agent</th><th>模型</th><th>Tokens</th><th>费用</th><th>重试</th></tr></thead><tbody>` +
-    ((c.by_agent || []).map((r) => `<tr><td>${esc(r.agent_id)}</td><td>${esc(r.model)}</td><td>${fmt(r.total_tokens)}</td><td>${money(r.cost)}</td><td>${r.retries}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">无用量记录</td></tr>') + '</tbody></table>';
+  const usageRows = c.by_agent || [];
+  const byAgent = {};
+  usageRows.forEach((r) => {
+    const a = byAgent[r.agent_id] || (byAgent[r.agent_id] = {
+      agent_id: r.agent_id, input: 0, output: 0, cached: 0, reasoning: 0,
+      total: 0, cost: 0, records: 0, models: [],
+    });
+    a.input += Number(r.input_tokens || 0);
+    a.output += Number(r.output_tokens || 0);
+    a.cached += Number(r.cached_tokens || 0);
+    a.reasoning += Number(r.reasoning_tokens || 0);
+    a.total += Number(r.total_tokens || 0);
+    a.cost += Number(r.cost || 0);
+    a.records += Number(r.records || 0);
+    a.models.push(r);
+  });
+  const agentList = Object.values(byAgent).sort((x, y) => y.total - x.total);
+  const grand = agentList.reduce((n, a) => n + a.total, 0) || 1;
+  const agentRows = agentList.map((a) => {
+    const pct = (a.total / grand * 100).toFixed(1);
+    return `<tr>
+      <td><b>${esc(a.agent_id)}</b></td>
+      <td>${fmt(a.input)}</td><td>${fmt(a.output)}</td><td>${fmt(a.cached)}</td>
+      <td>${a.reasoning ? fmt(a.reasoning) : '—'}</td>
+      <td><b>${fmt(a.total)}</b></td>
+      <td style="min-width:120px"><div style="height:8px;background:var(--line);border-radius:4px">
+        <div style="height:8px;width:${pct}%;background:var(--accent);border-radius:4px"></div></div>
+        <span class="sub">${pct}%</span></td>
+      <td>${money(a.cost)}</td><td>${a.records}</td></tr>`;
+  }).join('') || '<tr><td colspan="9" class="muted">暂无用量记录</td></tr>';
+  const detailRows = usageRows.map((r) => `<tr>
+    <td>${esc(r.agent_id)}</td><td class="mono">${esc(r.model)}</td>
+    <td>${fmt(r.input_tokens)}</td><td>${fmt(r.output_tokens)}</td>
+    <td>${fmt(r.cached_tokens)}</td><td>${fmt(r.total_tokens)}</td>
+    <td>${money(r.cost)}</td><td>${r.records}</td><td>${r.retries}</td></tr>`).join('');
+  $('usageTable').innerHTML = `
+    <div class="sub" style="margin-bottom:6px">按 Agent 汇总（预算仅统计，不会自动停止任务）</div>
+    <table class="table"><thead><tr><th>Agent</th><th>输入</th><th>输出</th><th>缓存</th>
+    <th>推理</th><th>总 tokens</th><th>占比</th><th>费用</th><th>记录</th></tr></thead>
+    <tbody>${agentRows}</tbody></table>
+    <div class="sub" style="margin:12px 0 6px">按模型明细</div>
+    <table class="table"><thead><tr><th>Agent</th><th>模型</th><th>输入</th><th>输出</th>
+    <th>缓存</th><th>总 tokens</th><th>费用</th><th>记录</th><th>重试</th></tr></thead>
+    <tbody>${detailRows || '<tr><td colspan="9" class="muted">暂无明细</td></tr>'}</tbody></table>`;
   $('auditEvents').innerHTML = `<table class="table"><thead><tr><th>时间</th><th>角色</th><th>动作</th><th>对象</th></tr></thead><tbody>` +
     (state.audit.slice(-80).reverse().map((e) => `<tr><td class="mono">${esc(e.ts)}</td><td>${esc(e.actor)}</td><td>${esc(e.action)}</td><td class="mono">${esc(e.subject)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">无审计事件</td></tr>') + '</tbody></table>';
   $('memoryList').innerHTML = (state.memories || []).slice(0, 40).map((m) => `
@@ -1016,6 +1315,8 @@ function render() {
   renderWorkspace();
   if (state.overview) {
     renderCommandAgents();
+    renderModelSync();
+    renderChain();
     renderCommandApprovals();
     renderCommandRun();
     renderCommandPlans();

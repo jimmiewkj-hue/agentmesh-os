@@ -214,6 +214,8 @@ def test_failure_circuit_breaker_pauses_remaining(tmp_path):
 
 def test_budget_blocks_dispatch(tmp_path):
     repo, hub, _ = make_project(tmp_path)
+    # Budget is advisory by default; this case opts into the hard gate.
+    hub.config.budget_hard_stop = True
     # Two analysis tasks fit, but the 10k implementation cannot fit the 12k
     # project budget after the first tasks consume tokens.
     hub.set_project_budget(12000)

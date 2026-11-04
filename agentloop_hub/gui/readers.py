@@ -9,6 +9,7 @@ from typing import Any
 
 from ..util import now_iso
 from .base import GuiAutomationError, GuiReply, GuiProfile, read_jsonl
+from .trae_reader import TraeReader  # noqa: F401 (registered by create_reader)
 
 
 def _candidate_files(root: Path, started_at: float, *, limit: int = 200) -> list[Path]:
@@ -327,9 +328,12 @@ def create_reader(profile: GuiProfile, config: dict[str, Any] | None = None):
         return QoderCnReader(profile, config)
     if profile.transcript_reader == "workbuddy":
         return WorkBuddyReader(profile, config)
+    if profile.transcript_reader in ("trae_cn", "trae"):
+        from .trae_reader import create_trae_reader
+        return create_trae_reader(profile, config)
     raise GuiAutomationError(
         "GUI_APP_NOT_CONFIGURED", f"未知 transcript_reader: {profile.transcript_reader}"
     )
 
 
-__all__ = ["QoderCnReader", "WorkBuddyReader", "create_reader"]
+__all__ = ["QoderCnReader", "WorkBuddyReader", "TraeReader", "create_reader"]

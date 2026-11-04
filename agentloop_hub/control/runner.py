@@ -128,6 +128,17 @@ class RunService:
         circuit_break = False
         try:
             while True:
+                live = self.store.get_run(run_id) or {}
+                if live.get("status") == "paused":
+                    for task in self.store.list_tasks(run_id):
+                        if task.status in (TaskStatus.QUEUED.value, TaskStatus.READY.value):
+                            self.store.set_task_status(task.uid, TaskStatus.PAUSED.value,
+                                                       error="用户暂停", force=True)
+                    self.audit.log("user", "run.paused", subject=run_id,
+                                   payload={"reason": live.get("error", "")})
+                    self.checkpoints.create("run_paused", run_id=run_id)
+                    self.memory.sync_workflow(run_id)
+                    return {"status": "paused", "run_id": run_id, "reason": "user"}
                 tasks = self.store.list_tasks(run_id)
                 capacity = max(0, max_workers - len(futures))
                 dispatch = self.scheduler.evaluate(tasks, capacity=capacity)
@@ -869,6 +880,10 @@ class RunService:
                                    payload={"approval": latest.approval_id, "kind": latest.kind})
             elif task.status == TaskStatus.FAILED.value:
                 self.store.set_task_status(task.uid, TaskStatus.QUEUED.value, force=True)
+                requeued += 1
+            elif task.status == TaskStatus.PAUSED.value:
+                self.store.set_task_status(task.uid, TaskStatus.QUEUED.value, force=True)
+                self.store.update_task(task.uid, error="")
                 requeued += 1
             elif task.status == TaskStatus.BLOCKED.value and not self.leases.conflicts(self.project.project_id, task):
                 self.store.set_task_status(task.uid, TaskStatus.QUEUED.value, force=True)

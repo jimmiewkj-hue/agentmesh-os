@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     surface.add_argument("--agent", default="", help="只输出指定 Agent")
     models = sub.add_parser("models", help="Agent 支持的模型清单")
     models.add_argument("--refresh", action="store_true", help="重新探测本机 Agent 模型")
+    models.add_argument("--sync", action="store_true", help="全量同步真实模型目录（含显示名/倍率）")
     models.add_argument("--agent", default="", help="只刷新指定 Agent")
     versions = sub.add_parser("versions", help="Agent 软件版本与兼容漂移")
     versions.add_argument("--agent", default="")
@@ -389,6 +390,8 @@ def _dispatch(hub: Hub, args: argparse.Namespace) -> Any:
             return agent_surface(args.agent, hub.project.project_id)
         return surface_report(hub.project.project_id)
     if cmd == "models":
+        if args.sync:
+            return hub.sync_models(args.agent)
         if args.refresh:
             return hub.refresh_agent_models(args.agent)
         return hub.agent_models()

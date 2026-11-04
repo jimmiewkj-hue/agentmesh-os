@@ -144,6 +144,17 @@ def qoder_projects_root(config: dict[str, Any] | None = None) -> Path:
     return Path(configured) if configured else _home() / ".qoder-cn" / "projects"
 
 
+def qoder_process_image(config: dict[str, Any] | None = None) -> str:
+    """Qoder CN and Qoder international use different Electron image names."""
+    configured = str((config or {}).get("qoder_image") or "").strip()
+    return configured or "Qoder CN.exe"
+
+
+def qoder_sites_root(config: dict[str, Any] | None = None) -> Path:
+    configured = str((config or {}).get("qoder_sites") or "").strip()
+    return Path(configured) if configured else _home() / ".qoder-cn" / "sites" / "sessions"
+
+
 def qoder_project_slug(path: str | Path) -> str:
     """Qoder's project folder name: ``D:\\a\\b`` -> ``J--a-b``.
 
@@ -180,8 +191,23 @@ def list_workbuddy_models(config: dict[str, Any] | None = None) -> list[dict[str
                 model_id = str(item.get("id") or "").strip()
                 if not model_id:
                     continue
+                # The manifest also lists editor internals (codewise/completion
+                # providers).  Chat models are the ones with a credit price and
+                # the chat vendor; anything else is not selectable in the
+                # conversation composer.
+                vendor = str(item.get("vendor") or "")
+                credits = str(item.get("credits") or "").strip()
+                if vendor not in ("f", "") or model_id.startswith(("codewise", "completion")):
+                    continue
+                rate = None
+                if credits.lower().startswith("x"):
+                    try:
+                        rate = float(credits[1:])
+                    except ValueError:
+                        rate = None
                 found.setdefault(model_id, {
                     "id": model_id, "name": str(item.get("name") or model_id),
+                    "rate": rate,
                     "source": "product_manifest", "evidence": str(path),
                 })
     if found:
@@ -264,6 +290,12 @@ def _newest_workbuddy_session(db: Path, *, started_at: float,
     return None
 
 
+def _local_urlopen(url: str, *, timeout: float = 3.0):
+    """Loopback probe that ignores HTTP_PROXY (sandbox proxies return 502)."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(url, timeout=timeout)
+
+
 def _norm_path(value: str | Path) -> str:
     try:
         return os.path.normcase(os.path.normpath(str(value))).replace("/", "\\")
@@ -284,9 +316,7 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
     """
     def _probe() -> bool:
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{int(port)}/json/list", timeout=3
-            ) as response:
+            with _local_urlopen(f"http://127.0.0.1:{int(port)}/json/list", timeout=3) as response:
                 targets = json.loads(response.read().decode("utf-8"))
             return any(item.get("type") == "page" for item in targets)
         except Exception:
@@ -306,7 +336,7 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
     subprocess.Popen(
         [executable, f"--remote-debugging-port={int(port)}",
          "--remote-allow-origins=*"],
-        close_fds=True, creationflags=0x00000008,
+        close_fds=True, creationflags=0x00000008, env=electron_env(),
     )
     deadline = time.time() + float(timeout_seconds)
     while time.time() < deadline:
@@ -524,12 +554,25 @@ def _stop_process(name: str) -> None:
     raise RuntimeError(f"{image} 仍在运行，无法重载工作区")
 
 
+def electron_env() -> dict[str, str]:
+    """Environment for launching an Electron app from inside another Electron app.
+
+    WorkBuddy's agent host exports ``ELECTRON_RUN_AS_NODE=1``; a child Electron
+    binary that inherits it behaves like plain Node and exits immediately.
+    """
+    env = dict(os.environ)
+    env.pop("ELECTRON_RUN_AS_NODE", None)
+    env.pop("NODE_OPTIONS", None)
+    return env
+
+
 def _start_app(exe: str) -> None:
     args: list[str] = []
     port = str(os.environ.get("AGENTMESH_QODER_CDP_PORT") or "").strip()
     if port:
         args = [f"--remote-debugging-port={port}", "--remote-allow-origins=*"]
-    subprocess.Popen([exe, *args], close_fds=True)
+    subprocess.Popen([exe, *args], close_fds=True, env=electron_env(),
+                     creationflags=0x00000008)
 
 
 def prepare_qoder_session(*, workspace: str, model: str,
@@ -560,7 +603,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
     evidence: dict[str, Any] = {"session_id": current["session_id"], "db": str(db),
                                 "workspace": workspace}
     try:
-        (stop_process or _stop_process)("Qoder CN.exe")
+        (stop_process or _stop_process)(qoder_process_image(config))
         time.sleep(1.0)
     except Exception as exc:
         return InterfaceOutcome(
@@ -712,7 +755,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
     # restore its agent panel.  Point it at the new workspace and keep only
     # this session so a stale route cannot win.
     try:
-        sites = _home() / ".qoder-cn" / "sites" / "sessions"
+        sites = qoder_sites_root(config)
         ensure_dir(sites)
         kept = []
         for path in sorted(sites.glob("*.json")):
@@ -810,7 +853,8 @@ def qoder_daemon_cwd(config: dict[str, Any] | None = None,
 
 def verify_qoder_session(*, workspace: str, model: str, started_at: float,
                          config: dict[str, Any] | None = None,
-                         session_id: str = "") -> InterfaceOutcome:
+                         session_id: str = "",
+                         strict_daemon: bool = True) -> InterfaceOutcome:
     projects = qoder_projects_root(config)
     db = qoder_db_path(config)
     conn = _qoder_connect(db)
@@ -885,6 +929,11 @@ def verify_qoder_session(*, workspace: str, model: str, started_at: float,
     actual["daemon_last_cwd"] = daemon.get("last_cwd", "")
     evidence["daemon_log"] = daemon.get("log", "")
     code, reason = "", ""
+    if not strict_daemon:
+        # Preflight: the desktop was just restarted and has not opened a turn
+        # yet, so the daemon log still shows the previous session's cwd.  The
+        # transcript is the authoritative resume state in that window.
+        daemon = {}
     if session_id and daemon.get("log") and not daemon.get("session_cwd"):
         code = "WORKSPACE_MISMATCH"
         reason = (f"daemon open_session cwd 未记录会话 {sid}"
@@ -954,4 +1003,6 @@ __all__ = [
     "list_workbuddy_models", "list_qoder_models",
     "workbuddy_model_key", "qoder_model_key", "set_model_programmatically",
     "qoder_project_slug", "qoder_db_path", "workbuddy_db_path",
+    "qoder_projects_root", "qoder_process_image", "qoder_sites_root",
+    "qoder_daemon_cwd",
 ]

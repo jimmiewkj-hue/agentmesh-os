@@ -58,9 +58,9 @@ class HubConfig:
     verify_timeout_seconds: int = 900
 
     default_task_token_budget: int = 30000
-    default_project_token_budget: int = 1000000
+    default_project_token_budget: int = 0
     default_plan_token_budget: int = 40000
-    budget_hard_stop: bool = True
+    budget_hard_stop: bool = False
     # Count only billable tokens (input/output/reasoning) against the quota;
     # cached tokens are reported separately and never inflate consumption.
     budget_billable_only: bool = True

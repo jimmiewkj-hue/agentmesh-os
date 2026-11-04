@@ -110,6 +110,21 @@ class HubServer:
         handler = _make_handler(None, self.jobs, self.manager)
         self.httpd = ThreadingHTTPServer((host, port), handler)
         self.httpd.daemon_threads = True
+        self._sync_stop = threading.Event()
+        threading.Thread(target=self._catalog_sync_loop, daemon=True,
+                         name="agentmesh-catalog-sync").start()
+
+    def _catalog_sync_loop(self) -> None:
+        """Daily model-catalog sync while the console stays open."""
+        while not self._sync_stop.wait(3600):
+            hub = self.hub
+            if not hub:
+                continue
+            try:
+                if hub.models_sync_status()["stale"]:
+                    hub.sync_models()
+            except Exception:
+                continue
 
     @property
     def url(self) -> str:
@@ -132,12 +147,21 @@ class HubServer:
             self.manager.close()
 
     def shutdown(self) -> None:
+        self._sync_stop.set()
         self.httpd.shutdown()
 
 
 def serve(project_root: Path | None, *, host: str = "127.0.0.1", port: int = 8787,
           open_browser: bool = False) -> None:
     HubServer(project_root, host=host, port=port).serve_forever(open_browser=open_browser)
+
+
+def _sync_models_if_stale(hub: Hub) -> None:
+    try:
+        if hub.models_sync_status()["stale"]:
+            hub.sync_models()
+    except Exception:
+        pass
 
 
 def _make_handler(hub: Hub | None, jobs: JobManager,
@@ -370,6 +394,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.agent_models(
                     refresh=query.get("refresh", "false") == "true"))
                 return
+            if path == "/api/agents/models/sync":
+                self._json(200, hub.models_sync_status())
+                return
             if path == "/api/agents/versions":
                 self._json(200, hub.agent_versions(
                     agent_id=query.get("agent_id", ""),
@@ -409,6 +436,18 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if path == "/api/main":
                 self._json(200, {"main": hub.get_main(), "history": hub.main_history()})
+                return
+            if path == "/api/chain":
+                self._json(200, hub.chain_status(query.get("run_id", "")))
+                return
+            if path == "/api/models/recommend":
+                self._json(200, hub.recommend_models(
+                    task_type=query.get("task_type", "analysis"),
+                    limit=int(query.get("limit", "8") or 8),
+                    profile=query.get("profile", "balanced")))
+                return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "bindings":
+                self._json(200, hub.run_bindings(parts[2]))
                 return
             if path == "/api/plans":
                 self._json(200, {"plans": hub.plans(limit=int(query.get("limit", "50")))})
@@ -544,6 +583,10 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                     name=str(body.get("name", "")),
                 )
                 hub = current_hub()
+                # Daily catalog sync: refresh in the background when stale so
+                # opening the console does not wait on model probing.
+                threading.Thread(target=_sync_models_if_stale, args=(hub,),
+                                 daemon=True).start()
                 self._json(200, {
                     "workspace": provider.info(),  # type: ignore[union-attr]
                     "result": result,
@@ -567,6 +610,29 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                     self._json(200, hub.ask(goal,
                                             main_agent_id=str(body.get("agent_id", "")),
                                             model=str(body.get("model", ""))))
+                return
+            if path == "/api/preflight":
+                result = hub.preflight_agents(
+                    list(body.get("stages") or []),
+                    workspace=str(body.get("workspace", "")),
+                    open_apps=bool(body.get("open_apps", True)),
+                    config=dict(body.get("config") or {}),
+                )
+                self._json(200, result)
+                return
+            if path == "/api/chain":
+                result = hub.configure_chain(
+                    goal=str(body.get("goal", "")),
+                    stages=list(body.get("stages") or []),
+                    main_agent_id=str(body.get("main_agent_id", "")),
+                    start=bool(body.get("start", False)),
+                    background=bool(body.get("background", True)),
+                    max_parallel=int(body.get("max_parallel", 1) or 1),
+                    approve=bool(body.get("approve", True)),
+                )
+                if result.get("status") == "started" and body.get("wait"):
+                    result["run"] = hub.run_status(result["run_id"])
+                self._json(200, result)
                 return
             if path == "/api/bus/publish":
                 self._json(200, hub.bus_publish(
@@ -606,6 +672,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if path == "/api/agents/models/refresh":
                 self._json(200, hub.refresh_agent_models(str(body.get("agent_id", ""))))
+                return
+            if path == "/api/agents/models/sync":
+                self._json(200, hub.sync_models(str(body.get("agent_id", ""))))
                 return
             if len(parts) == 4 and parts[1] == "agents" and parts[3] == "model":
                 self._json(200, hub.set_agent_model(parts[2], str(body.get("model", ""))))
@@ -668,6 +737,10 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 else:
                     outcome = hub.reject_plan(parts[2], approval_id=approval_id, note=note)
                 self._json(200, outcome)
+                return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "pause":
+                self._json(200, hub.pause_run(parts[2],
+                                              str(body.get("reason", "用户暂停"))))
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] in ("start", "resume"):
                 parallel = body.get("max_parallel")

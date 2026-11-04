@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +13,16 @@ import yaml
 
 from .adapters import DiscoveryContext, create_adapter, discover_agents
 from .config import HubConfig, load_config
-from .connectors import CONNECTOR_PROFILES, connector_manifest, is_auto_executable
+from .connectors import (
+    CONNECTOR_PROFILES, TASK_CAPABILITY_REQUIREMENTS, connector_manifest,
+    derive_capability_list, is_auto_executable,
+)
 from .errors import ApprovalRequiredError, ConfigError, NotFoundError, ValidationError
 from .models import AgentRecord, Project, Task, TaskSpec, TaskType
 from .sessions.service import SessionImportService
 from .storage.db import Database
 from .storage.repo import Store
-from .util import atomic_write_text, sha1_hex
+from .util import atomic_write_text, ensure_dir, read_json, sha1_hex, write_json
 from .workspace import detect_repo, is_git_repo
 from .workspace.identity import build_project, canonical_path
 from .control.approvals import ApprovalService
@@ -97,6 +104,17 @@ class Hub:
             self.store, self.project, self.config,
         )
         self.versions = AgentVersionService(self.store, self.project)
+        # An interrupted control plane leaves write leases behind; release the
+        # ones whose run is no longer active so later tasks are not blocked by
+        # a phantom scope conflict.
+        try:
+            # A fresh control-plane process cannot own a live run yet, so every
+            # "running" run at this point is orphaned and its leases are stale.
+            self.stale_leases_released = self.runner.leases.release_stale(
+                self.project.project_id, include_running=True)
+        except Exception:
+            self.stale_leases_released = []
+        self._migrate_legacy_budget()
         if self._new_project:
             self.memory.seed_project_facts()
             self.memory.seed_project_index()
@@ -112,6 +130,21 @@ class Hub:
                 self.memory.seed_code_structure()
         if auto_discover:
             self.discover(merge=True)
+
+    def _migrate_legacy_budget(self) -> None:
+        """1000000 was the old default; budgets are advisory now."""
+        extra = dict(self.project.extra or {})
+        try:
+            stored = int(extra.get("token_budget") or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        if not self.config.budget_hard_stop and stored == 1_000_000:
+            extra["token_budget"] = 0
+            self.project.extra = extra
+            self.store.save_project(self.project)
+            self.audit.log("control-plane", "project.budget_migrated",
+                           subject=self.project.project_id,
+                           payload={"from": 1_000_000, "to": 0})
 
     # ------------------------------------------------------------------
     # Project lifecycle
@@ -192,8 +225,15 @@ class Hub:
                 record.permissions = existing.permissions or record.permissions
                 record.extra = {**(existing.extra or {}), **(record.extra or {})}
             if record.models:
+                # Discovery only knows what it can probe right now; a richer
+                # catalog from the daily sync must not be shrunk by a restart.
+                existing_models = {
+                    row["model"] for row in self.store.list_agent_models(
+                        self.project.project_id, agent_id=record.agent_id)
+                }
                 self.store.replace_discovered_models(
-                    self.project.project_id, record.agent_id, record.models,
+                    self.project.project_id, record.agent_id,
+                    sorted(existing_models | set(record.models)),
                     source="discovered",
                 )
             catalog_models = sorted(
@@ -401,6 +441,40 @@ class Hub:
             self.model_catalog.select(agent_id, model)
         return {"agent_id": agent_id, "app": app, **outcome.to_dict()}
 
+    def sync_models(self, agent_id: str = "") -> dict[str, Any]:
+        """Refresh the agent list and the real model catalog (daily job)."""
+        if not agent_id:
+            try:
+                self.discover(merge=True)
+            except Exception:
+                pass
+        result = self.model_catalog.sync_all(agent_id=agent_id)
+        info = {"synced_at": result["synced_at"], "agents": result["agents"]}
+        try:
+            write_json(Path(self.project.root) / ".agentloop" / "models-sync.json", info)
+        except Exception:
+            pass
+        self.audit.log("control-plane", "models.synced", subject=agent_id or "all",
+                       payload=info)
+        return {"status": "synced", **info}
+
+    def models_sync_status(self, *, max_age_hours: float = 24.0) -> dict[str, Any]:
+        path = Path(self.project.root) / ".agentloop" / "models-sync.json"
+        data = read_json(path, {}) or {}
+        synced_at = str(data.get("synced_at") or "")
+        age_hours = None
+        if synced_at:
+            try:
+                from datetime import datetime, timezone
+                stamp = datetime.fromisoformat(synced_at.replace("Z", "+00:00"))
+                age_hours = (datetime.now(timezone.utc) - stamp).total_seconds() / 3600
+            except Exception:
+                age_hours = None
+        return {"synced_at": synced_at, "agents": data.get("agents", []),
+                "age_hours": None if age_hours is None else round(age_hours, 2),
+                "stale": age_hours is None or age_hours >= float(max_age_hours),
+                "max_age_hours": max_age_hours}
+
     def register_agent_models(self, agent_id: str, models: list[str],
                               note: str = "") -> dict[str, Any]:
         result = self.model_catalog.register(agent_id, models, note=note)
@@ -506,6 +580,17 @@ class Hub:
 
     def submit_summary(self, run_id: str, payload: dict[str, Any] | str | Path) -> dict[str, Any]:
         return self.runner.submit_summary(run_id, payload)
+
+    def pause_run(self, run_id: str, reason: str = "用户暂停") -> dict[str, Any]:
+        run = self.store.get_run(run_id)
+        if not run:
+            raise NotFoundError(f"运行不存在: {run_id}")
+        if run["status"] != "running":
+            raise ValidationError(f"运行当前状态 {run['status']}，只有 running 可以暂停")
+        self.store.update_run(run_id, status="paused", error=reason)
+        self.audit.log("user", "run.pause_requested", subject=run_id,
+                       payload={"reason": reason})
+        return {"status": "paused", "run_id": run_id, "reason": reason}
 
     def cancel_task(self, uid: str) -> dict[str, Any]:
         return self.runner.cancel_task(uid)
@@ -740,6 +825,421 @@ class Hub:
         return self.planning.request_plan(goal, main_agent_id=main_agent_id, model=model)
 
     # ------------------------------------------------------------------
+    # Multi-agent chain (workspace + per-stage agent/model pins)
+    # ------------------------------------------------------------------
+    def configure_chain(self, *, goal: str, stages: list[dict[str, Any]],
+                        main_agent_id: str = "", start: bool = False,
+                        background: bool = True, max_parallel: int = 1,
+                        approve: bool = True) -> dict[str, Any]:
+        """Pin one agent + one real model per stage, then build and run a chain.
+
+        Each stage is a task in the same dependency chain.  ``assigned_agent``
+        is written on the task row so the capability router cannot silently
+        substitute a different agent, and the model is validated against the
+        agent's own discovered catalog before anything is stored.
+        """
+        if not goal.strip():
+            raise ValidationError("链路目标不能为空")
+        if not stages:
+            raise ValidationError("链路至少需要一个阶段")
+        prepared: list[dict[str, Any]] = []
+        for index, raw in enumerate(stages, start=1):
+            agent_id = str(raw.get("agent_id") or "").strip()
+            model = str(raw.get("model") or "").strip()
+            if not agent_id:
+                raise ValidationError(f"第 {index} 阶段缺少 agent_id")
+            agent = self.get_agent(agent_id)
+            if not model:
+                model = str((agent.extra or {}).get("selected_model") or
+                            (agent.models[0] if agent.models else ""))
+            known = [row["model"] for row in self.store.list_agent_models(
+                self.project.project_id, agent_id=agent_id)]
+            if not known:
+                known = list(agent.models)
+            if not known:
+                raise ValidationError(
+                    f"{agent_id} 没有可验证的模型清单；请先 discover/models --refresh"
+                )
+            if model not in known:
+                raise ValidationError(
+                    f"{agent_id} 的真实模型清单中没有 {model}",
+                    details={"available": sorted(known)[:40]},
+                )
+            stage_type = str(raw.get("type") or
+                             {1: "analysis", 2: "review", 3: "implementation"}.get(
+                                 index, "analysis"))
+            legal_types = {t.value for t in TaskType}
+            if stage_type not in legal_types:
+                raise ValidationError(
+                    f"未知任务类型 {stage_type}",
+                    details={"allowed": sorted(legal_types)},
+                )
+            prepared.append({
+                "stage": index,
+                "agent_id": agent_id,
+                "agent_name": agent.name,
+                "model": model,
+                "type": stage_type,
+                "objective": str(raw.get("objective") or "").strip(),
+                "title": str(raw.get("title") or "").strip(),
+                "scope": list(raw.get("scope") or []),
+                "out_of_scope": list(raw.get("out_of_scope") or []),
+                "verification_commands": list(raw.get("verification_commands") or []),
+                "time_limit_minutes": int(raw.get("time_limit_minutes") or 30),
+                "retry_limit": int(raw.get("retry_limit", 1)),
+                "token_budget": int(raw.get("token_budget") or 60000),
+            })
+        # A model is a property of the Agent, not of the stage: the executor
+        # reads ``agent.extra.selected_model``.  Two stages that reuse one agent
+        # with different models would silently run the last one everywhere.
+        pinned: dict[str, str] = {}
+        for stage in prepared:
+            previous = pinned.get(stage["agent_id"])
+            if previous and previous != stage["model"]:
+                raise ValidationError(
+                    f"{stage['agent_id']} 在不同阶段使用了不同模型"
+                    f"（{previous} vs {stage['model']}）",
+                    details={"agent_id": stage["agent_id"], "models": [previous, stage["model"]]},
+                )
+            pinned[stage["agent_id"]] = stage["model"]
+        # Persist each stage model through the same catalog used by the WebUI.
+        for agent_id, model in pinned.items():
+            self.set_agent_model(agent_id, model)
+        # Narrow on purpose: a bare "**" pattern overlaps every high-risk file
+        # pattern (lock files, .env, *.pem) and would force a high-risk
+        # approval for an ordinary test-generation stage.
+        default_write_scope = ["tests/**", "test_*.py"]
+        tasks: list[dict[str, Any]] = []
+        previous = ""
+        for index, stage in enumerate(prepared, start=1):
+            task_id = f"CHAIN{index:02d}"
+            if stage["type"] in ("implementation", "documentation") and not stage["scope"]:
+                stage["scope"] = list(default_write_scope)
+                stage["scope_source"] = "chain-default-tests"
+            objective = stage["objective"] or (
+                f"{goal}（第 {index} 阶段：{stage['agent_name']}）"
+            )
+            tasks.append({
+                "task_id": task_id,
+                "title": stage["title"] or f"阶段 {index} · {stage['agent_name']}",
+                "type": stage["type"],
+                "objective": objective,
+                "suggested_agent": stage["agent_id"],
+                "dependencies": [previous] if previous else [],
+                "scope": stage["scope"],
+                "out_of_scope": stage["out_of_scope"],
+                "expected_outputs": ["summary"],
+                "acceptance_criteria": ["结构化成果包 + 可定位证据"],
+                "verification_commands": stage["verification_commands"],
+                "token_budget": int(stage["token_budget"]),
+                "time_limit_minutes": int(stage["time_limit_minutes"]),
+                "retry_limit": int(stage["retry_limit"]),
+                "risk_level": "low",
+                "priority": max(0, 9 - index),
+                "approval_policy": "auto",
+            })
+            stage["task_id"] = task_id
+            previous = task_id
+        plan_payload = {
+            "plan_version": 1,
+            "goal": goal,
+            "constraints": ["只允许通过各 Agent 自身的软件接口执行，禁止 OS 键鼠合成"],
+            "tasks": tasks,
+        }
+        imported = self.import_plan(plan_payload)
+        architecture_id = imported.get("architecture_approval_id") or ""
+        if architecture_id:
+            self.decide_approval(architecture_id, approve=True)
+        plan_approval = _approval_id_for(self, "plan", imported["plan_id"])
+        approved = self.decide_approval(plan_approval, approve=True)
+        run_id = approved["outcome"]["run_id"]
+        for stage in prepared:
+            self.store.update_task(f"{run_id}:{stage['task_id']}",
+                                   assigned_agent=stage["agent_id"])
+        self.audit.log("user", "chain.configured", subject=run_id, payload={
+            "goal": goal,
+            "stages": [{"task_id": s["task_id"], "agent": s["agent_id"],
+                        "model": s["model"], "type": s["type"]} for s in prepared],
+        })
+        outcome: dict[str, Any] = {
+            "status": "configured", "plan_id": imported["plan_id"], "run_id": run_id,
+            "main_agent_id": main_agent_id or "",
+            "stages": prepared,
+        }
+        if start:
+            self.start_run(run_id, max_parallel=max_parallel, background=background)
+            outcome["status"] = "started"
+        if not approve:
+            outcome["status"] = "pending_approval"
+        return outcome
+
+    # ------------------------------------------------------------------
+    # Preflight: open the selected agents and bind workspace + model
+    # ------------------------------------------------------------------
+    def preflight_agents(self, stages: list[dict[str, Any]], *,
+                         workspace: str = "", open_apps: bool = True,
+                         config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Open every selected agent and verify its workspace + model.
+
+        Trae and Qoder are actually relaunched with their programmatic
+        interface and read back; CLI agents are checked for executable and
+        catalog membership.  This is deliberately a separate, explicit step:
+        it can restart desktop apps and therefore never runs implicitly.
+        """
+        from .control import trae_interface
+        from .control.interfaces import (
+            prepare_qoder_session, qoder_model_key, verify_qoder_session,
+        )
+        from .connectors import is_auto_executable
+
+        root = str(Path(workspace).expanduser().resolve()) if workspace else \
+            str(self.project.root)
+        ensure_dir(Path(root))
+        report: list[dict[str, Any]] = []
+        for stage in stages:
+            agent_id = str(stage.get("agent_id") or "")
+            model = str(stage.get("model") or "")
+            agent = self.get_agent(agent_id)
+            cfg = dict(agent.adapter_config or {})
+            cfg.update(config or {})
+            item: dict[str, Any] = {"agent_id": agent_id, "name": agent.name,
+                                    "model": model, "workspace": root,
+                                    "adapter": agent.adapter_type}
+            known = [row["model"] for row in self.store.list_agent_models(
+                self.project.project_id, agent_id=agent_id)] or list(agent.models)
+            if model not in known:
+                item.update({"ok": False, "stage": "model",
+                             "error": f"{agent_id} 的真实模型清单中没有 {model}",
+                             "available": sorted(known)[:20]})
+                report.append(item)
+                continue
+            app = str(cfg.get("gui_app") or "")
+            try:
+                if app in ("trae_cn", "trae"):
+                    cdp = trae_interface.ensure_trae_cdp(
+                        app=app, port=int(cfg.get("trae_cdp_port")
+                                          or trae_interface.CDP_DEFAULT_PORT),
+                        workspace=root, executable=str(cfg.get("executable") or ""),
+                        config=cfg, allow_restart=open_apps, force_restart=open_apps,
+                        before_launch=lambda: trae_interface.set_trae_workspace(
+                            workspace=root, app=app, config=cfg))
+                    if not cdp.ok:
+                        item.update({"ok": False, "stage": "launch", "error": cdp.reason})
+                        report.append(item)
+                        continue
+                    ws = trae_interface.set_trae_workspace(
+                        workspace=root, app=app,
+                        dev_mode=str(cfg.get("trae_dev_mode") or "code"), config=cfg)
+                    md = trae_interface.set_trae_model(
+                        model=model, app=app, config=cfg,
+                        cdp_port=int(cfg.get("trae_cdp_port")
+                                     or trae_interface.CDP_DEFAULT_PORT))
+                    verify = trae_interface.verify_trae_session(
+                        workspace=root, model=model,
+                        dev_mode=str(cfg.get("trae_dev_mode") or "code"),
+                        app=app, config=cfg,
+                        cdp_port=int(cfg.get("trae_cdp_port")
+                                     or trae_interface.CDP_DEFAULT_PORT))
+                    item.update({
+                        "ok": bool(ws.ok and md.ok and verify.ok),
+                        "stage": "ready" if verify.ok else "verify",
+                        "process": "running" if cdp.ok else "not_running",
+                        "visible_model": md.actual.get("visible_model", ""),
+                        "workspace_set": ws.ok, "model_set": md.ok,
+                        "verify": verify.to_dict(),
+                        "error": "" if verify.ok else verify.reason,
+                    })
+                elif app == "qoder_cn":
+                    qkey = qoder_model_key(model)
+                    prep = prepare_qoder_session(workspace=root, model=qkey, config=cfg)
+                    if not prep.ok:
+                        item.update({"ok": False, "stage": "launch", "error": prep.reason})
+                        report.append(item)
+                        continue
+                    verify = verify_qoder_session(
+                        workspace=root, model=model, started_at=time.time() - 2,
+                        config=cfg, strict_daemon=False,
+                        session_id=str(prep.evidence.get("session_id") or ""))
+                    item.update({
+                        "ok": verify.ok, "stage": "ready" if verify.ok else "verify",
+                        "process": "running", "workspace_set": True, "model_set": True,
+                        "verify": verify.to_dict(),
+                        "error": "" if verify.ok else verify.reason,
+                    })
+                elif app == "workbuddy":
+                    # The deeplink prefills a probe without sending; a real
+                    # workspace/model binding is verified when the task runs.
+                    item.update({"ok": True, "stage": "deferred",
+                                 "process": "deeplink",
+                                 "note": "WorkBuddy 在任务执行时用 deeplink 绑定工作区/模型"})
+                else:
+                    command = cfg.get("command")
+                    exe = str(cfg.get("executable") or (
+                        command[0] if isinstance(command, list) and command else ""))
+                    usable = bool(exe) and (Path(exe).exists() or shutil.which(exe))
+                    item.update({
+                        "ok": usable and is_auto_executable(agent),
+                        "stage": "ready" if usable else "executable",
+                        "process": "cli", "workspace_set": True, "model_set": True,
+                        "error": "" if usable else f"可执行文件不可用: {exe or '(未登记)'}",
+                    })
+            except Exception as exc:
+                item.update({"ok": False, "stage": "error",
+                             "error": f"{type(exc).__name__}: {exc}"})
+            report.append(item)
+        return {"workspace": root, "opened": bool(open_apps),
+                "ready": sum(1 for r in report if r.get("ok")),
+                "total": len(report), "agents": report}
+
+    # ------------------------------------------------------------------
+    # Model recommendation: cheapest sufficient, best value
+    # ------------------------------------------------------------------
+    def recommend_models(self, *, task_type: str = "analysis",
+                         limit: int = 8,
+                         profile: str = "balanced") -> dict[str, Any]:
+        """Rank (agent, model) pairs by quality first, then by real cost."""
+        from .control import trae_interface
+
+        required = set(TASK_CAPABILITY_REQUIREMENTS.get(task_type, set()))
+        catalog = self.model_catalog.catalog()
+        bench = {row["agent_id"]: row for row in
+                 self.cost.benchmark(persist=False)["agents"]}
+        trae_rates: dict[str, dict[str, float]] = {}
+        for app in ("trae_cn", "trae"):
+            try:
+                trae_rates[app] = {row["id"]: row["rate"] for row in
+                                   trae_interface.list_trae_models(app, None)
+                                   if row.get("rate") is not None}
+            except Exception:
+                trae_rates[app] = {}
+        candidates: list[dict[str, Any]] = []
+        for agent in self.list_agents():
+            caps = set(derive_capability_list(agent))
+            if required - caps or agent.status == "offline":
+                continue
+            rows = catalog["by_agent"].get(agent.agent_id, {}).get("models", [])
+            if not rows:
+                continue
+            record = bench.get(agent.agent_id, {})
+            quality = float(record.get("score") or 0.6)
+            verification = float(record.get("verification_pass_rate") or 0.5)
+            duration = float(record.get("avg_duration_ms") or 0)
+            speed = 1.0 - min(1.0, duration / max(1, self.config.router_slow_reference_ms)) \
+                if duration else 0.5
+            for row in rows:
+                name = str(row["name"])
+                rate = trae_rates.get(str(agent.adapter_config.get("gui_app") or ""), {}).get(name)
+                if "free" in name.lower():
+                    cost, source = 0.0, "free_model"
+                elif rate is not None:
+                    cost, source = float(rate), "trae_catalog_rate"
+                else:
+                    cost, source = 0.5, "estimated"
+                candidates.append({
+                    "agent_id": agent.agent_id, "agent_name": agent.name,
+                    "model": name, "adapter": agent.adapter_type,
+                    "quality": round(quality, 4),
+                    "verification": round(verification, 4),
+                    "speed": round(speed, 4),
+                    "cost": round(cost, 4), "cost_source": source,
+                    "capabilities": sorted(required & caps),
+                })
+        if not candidates:
+            return {"task_type": task_type, "recommended": None,
+                    "candidates": [], "reason": "没有满足能力要求的 Agent/模型"}
+        max_cost = max(c["cost"] for c in candidates) or 1.0
+        for c in candidates:
+            c["cost_score"] = round(1.0 - c["cost"] / max_cost, 4)
+            c["value"] = round(0.55 * c["quality"] + 0.25 * c["verification"]
+                               + 0.20 * c["speed"], 4)
+        best_quality = max(c["quality"] for c in candidates)
+        profile = profile if profile in ("cost_first", "balanced", "quality_first") \
+            else "balanced"
+        ratio = {"cost_first": 0.8, "balanced": 0.9, "quality_first": 1.0}[profile]
+        # Never floor above the best available quality: with no history every
+        # agent sits at the 0.5 prior and a 0.55 floor would empty the set.
+        threshold = best_quality * ratio
+        sufficient = [c for c in candidates if c["quality"] >= threshold] or candidates
+        cheapest = min(sufficient, key=lambda c: (c["cost"], -c["value"]))
+        best = max(candidates, key=lambda c: (c["value"], -c["cost"]))
+        picked = best if profile == "quality_first" else cheapest
+        picked["rationale"] = (
+            f"[{profile}] 质量 {picked['quality']:.2f} ≥ 阈值 {threshold:.2f}；"
+            f"成本 {picked['cost']}（{picked['cost_source']}）"
+            + ("；取综合价值最高" if profile == "quality_first" else "；取满足质量的最低价"))
+        best["rationale"] = (
+            f"综合价值 {best['value']:.2f} 最高（质量 {best['quality']:.2f}，"
+            f"成本 {best['cost']}）")
+        ranked = sorted(candidates, key=lambda c: (-c["value"], c["cost"]))[:limit]
+        return {"task_type": task_type, "required": sorted(required),
+                "profile": profile, "recommended": picked, "best_value": best,
+                "threshold": round(threshold, 4),
+                "note": ("质量取该 Agent 的历史 benchmark（无历史用 0.6 先验）；"
+                         "成本优先取应用自身目录倍率，free 模型为 0，其余为估计值"),
+                "candidates": ranked}
+
+    # ------------------------------------------------------------------
+    # Per-run binding report (workspace + model as actually applied)
+    # ------------------------------------------------------------------
+    def run_bindings(self, run_id: str) -> dict[str, Any]:
+        run = self.store.get_run(run_id)
+        if not run:
+            raise NotFoundError(f"运行不存在: {run_id}")
+        rows: list[dict[str, Any]] = []
+        for task in sorted(self.store.list_tasks(run_id),
+                           key=lambda t: int(re.sub(r"\D", "", t.task_id) or 0)):
+            agent = self.store.get_agent(task.assigned_agent) if task.assigned_agent else None
+            gui_log = Path(task.task_dir or "") / "gui" / "gui.log"
+            verify: dict[str, Any] = {}
+            visible = ""
+            if gui_log.exists():
+                for line in gui_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("event") == "interface_verify":
+                        verify = event
+                    if event.get("event") == "trae_visible_model":
+                        visible = str(event.get("visible") or "")
+            rows.append({
+                "task_id": task.task_id, "agent_id": task.assigned_agent,
+                "agent_name": agent.name if agent else "",
+                "model": str(((agent.extra or {}) if agent else {}).get("selected_model") or ""),
+                "workspace": task.workdir,
+                "status": task.status, "verification": task.verification_status,
+                "visible_model": visible,
+                "verified": bool(verify.get("ok")),
+                "verify_method": verify.get("method", ""),
+                "error": task.error,
+            })
+        return {"run_id": run_id, "status": run["status"], "stages": rows}
+
+    def chain_status(self, run_id: str = "") -> dict[str, Any]:
+        run = self.store.get_run(run_id) if run_id else self.latest_run()
+        if not run:
+            return {"status": "no_run", "stages": []}
+        tasks = sorted(self.store.list_tasks(run["run_id"]),
+                       key=lambda t: int(re.sub(r"\D", "", t.task_id) or 0))
+        stages = []
+        for task in tasks:
+            agent_id = task.assigned_agent or task.spec.suggested_agent
+            agent = self.store.get_agent(agent_id) if agent_id else None
+            stages.append({
+                "task_id": task.task_id, "status": task.status,
+                "agent_id": agent_id, "agent_name": agent.name if agent else "",
+                "model": str(((agent.extra or {}) if agent else {}).get("selected_model")
+                             or ""),
+                "verification": task.verification_status, "error": task.error,
+                "objective": task.spec.objective,
+            })
+        plan = self.store.get_plan(run["plan_id"])
+        return {"run_id": run["run_id"], "status": run["status"],
+                "acceptance_status": run.get("acceptance_status", ""),
+                "release_status": run.get("release_status", ""),
+                "goal": plan.goal if plan else "", "stages": stages}
+
+    # ------------------------------------------------------------------
     # Overview / doctor
     # ------------------------------------------------------------------
     def overview(self) -> dict[str, Any]:
@@ -856,6 +1356,14 @@ class Hub:
 
     def close(self) -> None:
         self.db.close_thread()
+
+
+def _approval_id_for(hub: "Hub", kind: str, plan_id: str) -> str:
+    for item in hub.approvals_all(limit=500):
+        if item["kind"] == kind and item.get("plan_id") == plan_id \
+                and item["status"] in ("pending", "approved"):
+            return str(item["approval_id"])
+    return ""
 
 
 def _count_by(items: list[Any], key) -> dict[str, int]:

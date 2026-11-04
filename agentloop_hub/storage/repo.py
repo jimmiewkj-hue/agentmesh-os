@@ -388,10 +388,12 @@ class Store:
     def replace_discovered_models(self, project_id: str, agent_id: str,
                                   models: list[str], *, source: str = "discovered") -> None:
         """Refresh machine-detected models while preserving user registrations."""
-        discovered_sources = {"discovered", "session", "cli"}
+        discovered_sources = {"discovered", "session", "cli", "sync"}
+        marks = ",".join("?" for _ in discovered_sources)
         self.db.execute(
-            "DELETE FROM agent_models WHERE project_id=? AND agent_id=? AND source IN "
-            "(?,?,?)", (project_id, agent_id, *sorted(discovered_sources)),
+            f"DELETE FROM agent_models WHERE project_id=? AND agent_id=? "
+            f"AND source IN ({marks})",
+            (project_id, agent_id, *sorted(discovered_sources)),
         )
         for name in sorted(set(models)):
             self.upsert_agent_model(project_id, agent_id, name, source=source)
@@ -943,8 +945,14 @@ class Store:
         where = "project_id=?" + (" AND run_id=?" if run_id else "")
         params: list[Any] = [project_id] + ([run_id] if run_id else [])
         return self.db.query(
-            "SELECT agent_id, model, COUNT(*) AS records, COALESCE(SUM(total_tokens),0) AS total_tokens, "
-            "COALESCE(SUM(cost),0) AS cost, COALESCE(SUM(retries),0) AS retries "
+            "SELECT agent_id, model, COUNT(*) AS records, "
+            "COALESCE(SUM(input_tokens),0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens),0) AS output_tokens, "
+            "COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
+            "COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens, "
+            "COALESCE(SUM(total_tokens),0) AS total_tokens, "
+            "COALESCE(SUM(cost),0) AS cost, COALESCE(SUM(retries),0) AS retries, "
+            "COALESCE(SUM(duration_ms),0) AS duration_ms "
             f"FROM usage_records WHERE {where} GROUP BY agent_id, model ORDER BY total_tokens DESC",
             params,
         )

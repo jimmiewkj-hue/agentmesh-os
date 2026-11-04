@@ -1,0 +1,195 @@
+{
+  "root": "C:\\Users\\<user>\\AppData\\Local\\Temp\\agentmesh-audit-n5hxhg1e",
+  "agents_total": 14,
+  "auto_executable": [
+    "aider",
+    "claude_code",
+    "codex_cli",
+    "gemini_cli",
+    "opencode",
+    "qoder_cn",
+    "workbuddy"
+  ],
+  "manual_only": [
+    "cursor",
+    "dsh",
+    "qoder",
+    "rea",
+    "trae",
+    "trae_cn",
+    "zcode"
+  ],
+  "agents": [
+    {
+      "agent_id": "aider",
+      "product": "Aider",
+      "status": "offline",
+      "adapter": "cli",
+      "level": "L1",
+      "auto": true,
+      "capabilities": 1,
+      "models": 0
+    },
+    {
+      "agent_id": "claude_code",
+      "product": "Claude Code",
+      "status": "offline",
+      "adapter": "cli",
+      "level": "L1",
+      "auto": true,
+      "capabilities": 1,
+      "models": 0
+    },
+    {
+      "agent_id": "codex_cli",
+      "product": "Codex CLI",
+      "status": "offline",
+      "adapter": "cli",
+      "level": "L1",
+      "auto": true,
+      "capabilities": 1,
+      "models": 0
+    },
+    {
+      "agent_id": "cursor",
+      "product": "Cursor",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L1",
+      "auto": false,
+      "capabilities": 10,
+      "models": 0
+    },
+    {
+      "agent_id": "dsh",
+      "product": "DeepSeek Harness",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 12,
+      "models": 40
+    },
+    {
+      "agent_id": "gemini_cli",
+      "product": "Gemini CLI",
+      "status": "offline",
+      "adapter": "cli",
+      "level": "L1",
+      "auto": true,
+      "capabilities": 1,
+      "models": 0
+    },
+    {
+      "agent_id": "opencode",
+      "product": "OpenCode",
+      "status": "online",
+      "adapter": "opencode",
+      "level": "L3",
+      "auto": true,
+      "capabilities": 18,
+      "models": 41
+    },
+    {
+      "agent_id": "qoder",
+      "product": "Qoder",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 12,
+      "models": 1
+    },
+    {
+      "agent_id": "qoder_cn",
+      "product": "Qoder CN",
+      "status": "online",
+      "adapter": "gui_automation",
+      "level": "L3",
+      "auto": true,
+      "capabilities": 17,
+      "models": 4
+    },
+    {
+      "agent_id": "rea",
+      "product": "REA Studio",
+      "status": "online",
+      "adapter": "mcp",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 7,
+      "models": 0
+    },
+    {
+      "agent_id": "trae",
+      "product": "Trae",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 12,
+      "models": 0
+    },
+    {
+      "agent_id": "trae_cn",
+      "product": "Trae CN",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 12,
+      "models": 0
+    },
+    {
+      "agent_id": "workbuddy",
+      "product": "WorkBuddy",
+      "status": "online",
+      "adapter": "gui_automation",
+      "level": "L3",
+      "auto": true,
+      "capabilities": 17,
+      "models": 11
+    },
+    {
+      "agent_id": "zcode",
+      "product": "ZCode",
+      "status": "online",
+      "adapter": "file_relay",
+      "level": "L2",
+      "auto": false,
+      "capabilities": 12,
+      "models": 10
+    }
+  ],
+  "surface_summary": {
+    "agents": 14,
+    "capability_cells": 70,
+    "verified": 20,
+    "partial": 9,
+    "unsupported": 21,
+    "not_installed": 20
+  },
+  "zero_input": {
+    "os_input": "blocked",
+    "mode": "blocked",
+    "reason": "默认零 OS 输入",
+    "disable_locked": false,
+    "allowed_channels": [
+      "cdp",
+      "ipc",
+      "deeplink",
+      "db_config",
+      "stdio",
+      "cli_args"
+    ]
+  },
+  "routing_selected": {
+    "analysis": "opencode",
+    "review": "opencode",
+    "implementation": "opencode",
+    "documentation": "opencode",
+    "verification": "opencode",
+    "architecture": "opencode"
+  },
+  "models_total": 107
+}

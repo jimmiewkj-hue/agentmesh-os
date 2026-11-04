@@ -111,9 +111,50 @@ def workbuddy_profile() -> GuiProfile:
     )
 
 
+def trae_cn_profile() -> GuiProfile:
+    """Trae CN 1.107.1.  Layout coordinates are NOT used on the zero-input path.
+
+    Model / workspace / dev mode are written to ``state.vscdb``; the prompt is
+    inserted and submitted through CDP DOM.  The ratios below exist only so the
+    diagnostic (explicitly opted-in) path can still attach a window.
+    """
+    local = _appdata_local()
+    return GuiProfile(
+        app="trae_cn",
+        product="Trae CN",
+        window_title="Trae CN",
+        executable_candidates=(
+            str(local / "Programs" / "Trae CN" / "Trae CN.exe"),
+            r"C:\Program Files\Trae CN\Trae CN.exe",
+        ),
+        transcript_reader="trae_cn",
+        data_root=str(_home() / ".trae-cn" / "memory" / "projects"),
+        input_ratio=(0.5, 0.8),
+        model_switch_supported=False,  # handled by state.vscdb, never by a click
+        display_model="DeepSeek-V4.1-Flash",
+        launch_timeout_seconds=120,
+        timeout_seconds=1800,
+        stall_seconds=300,
+    )
+
+
+def trae_profile() -> GuiProfile:
+    profile = trae_cn_profile()
+    return GuiProfile(
+        app="trae", product="Trae", window_title="Trae",
+        executable_candidates=(str(_appdata_local() / "Programs" / "Trae" / "Trae.exe"),),
+        transcript_reader="trae", data_root=str(_home() / ".trae" / "memory" / "projects"),
+        input_ratio=profile.input_ratio, model_switch_supported=False,
+        launch_timeout_seconds=profile.launch_timeout_seconds,
+        timeout_seconds=profile.timeout_seconds, stall_seconds=profile.stall_seconds,
+    )
+
+
 GUI_PROFILES = {
     "qoder_cn": qoder_cn_profile,
     "workbuddy": workbuddy_profile,
+    "trae_cn": trae_cn_profile,
+    "trae": trae_profile,
 }
 
 
@@ -122,4 +163,5 @@ def profile_for_app(app: str) -> GuiProfile | None:
     return factory() if factory else None
 
 
-__all__ = ["GUI_PROFILES", "profile_for_app", "qoder_cn_profile", "workbuddy_profile"]
+__all__ = ["GUI_PROFILES", "profile_for_app", "qoder_cn_profile", "workbuddy_profile",
+           "trae_cn_profile", "trae_profile"]

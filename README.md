@@ -78,6 +78,47 @@ Claude Code · Gemini CLI · Codex CLI · Cursor · Aider · REA Studio (MCP) ·
 - Agent 软件版本台账与兼容漂移检测；REA Studio 以真实 MCP 服务接入（229 个工具）。
 - Qoder CN / WorkBuddy 以 `gui_automation` 自动执行：窗口标题 + 相对布局定位、模型切换/校验、transcript 回读、超时/卡死/解析错误码与截图留证。
 - 40+ CLI 子命令。
+- **多 Agent 链路（2026-11-04）**：WebUI 第 3.5 步可固定「每阶段 Agent + 该 Agent 真实模型清单中的模型」，
+  一键 `POST /api/chain` 建计划、批计划、钉住 `assigned_agent` 并按 DAG 运行；单阶段可设时限与重试次数。
+- **预检并打开 Agent（`POST /api/preflight`）**：按所选阶段真正启动 Trae/Qoder、写入工作区与模型并回读核验；
+  本机实测 `ready 3/3`（Trae `DeepSeek-V4.1-Flash`、Qoder `gfmodel`、OpenCode CLI）。
+- **智能选型（`GET /api/models/recommend`）**：质量取 Agent 历史 benchmark，成本取应用自身倍率
+  （Trae 目录）或 free 模型；输出 `cost_source` 与理由，支持 `cost_first / balanced / quality_first`。
+- **每阶段绑定报告（`GET /api/runs/<id>/bindings`）**：列出每个任务实际使用的 Agent、模型、工作区与核验结果。
+- **模型目录每日同步（`POST/GET /api/agents/models/sync`、`agentmesh models --sync`）**：
+  Trae/Qoder/WorkBuddy/OpenCode/ZCode/DSH 的真实模型合并去重，下拉显示应用内同名并附真实倍率；
+  控制台每小时检查、超过 24 小时自动刷新。实测覆盖：Trae 19、Qoder 10/14、WorkBuddy 30+、OpenCode 41。
+- **预算仅统计、不自动停机（`budget_hard_stop=false`，默认项目预算 0）**：成本页新增
+  “分 Agent Token 消耗”（输入/输出/缓存/推理/占比/费用）；运行可用户暂停/继续
+  （`POST /api/runs/<id>/pause|resume`），暂停只停止后续派发，不强杀正在执行的任务。
+- **Trae / Trae CN 零输入接口（2026-11-04）**：`state.vscdb`（明文 SQLite）写工作区/模式，
+  `--remote-debugging-port` + CDP DOM 写入并点击发送；模型写入可回读但**界面不生效**
+  （服务端偏好），因此发送前会读取输入框显示模型并在不一致时抛 `MODEL_MISMATCH`。
+  详见 [Agent 软件接口逆向实测](docs/Agent软件接口逆向实测.md)。
+- **CDP 探活绕过 HTTP_PROXY**：本机 `HTTP_PROXY` 指向本地沙箱代理，`127.0.0.1` 也会被代理成 502；
+  `gui/cdp.py` 与两个接口模块已改为显式 `ProxyHandler({})`。
+- **Electron 子进程环境清理**：宿主导出的 `ELECTRON_RUN_AS_NODE=1` 会让被拉起的 Electron 应用以 Node 模式
+  启动后立即退出；拉起 Qoder/Trae/WorkBuddy 时统一剔除。
+
+### 多 Agent 链路实测状态（2026-11-04）
+
+- ✅ **Trae CN + `deepseek-v4.1-flash`**：用 CDP **页面级鼠标事件**打开应用自己的模型菜单并点选
+  （`Seed-Code → DeepSeek-V4.1-Flash`，回读 `.model-select-area-model` 确认），再发送任务；
+  实测产出完整成果包（发现 `add()` 返回 `a - b`、执行了 `python -c` 验证、列出证据与修复建议），
+  控制平面验证 `passed`。事件只进入渲染进程，不移动 OS 光标。
+- ✅ Qoder CN + `gfmodel`（GLM-5.3-Flash）：CDP 零输入发送，transcript 回读
+  `model=gfmodel` / `workspace-directories=<任务 worktree>` / `completed=true`，验证 `passed`。
+- ✅ OpenCode + `opencode/glm-5.3-flash-free`：CLI 直连返回预期内容（7.3s）。
+- ⚠️ 三段真实链路 `run_e03efb244dcc`：Trae 段与 Qoder 段均 `completed + passed`；
+  OpenCode 长任务在免费模型上超过 8 分钟未返回，未在观察窗口内完成（接口本身已由直连验证）。
+  链路编排另有 `verification/test_chain.py`（5 个用例，mock CLI Agent）覆盖。
+
+> 与第三方插件 `dsh-connect-trae-plus` 的对比见
+> [Trae 接入方案分析](docs/Trae接入方案分析-dsh-connect-trae-plus.md)：该插件走
+> `llm_utils_chat` 私有 HTTP + token 桥（有封号风险），本项目不采用；我们改走应用自身 UI。
+
+完整证据与逐条接口见 [Agent 软件接口逆向实测](docs/Agent软件接口逆向实测.md)，
+原始运行记录在 `logs/chain-20261104/chain-runs.json`。
 
 ## 快速开始
 

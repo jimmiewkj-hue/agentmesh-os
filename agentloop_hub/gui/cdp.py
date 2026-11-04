@@ -36,10 +36,20 @@ class CdpTransport(Protocol):
         ...
 
 
+def _local_urlopen(url: str, *, timeout: float):
+    """Open a loopback URL without the environment HTTP proxy.
+
+    The desktop app runs inside environments that export ``HTTP_PROXY`` (this
+    box points at a local sandbox proxy).  ``urllib`` honours it even for
+    127.0.0.1 and turns a live CDP endpoint into ``502 Bad Gateway``, so every
+    loopback probe must bypass proxies explicitly.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(url, timeout=timeout)
+
+
 def _targets(port: int) -> list[dict[str, Any]]:
-    with urllib.request.urlopen(
-        f"http://127.0.0.1:{int(port)}/json/list", timeout=5
-    ) as response:
+    with _local_urlopen(f"http://127.0.0.1:{int(port)}/json/list", timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
