@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import make_project
+from hub_test_support import make_project
 from agentloop_hub.control.rounds import decide, signature_of
 from agentloop_hub.models import Task, TaskSpec
 
@@ -303,3 +303,20 @@ def test_identical_blocker_signature_blocks_after_threshold():
     assert second.code == "repeated-blocker"
     assert second.blocked_streak == 2
 
+
+
+def test_collect_unresolved_ignores_nonblocking_notes():
+    from types import SimpleNamespace
+    from agentloop_hub.control.rounds import collect_unresolved
+
+    task = SimpleNamespace(uid="run:T1", task_id="T1", status="completed",
+                           verification_status="warning", error="",
+                           spec=SimpleNamespace(supersedes=[]))
+    results = {"run:T1": {"unresolved_items": [
+        "非阻塞：浏览器人工复核留待验收",
+        "optional: document later",
+        "真正阻塞：登录流程仍然失败",
+    ]}}
+    items = collect_unresolved([task], {"merge_recommendation": "approve"}, results)
+    assert len(items) == 1
+    assert "登录流程" in items[0]

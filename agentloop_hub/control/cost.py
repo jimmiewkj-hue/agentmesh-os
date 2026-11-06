@@ -70,7 +70,13 @@ class CostOptimizer:
             normalize_intent(" ".join(spec.out_of_scope)),
         ])
 
-    def semantic_lookup(self, task: Task, file_hash: str) -> dict[str, Any] | None:
+    def semantic_reference(self, task: Task, file_hash: str) -> dict[str, Any] | None:
+        """Return a similar prior result as a *reference*, never as a result.
+
+        Approximate similarity cannot prove the same intent (``>0`` and ``<0``
+        normalize identically), so a match is not recorded as a hit or a
+        saving and is never returned as a successful payload.
+        """
         if task.spec.writable or not file_hash:
             return None
         entries = self.store.semantic_candidates(
@@ -86,18 +92,12 @@ class CostOptimizer:
         if not best or best[0] < float(self.config.semantic_cache_threshold):
             return None
         score, entry = best
-        self.store.semantic_hit(entry["cache_key"])
-        tokens_saved = self._payload_tokens(entry.get("payload", {}))
-        self.record_saving(
-            "semantic_cache", tokens_saved, task_uid=task.uid, run_id=task.run_id,
-            detail={"cache_key": entry["cache_key"], "similarity": round(score, 4),
-                    "matched_objective": entry.get("objective", "")[:300]},
-        )
         return {
             "cache_key": entry["cache_key"],
             "similarity": round(score, 4),
             "payload": entry.get("payload", {}),
             "source_task": entry.get("objective", ""),
+            "reference_only": True,
         }
 
     def semantic_store(self, task: Task, file_hash: str, payload: dict[str, Any]) -> dict[str, Any] | None:

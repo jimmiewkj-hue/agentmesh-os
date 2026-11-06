@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 from agentloop_hub.hub import Hub
 
@@ -154,3 +154,24 @@ def test_chain_draft_persists_across_hub_restart(env, tmp_path):
     loaded = reopened.chain_draft()
     assert loaded["plan_id"] == "plan_x"
     assert loaded["stages"][0]["model"] == "worker-free"
+
+
+def test_reassigning_a_relay_wait_requeues_the_same_attempt(env):
+    repo, hub, _ = env
+    imported = hub.import_plan(default_plan(str(repo)), main_agent_id="mock_main",
+                               model="main-pro")
+    for approval in hub.approvals_pending():
+        if approval["kind"] == "architecture":
+            hub.decide_approval(approval["approval_id"], approve=True)
+    run_id = hub.approve_plan(imported["plan_id"])["run_id"]
+    uid = f"{run_id}:T003"
+    hub.store.set_task_status(uid, "waiting_user", error="等待接力任务", force=True)
+    hub.store.update_task(uid, attempts=1)
+    updated = hub.update_task_binding(
+        uid, agent_id="mock_verifier", model="verifier-pro", requeue=True)
+    assert updated["status"] == "queued", updated
+    task = hub.store.get_task(uid)
+    assert task.assigned_agent == "mock_verifier"
+    assert task.attempts == 0
+    assert task.error == ""
+    hub.close()

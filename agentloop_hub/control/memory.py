@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,26 @@ SOURCE_EXTENSIONS = {
     ".c", ".h", ".hpp", ".rb", ".php", ".dart", ".kt", ".swift", ".scala", ".sh",
     ".ps1", ".sql", ".vue", ".svelte",
 }
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|secret|"
+               r"password|passwd|authorization)\b\s*[:=]\s*['\"]?([^\s'\"]{6,})"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,}|"
+               r"AKIA[0-9A-Z]{12,})\b"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_.-]{10,}"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Remove credentials before raw conversation text enters shared memory."""
+    out = str(text or "")
+    # Bearer first: otherwise the generic key/value rule consumes only the
+    # word "Bearer" and leaves the actual token behind.
+    out = _SECRET_PATTERNS[2].sub("Bearer [REDACTED]", out)
+    out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}=[REDACTED]", out)
+    out = _SECRET_PATTERNS[1].sub("[REDACTED]", out)
+    return out
+
 
 KEY_FILE_PATTERNS = (
     "README.md", "README*", "pyproject.toml", "package.json", "requirements.txt",
@@ -72,7 +93,8 @@ class MemoryService:
         return memory
 
     def upsert_active(self, *, type: str, title: str, body: str, source: str,
-                      confidence: float = 0.9, scope: str = "") -> MemoryRecord:
+                      confidence: float = 0.9, scope: str = "",
+                      injectable: bool = True) -> MemoryRecord:
         """Create or update one deterministic, auto-synced memory record.
 
         A process-local lock prevents concurrent task completions from creating
@@ -88,14 +110,16 @@ class MemoryService:
             if existing:
                 self.store.update_memory(
                     existing.memory_id, body=body, source=source,
-                    confidence=float(confidence), scope=scope, last_verified_at=now_iso(),
+                    confidence=float(confidence), scope=scope,
+                    injectable=injectable, last_verified_at=now_iso(),
                 )
                 self.store.append_audit(self.project.project_id, "memory", "memory.synced",
                                         subject=existing.memory_id,
                                         payload={"type": normalized, "title": title})
                 return self.get(existing.memory_id)
             return self.add(type=normalized, title=title, body=body, source=source,
-                            confidence=confidence, scope=scope)
+                            confidence=confidence, scope=scope,
+                            injectable=injectable)
 
     def get(self, memory_id: str) -> MemoryRecord:
         memory = self.store.get_memory(memory_id)
@@ -276,15 +300,19 @@ class MemoryService:
             "message_count": record.message_count,
             "cwd": record.cwd,
             "token_usage": record.token_usage,
-            "user_requests": list(summary.get("user_requests", []))[:10],
-            "last_assistant_reply": str(summary.get("last_assistant_reply", ""))[:800],
+            "user_requests": [redact_secrets(item)
+                              for item in list(summary.get("user_requests", []))[:10]],
+            "last_assistant_reply": redact_secrets(
+                str(summary.get("last_assistant_reply", ""))[:800]),
             "tool_names": list(summary.get("tool_names", []))[:50],
         }
+        # Raw conversation evidence is not shared/injected by default; only
+        # curated knowledge/decisions are.  The archive stays in the ledger.
         return self.upsert_active(
             type=MemoryType.MESSAGE.value,
             title=f"会话 {record.agent_id}/{record.session_id}",
             body=json.dumps(body, ensure_ascii=False), source=record.agent_id,
-            confidence=0.8,
+            confidence=0.8, injectable=False,
         )
 
     def record_decision(self, content: str, *, agent_id: str = "", model: str = "",
@@ -299,7 +327,8 @@ class MemoryService:
 
     def record_problem(self, *, symptom: str, cause: str, fix: str,
                        verification: str, task_uid: str = "") -> MemoryRecord:
-        body = f"症状：{symptom}\n根因：{cause}\n修复：{fix}\n验证：{verification}"
+        body = redact_secrets(
+            f"症状：{symptom}\n根因：{cause}\n修复：{fix}\n验证：{verification}")
         return self.add(
             type=MemoryType.KNOWLEDGE.value, title=symptom[:80], body=body,
             source="verification", confidence=0.8, task_uid=task_uid,
@@ -308,8 +337,58 @@ class MemoryService:
 
     def record_knowledge(self, title: str, body: str, *, source: str = "user",
                          confidence: float = 0.8) -> MemoryRecord:
-        return self.add(type=MemoryType.KNOWLEDGE.value, title=title, body=body,
-                        source=source, confidence=confidence)
+        return self.add(type=MemoryType.KNOWLEDGE.value, title=title,
+                        body=redact_secrets(body), source=source,
+                        confidence=confidence,
+                        invalid_conditions=["相关文件基线变化", "项目/分支变化"])
+
+    def invalidate_on_baseline_change(self, previous_commit: str,
+                                      current_commit: str) -> int:
+        """Expire memories whose validity depended on the old code baseline."""
+        previous = str(previous_commit or "").strip()
+        current = str(current_commit or "").strip()
+        if not previous or not current or previous == current:
+            return 0
+        invalidated = 0
+        for memory in self.store.list_memories(self.project.project_id, limit=10000):
+            if memory.status != MemoryStatus.ACTIVE.value:
+                continue
+            conditions = list(memory.invalid_conditions or [])
+            if not any(("基线" in str(item)) or ("分支" in str(item))
+                       for item in conditions):
+                continue
+            reason = f"代码基线 {previous[:12]} -> {current[:12]}"
+            conditions.append(reason)
+            self.store.update_memory(
+                memory.memory_id, status=MemoryStatus.EXPIRED.value,
+                invalid_conditions=conditions)
+            invalidated += 1
+        if invalidated:
+            self.store.append_audit(
+                self.project.project_id, "control-plane", "memory.baseline_invalidated",
+                payload={"previous": previous, "current": current,
+                         "count": invalidated})
+        return invalidated
+
+    def invalidate_task_memories(self, task_uid: str, reason: str) -> int:
+        """Mark a task's memories stale after a retry or dependency change."""
+        if not task_uid:
+            return 0
+        invalidated = 0
+        for memory in self.store.list_memories(self.project.project_id, limit=10000):
+            if memory.task_uid != task_uid or memory.status != MemoryStatus.ACTIVE.value:
+                continue
+            conditions = list(memory.invalid_conditions or [])
+            if reason not in conditions:
+                conditions.append(reason)
+            self.store.update_memory(memory.memory_id, status=MemoryStatus.EXPIRED.value,
+                                     invalid_conditions=conditions)
+            invalidated += 1
+        if invalidated:
+            self.store.append_audit(
+                self.project.project_id, "control-plane", "memory.invalidated",
+                subject=task_uid, payload={"reason": reason, "count": invalidated})
+        return invalidated
 
     # ------------------------------------------------------------------
     # Agent startup bootstrap
@@ -341,7 +420,7 @@ class MemoryService:
                 "source": e["source"], "created_at": e["created_at"],
                 "payload": e["payload"],
             }
-            for e in self.store.list_bus_events(self.project.project_id, after_seq=0, limit=limit)
+            for e in self.store.recent_bus_events(self.project.project_id, limit=limit)
         ]
         counts = {
             level: sum(

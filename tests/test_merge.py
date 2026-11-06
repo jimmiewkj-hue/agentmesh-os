@@ -8,7 +8,7 @@ import pytest
 
 from agentloop_hub.errors import ApprovalRequiredError, ConflictError
 from agentloop_hub.models import TaskStatus
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def approve_and_run(hub, tmp_path):
@@ -97,7 +97,7 @@ def test_cross_task_same_file_conflict_detected(tmp_path):
          "verification_commands": [], "token_budget": 1000, "time_limit_minutes": 5,
          "retry_limit": 1, "risk_level": "low"},
         {"task_id": "B", "title": "b", "type": "implementation", "objective": "modify again",
-         "suggested_agent": "mock_worker", "dependencies": ["A"], "scope": ["calc.py"],
+         "suggested_agent": "mock_worker", "dependencies": [], "scope": ["calc.py"],
          "out_of_scope": [], "expected_outputs": [], "acceptance_criteria": [],
          "verification_commands": [], "token_budget": 1000, "time_limit_minutes": 5,
          "retry_limit": 1, "risk_level": "low"},
@@ -139,3 +139,12 @@ def test_dirty_unrelated_file_does_not_block_merge(tmp_path):
     assert merged["status"] == "completed"
     assert (repo / "unrelated.txt").exists()
     hub.close()
+
+
+def test_continuation_overlap_allows_dependency_chains_only():
+    from agentloop_hub.control.merge import MergeService
+
+    deps = {"T1": [], "T2": ["T1"], "R2_T2": ["T2"], "X1": [], "X2": []}
+    assert MergeService._continuation_overlap(deps, "R2_T2", "T2")
+    assert MergeService._continuation_overlap(deps, "T2", "T1")
+    assert not MergeService._continuation_overlap(deps, "X1", "X2")

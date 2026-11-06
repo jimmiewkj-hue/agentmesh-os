@@ -12,7 +12,7 @@ from ..errors import HubError
 from ..util import ensure_dir
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS plans (
     raw TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     approved_at TEXT NOT NULL DEFAULT '',
-    approval_id TEXT NOT NULL DEFAULT ''
+    approval_id TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    content_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project_id, created_at);
 
@@ -98,6 +100,8 @@ CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     plan_id TEXT NOT NULL,
+    approval_id TEXT NOT NULL DEFAULT '',
+    owner_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     main_agent_id TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT '',
@@ -109,6 +113,7 @@ CREATE TABLE IF NOT EXISTS runs (
     release_status TEXT NOT NULL DEFAULT 'not_requested',
     round_number INTEGER NOT NULL DEFAULT 1,
     max_rounds INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL DEFAULT 1,
     goal_status TEXT NOT NULL DEFAULT 'active',
     blocked_reason TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -126,6 +131,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     run_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     parent_task_id TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT 'user',
+    supersedes TEXT NOT NULL DEFAULT '[]',
     title TEXT NOT NULL,
     objective TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -151,6 +158,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     assigned_agent TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    active_attempt_id TEXT NOT NULL DEFAULT '',
     workdir TEXT NOT NULL DEFAULT '',
     task_dir TEXT NOT NULL DEFAULT '',
     base_commit TEXT NOT NULL DEFAULT '',
@@ -171,6 +179,7 @@ CREATE TABLE IF NOT EXISTS results (
     task_uid TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL DEFAULT '',
     agent_id TEXT NOT NULL,
     status TEXT NOT NULL,
     payload TEXT NOT NULL,
@@ -195,10 +204,33 @@ CREATE TABLE IF NOT EXISTS verifications (
 );
 CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications(task_uid, created_at);
 
+CREATE TABLE IF NOT EXISTS attempts (
+    attempt_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    task_uid TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    attempt_number INTEGER NOT NULL DEFAULT 1,
+    request_id TEXT NOT NULL UNIQUE,
+    purpose TEXT NOT NULL DEFAULT 'task',
+    status TEXT NOT NULL DEFAULT 'prepared',
+    workdir TEXT NOT NULL DEFAULT '',
+    result_path TEXT NOT NULL DEFAULT '',
+    patch_path TEXT NOT NULL DEFAULT '',
+    report_path TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    binding TEXT NOT NULL DEFAULT '{}',
+    input_snapshot TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_uid, attempt_number);
+
 CREATE TABLE IF NOT EXISTS changes (
     change_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     task_uid TEXT NOT NULL,
+    attempt_id TEXT NOT NULL DEFAULT '',
     agent_id TEXT NOT NULL,
     base_commit TEXT NOT NULL DEFAULT '',
     base_hash TEXT NOT NULL DEFAULT '',
@@ -217,6 +249,7 @@ CREATE TABLE IF NOT EXISTS file_leases (
     project_id TEXT NOT NULL,
     path_pattern TEXT NOT NULL,
     task_uid TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT '',
     agent_id TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'write',
     active INTEGER NOT NULL DEFAULT 1,
@@ -258,6 +291,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
     retries INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     cost REAL NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    cost_known INTEGER NOT NULL DEFAULT 1,
     estimated INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'ok',
     created_at TEXT NOT NULL
@@ -367,6 +402,47 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS outbox (
+    outbox_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL DEFAULT 'control-plane',
+    correlation_id TEXT NOT NULL DEFAULT '',
+    topic TEXT NOT NULL DEFAULT '',
+    sync_level INTEGER,
+    published INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    published_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(project_id, published, created_at);
+
+CREATE TABLE IF NOT EXISTS reconcile_todos (
+    todo_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(project_id, run_id, reason, status)
+);
+CREATE INDEX IF NOT EXISTS idx_reconcile_pending ON reconcile_todos(project_id, status);
+
+CREATE TABLE IF NOT EXISTS controller_instances (
+    instance_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    host TEXT NOT NULL DEFAULT '',
+    pid INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    heartbeat_epoch REAL NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_controller_instances ON controller_instances(project_id, active);
+
 -- ---------------------------------------------------------------------------
 -- AgentMesh OS v2: Context Bus, Capability Router, Cost Optimizer, Governance
 -- ---------------------------------------------------------------------------
@@ -407,6 +483,7 @@ CREATE TABLE IF NOT EXISTS bus_subscriptions (
     topics TEXT NOT NULL DEFAULT '[]',
     kinds TEXT NOT NULL DEFAULT '[]',
     cursor_seq INTEGER NOT NULL DEFAULT 0,
+    acked_seq INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -525,7 +602,11 @@ class Database:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
+            self._local.tx_depth = 0
         return conn
+
+    def in_transaction(self) -> bool:
+        return int(getattr(self._local, "tx_depth", 0) or 0) > 0
 
     def close_thread(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -571,6 +652,23 @@ class Database:
             conn.execute("ALTER TABLE tasks ADD COLUMN context_length INTEGER NOT NULL DEFAULT 0")
         if "capability_level" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN capability_level TEXT NOT NULL DEFAULT ''")
+        if "supersedes" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN supersedes TEXT NOT NULL DEFAULT '[]'")
+        if "origin" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'")
+        if "active_attempt_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN active_attempt_id TEXT NOT NULL DEFAULT ''")
+        change_columns = columns("changes")
+        if "attempt_id" not in change_columns:
+            conn.execute("ALTER TABLE changes ADD COLUMN attempt_id TEXT NOT NULL DEFAULT ''")
+        result_columns = columns("results")
+        if "attempt_id" not in result_columns:
+            conn.execute("ALTER TABLE results ADD COLUMN attempt_id TEXT NOT NULL DEFAULT ''")
+        plan_columns = columns("plans")
+        if "revision" not in plan_columns:
+            conn.execute("ALTER TABLE plans ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+        if "content_hash" not in plan_columns:
+            conn.execute("ALTER TABLE plans ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
         agent_columns = columns("agents")
         if "extra" not in agent_columns:
             conn.execute("ALTER TABLE agents ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
@@ -591,6 +689,28 @@ class Database:
             conn.execute("ALTER TABLE runs ADD COLUMN goal_status TEXT NOT NULL DEFAULT 'active'")
         if "blocked_reason" not in run_columns:
             conn.execute("ALTER TABLE runs ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''")
+        if "approval_id" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN approval_id TEXT NOT NULL DEFAULT ''")
+        if "owner_id" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        if "epoch" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1")
+        lease_columns = columns("file_leases")
+        if "owner_id" not in lease_columns:
+            conn.execute("ALTER TABLE file_leases ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        usage_columns = columns("usage_records")
+        if "currency" not in usage_columns:
+            conn.execute("ALTER TABLE usage_records ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'")
+        if "cost_known" not in usage_columns:
+            conn.execute(
+                "ALTER TABLE usage_records ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1")
+        sub_columns = columns("bus_subscriptions")
+        if "acked_seq" not in sub_columns:
+            conn.execute(
+                "ALTER TABLE bus_subscriptions ADD COLUMN acked_seq INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_approval ON runs(approval_id) "
+            "WHERE approval_id <> ''")
 
     # -- primitives -------------------------------------------------------
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> sqlite3.Cursor:
@@ -610,13 +730,21 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self.connection()
+        if self.in_transaction():
+            # Nested callers share the outer transaction; only the outermost
+            # commits or rolls back.
+            yield conn
+            return
         conn.execute("BEGIN IMMEDIATE")
+        self._local.tx_depth = 1
         try:
             yield conn
         except Exception:
+            self._local.tx_depth = 0
             conn.execute("ROLLBACK")
             raise
         else:
+            self._local.tx_depth = 0
             conn.execute("COMMIT")
 
     def get_setting(self, key: str, default: str = "") -> str:

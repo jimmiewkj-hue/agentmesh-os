@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import shutil
 import threading
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
@@ -14,8 +17,9 @@ from ..adapters.base import ExecutionRequest
 from ..config import HubConfig
 from ..errors import ConflictError, NotFoundError, ValidationError
 from ..models import (
-    AgentRecord, ChangeRecord, ChangeStatus, Project, ResultPackage, Task, TaskPlan,
-    TaskSpec, TaskStatus, VerificationReport, VerificationStatus, scope_matches,
+    RESULT_REQUIRED_FIELDS, AgentRecord, ChangeRecord, ChangeStatus, Project,
+    ResultPackage, Task, TaskPlan, TaskSpec, TaskStatus, VerificationReport,
+    VerificationStatus, scope_matches,
 )
 from ..storage.repo import Store
 from ..util import (
@@ -23,7 +27,8 @@ from ..util import (
     sha1_hex, stable_json, tree_hash, write_json,
 )
 from ..workspace import (
-    LeaseManager, apply_patch, create_worktree, generate_patch, patch_files, run_git,
+    PATCH_EXCLUDE_PREFIXES, LeaseManager, apply_patch, create_worktree, generate_patch,
+    patch_files, run_git,
 )
 from .approvals import ApprovalService
 from .audit import AuditService
@@ -51,6 +56,35 @@ TERMINAL = {
     TaskStatus.COMPLETED.value, TaskStatus.FAILED.value,
     TaskStatus.REJECTED.value, TaskStatus.CANCELED.value,
 }
+
+
+def _blocking_unresolved(items: list[Any]) -> list[str]:
+    """Only blocking unresolved items prevent delivery.
+
+    Optional suggestions remain visible in the result package but are not
+    silently treated as hard failures.  A dict may declare ``blocking`` or a
+    low/info ``severity``; plain strings opt out with explicit wording.
+    """
+    out: list[str] = []
+    for raw in items or []:
+        if isinstance(raw, dict):
+            if raw.get("blocking") is False:
+                continue
+            if str(raw.get("severity") or "").lower() in (
+                    "info", "low", "suggestion", "optional"):
+                continue
+            text = raw.get("summary") or raw.get("description") or raw.get("finding") or raw
+        else:
+            text = raw
+        text = str(text or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(token in lowered for token in
+               ("optional", "non-blocking", "nonblocking", "建议", "可选", "非阻塞")):
+            continue
+        out.append(text)
+    return out
 
 
 class RunService:
@@ -194,6 +228,7 @@ class RunService:
             canceled.append(task.task_id)
         self.store.update_run(run_id, status="canceled", goal_status="blocked",
                               blocked_reason=reason, error=reason,
+                              epoch=int(run.get("epoch") or 1) + 1,
                               finished_at=now_iso())
         self.audit.log("user", "run.canceled", subject=run_id,
                        payload={"reason": reason, "tasks": canceled})
@@ -204,26 +239,54 @@ class RunService:
                 "phase": "run_canceled", "run_id": run_id,
                 "reason": reason, "tasks": canceled,
             }, source="user", correlation_id=run_id, sync_level=2)
-        # Best-effort: stop the visible WorkBuddy turn so it does not keep
-        # streaming after the control plane has canceled the run.
+        # Stop only the external work we can prove belongs to this run.  If the
+        # session/page binding is missing, report "stop unconfirmed" instead of
+        # clicking the user's currently active conversation.
+        external_stops: list[dict[str, Any]] = []
         try:
             from ..gui.cdp import stop_workbuddy_task
-            active_agents = {t.assigned_agent for t in tasks
-                             if t.status not in TERMINAL and t.assigned_agent}
-            for agent_id in active_agents:
-                agent = self.store.get_agent(agent_id)
-                app = str(((agent.adapter_config or {}) if agent else {}).get("gui_app") or "")
-                if app == "workbuddy":
+            for task in tasks:
+                if task.status in TERMINAL or not task.assigned_agent:
+                    continue
+                agent = self.store.get_agent(task.assigned_agent)
+                cfg = dict((agent.adapter_config or {}) if agent else {})
+                if str(cfg.get("gui_app") or "") != "workbuddy":
+                    external_stops.append({"task_id": task.task_id,
+                                           "status": "unsupported",
+                                           "reason": "no bound stop interface"})
+                    continue
+                attempt = self.store.get_attempt(task.active_attempt_id or "") or {}
+                binding = dict(attempt.get("binding") or {})
+                interface = binding.get("interface") if isinstance(
+                    binding.get("interface"), dict) else {}
+                session_id = str(binding.get("session_id")
+                                 or attempt.get("session_id") or "")
+                page_id = str(interface.get("cdp_target")
+                              or interface.get("trae_page_id") or "")
+                if not (session_id or page_id):
+                    result = {"ok": False, "reason": "NO_BOUND_TARGET"}
+                else:
                     result = stop_workbuddy_task(
-                        int((agent.adapter_config or {}).get("workbuddy_cdp_port")
-                            or 9223))
-                    self.audit.log("control-plane", "workbuddy.stop_requested",
-                                   subject=agent_id, payload=result)
+                        int(cfg.get("workbuddy_cdp_port") or 9223),
+                        page_id=page_id, session_id=session_id)
+                external_stops.append({"task_id": task.task_id,
+                                       "agent_id": task.assigned_agent,
+                                       "session_id": session_id,
+                                       "page_id": page_id,
+                                       "status": "confirmed" if result.get("ok")
+                                       else "unconfirmed",
+                                       **result})
+                self.audit.log("control-plane", "workbuddy.stop_requested",
+                               subject=task.uid,
+                               payload={"attempt_id": task.active_attempt_id,
+                                        "result": result})
         except Exception as exc:
             self.audit.log("control-plane", "workbuddy.stop_failed",
                            subject=run_id, payload={"error": str(exc)[:500]})
+            external_stops.append({"status": "error",
+                                   "error": str(exc)[:500]})
         return {"status": "canceled", "run_id": run_id, "reason": reason,
-                "tasks": canceled}
+                "tasks": canceled, "external_stops": external_stops}
 
     def start(self, run_id: str, *, max_parallel: int | None = None, background: bool = False) -> dict[str, Any]:
         run = self.store.get_run(run_id)
@@ -235,6 +298,22 @@ class RunService:
         if run["status"] in ("completed", "pending_acceptance", "pending_merge", "released"):
             return {"status": run["status"], "run_id": run_id,
                     "message": "运行已结束或被治理门禁阻塞，请按审批流程处理"}
+        owner_id = str(getattr(self, "owner_id", "") or "")
+        current_owner = str(run.get("owner_id") or "")
+        if owner_id and current_owner and current_owner != owner_id:
+            try:
+                live = self.store.live_controller_ids(
+                    self.project.project_id, ttl_seconds=30.0, exclude=owner_id)
+            except Exception:
+                live = set()
+            if current_owner in live:
+                return {"status": "blocked", "run_id": run_id,
+                        "message": "运行由另一个存活的 Controller 持有",
+                        "owner_id": current_owner}
+        try:
+            self.store.drain_outbox()
+        except Exception:
+            pass
         event = self._cancel_event(run_id)
         if event.is_set():
             with self._cancel_lock:
@@ -247,22 +326,75 @@ class RunService:
         if run.get("status") == "waiting_user":
             updates["blocked_reason"] = ""
             updates["error"] = ""
+        if owner_id and run.get("owner_id") != owner_id:
+            updates["owner_id"] = owner_id
+            run["owner_id"] = owner_id
         if updates:
             self.store.update_run(run_id, **updates)
             run.update(updates)
-        lock = self._run_locks.setdefault(run_id, threading.Lock())
-        if lock.locked() and not background:
-            raise ConflictError("该运行已在执行中")
         if background:
             thread = threading.Thread(target=self._locked_loop, args=(run_id, max_parallel),
                                       name=f"agentloop-run-{run_id}", daemon=True)
             thread.start()
             return {"status": "started", "run_id": run_id, "background": True}
-        return self._locked_loop(run_id, max_parallel)
+        # A foreground caller (human resume) waits for an already-running
+        # controller instead of failing with a spurious "busy" conflict; its
+        # wake-up request and this call converge on the same run state.
+        return self._locked_loop(run_id, max_parallel, blocking=True)
 
-    def _locked_loop(self, run_id: str, max_parallel: int | None) -> dict[str, Any]:
+    def schedule_reconcile(self, run_id: str, reason: str) -> dict[str, Any]:
+        """Persist a wake-up intent, then try to act on it.
+
+        The todo survives a process crash; a later start/drain can still see
+        that this run needed reconciliation.
+        """
+        try:
+            todo_id = self.store.enqueue_reconcile(run_id, reason)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail a task
+            self.audit.log("control-plane", "reconcile.enqueue_failed",
+                           subject=run_id,
+                           payload={"reason": reason, "error": str(exc)[:300]})
+            return {"status": "deferred", "run_id": run_id, "todo_id": "",
+                    "started": False, "error": str(exc)[:300]}
+        current = self.store.get_run(run_id) or {}
+        if current.get("status") in (
+                "canceled", "completed", "pending_acceptance", "pending_merge",
+                "released", "paused"):
+            self.store.complete_reconcile(todo_id)
+            return {"status": current.get("status") or "missing", "run_id": run_id,
+                    "todo_id": todo_id, "started": False}
+        try:
+            started = self.start(run_id, background=True)
+        except Exception as exc:  # noqa: BLE001 - wake-up must not lose the todo
+            self.audit.log("control-plane", "reconcile.wake_failed", subject=run_id,
+                           payload={"reason": reason, "error": str(exc)[:300],
+                                    "todo_id": todo_id})
+            return {"status": "deferred", "run_id": run_id, "todo_id": todo_id,
+                    "error": str(exc)[:300], "started": False}
+        return {"status": "woken", "run_id": run_id, "todo_id": todo_id,
+                "started": True, "wake": started}
+
+    def reconcile_pending(self) -> dict[str, Any]:
+        todos = self.store.pending_reconcile()
+        acted = []
+        for todo in todos:
+            run_id = str(todo.get("run_id") or "")
+            current = self.store.get_run(run_id) or {}
+            if current.get("status") in (
+                    "canceled", "completed", "pending_acceptance", "pending_merge",
+                    "released", "paused", "missing"):
+                self.store.complete_reconcile(str(todo["todo_id"]))
+                continue
+            result = self.schedule_reconcile(run_id, str(todo.get("reason") or "resume"))
+            if result.get("started"):
+                self.store.complete_reconcile(str(todo["todo_id"]))
+            acted.append({**todo, "wake": result})
+        return {"pending": len(todos), "acted": acted}
+
+    def _locked_loop(self, run_id: str, max_parallel: int | None,
+                     blocking: bool = False) -> dict[str, Any]:
         lock = self._run_locks.setdefault(run_id, threading.Lock())
-        acquired = lock.acquire(blocking=False)
+        acquired = lock.acquire(blocking=blocking, timeout=600 if blocking else -1)
         if not acquired:
             return {"status": "busy", "run_id": run_id}
         try:
@@ -433,13 +565,32 @@ class RunService:
             self.store.set_task_status(uid, TaskStatus.FAILED.value, error="运行或计划缺失", force=True)
             return
         decision = None
-        pinned = self._pinned_agent(task)
+        try:
+            pinned = self._pinned_agent(task)
+        except ValidationError as exc:
+            self.store.set_task_status(uid, TaskStatus.BLOCKED.value,
+                                       error=f"固定模型不可用: {exc.message}", force=True)
+            self.audit.log("control-plane", "task.pin_unavailable", subject=uid,
+                           payload={"error": exc.message, "details": exc.details})
+            return
         if pinned is not None:
             agent = pinned
         else:
             if self.router:
                 decision = self.router.select(task)
-            agent = decision.agent if decision else self._select_agent(task)
+                if decision is None:
+                    # A capability/availability gate must block, not fall back
+                    # to an agent that does not satisfy the task.
+                    rejected = list(getattr(self.router, "last_rejected", []) or [])
+                    self.store.set_task_status(
+                        uid, TaskStatus.BLOCKED.value,
+                        error="没有满足能力/可用性门槛的 Agent", force=True)
+                    self.audit.log("control-plane", "task.route_blocked", subject=uid,
+                                   payload={"rejected": rejected[:20]})
+                    return
+                agent = decision.agent
+            else:
+                agent = self._select_agent(task)
         if not agent:
             self.store.set_task_status(uid, TaskStatus.FAILED.value, error="没有可用的执行 Agent", force=True)
             self.audit.log("control-plane", "task.no_agent", subject=uid,
@@ -482,9 +633,36 @@ class RunService:
         task = self.store.get_task(uid) or task
         task.assigned_agent = task.assigned_agent or agent.agent_id
         task.attempts += 1
+        attempt_id = new_id("att")
+        request_id = uuid.uuid4().hex
+        request_marker = f"AGENTMESH_GUI_MARKER_REQ_{request_id}"
         request_model = self._model_for_agent(agent, task)
         resume_session = self._resume_session(task, agent, request_model)
-        workdir = self._prepare_workdir(task, run, agent, resume_session)
+        try:
+            input_manifest = self._input_manifest(task)
+            workdir = self._prepare_workdir(task, run, agent, resume_session,
+                                            attempt_number=task.attempts,
+                                            manifest=input_manifest)
+            if resume_session:
+                remembered = str(resume_session.get("workdir") or "")
+                if not remembered or \
+                        Path(remembered).resolve() != Path(workdir).resolve():
+                    # The app conversation is pinned to its own cwd; asking it
+                    # to resume inside a different worktree is guaranteed to
+                    # fail with SESSION_BINDING_UNCONFIRMED.
+                    self.audit.log("control-plane", "task.session_dropped_for_new_worktree",
+                                   subject=uid,
+                                   payload={"session_workdir": remembered,
+                                            "workdir": workdir})
+                    resume_session = {}
+        except Exception as exc:
+            reason = f"输入快照准备失败: {exc}"
+            self.store.set_task_status(uid, TaskStatus.FAILED.value,
+                                       error=reason[:800], force=True)
+            self.leases.release(uid)
+            self.audit.log("control-plane", "task.snapshot_failed", subject=uid,
+                           payload={"error": str(exc)[:800]})
+            return
         upstream = self.context.upstream_results(task)
         if self.cost and upstream:
             saved = 0
@@ -510,6 +688,14 @@ class RunService:
             "router": decision.to_dict() if decision else {},
             "round_context": self._task_round_context(run, task),
         }
+        feedback_path = Path(task.task_dir or "") / "repair-feedback.json"
+        if task.task_dir and feedback_path.exists():
+            feedback = read_json(feedback_path, None)
+            if isinstance(feedback, dict) and feedback:
+                extra_context["repair_feedback"] = feedback
+                self.audit.log("control-plane", "task.repair_feedback_attached",
+                               subject=uid,
+                               payload={"warnings": len(feedback.get("warnings") or [])})
         try:
             agent_profile = self._agent_profile(agent, task, request_model)
         except ValidationError as exc:
@@ -539,15 +725,29 @@ class RunService:
         task_pkg = self.prompts.write_task_package(
             task, agent, plan, self.memory.injectable(scope=task.task_id),
             runtime_dir=workdir, extra_context=extra_context, bootstrap=bootstrap,
-            agent_profile=agent_profile,
+            agent_profile=agent_profile, attempt_id=attempt_id,
         )
         self.leases.acquire(self.project.project_id, task)
         task.workdir = workdir
         task.task_dir = str(task_pkg.task_dir)
         task.assigned_agent = agent.agent_id
+        task.active_attempt_id = attempt_id
         self.store.update_task(
             uid, assigned_agent=agent.agent_id, attempts=task.attempts,
-            workdir=workdir, task_dir=str(task_pkg.task_dir), patch_path=task.patch_path,
+            workdir=workdir, task_dir=str(task_pkg.task_dir), patch_path="",
+            active_attempt_id=attempt_id,
+        )
+        self.store.create_attempt(
+            attempt_id=attempt_id, project_id=self.project.project_id,
+            task_uid=uid, run_id=task.run_id, attempt_number=task.attempts,
+            request_id=request_id, purpose="task", workdir=workdir,
+            result_path=str(task_pkg.result_path),
+            binding={**(resume_session or {}), "marker": request_marker,
+                     "request_id": request_id, "purpose": "task"},
+            input_snapshot={"base_commit": run["base_commit"], "workdir": workdir,
+                            "dependencies": list(task.spec.dependencies),
+                            "manifest": input_manifest,
+                            "manifest_hash": input_manifest.get("manifest_hash", "")},
         )
         self.store.set_task_status(uid, TaskStatus.RUNNING.value)
         self.checkpoints.create("task_dispatched", run_id=task.run_id, task_uid=uid,
@@ -567,18 +767,20 @@ class RunService:
                 "preview": prompt_text[:1200],
                 "required_capabilities": list(task.spec.required_capabilities),
             }, source=agent.agent_id, correlation_id=uid, sync_level=2)
-        cache_key, file_hash = self._analysis_files(task, workdir)
+        cache_key, file_hash = self._analysis_files(task, workdir, request_model)
         cached = self.store.cache_get(cache_key) if cache_key else None
         cache_source = "exact_cache" if cached is not None else ""
         cache_meta: dict[str, Any] = {}
         if cached is None and self.cost:
-            semantic = self.cost.semantic_lookup(task, file_hash)
+            semantic = self.cost.semantic_reference(task, file_hash)
             if semantic:
-                cached = semantic["payload"]
-                cache_source = "semantic_cache"
-                cache_meta = {"cache_key": semantic["cache_key"],
+                # Similarity is a reference hint, never a successful result.
+                cache_meta = {"reference_only": True,
+                              "cache_key": semantic["cache_key"],
                               "similarity": semantic["similarity"],
                               "matched_objective": semantic["source_task"]}
+                self.audit.log("control-plane", "cache.semantic_reference_only",
+                               subject=uid, payload=cache_meta)
         if cached is not None:
             payload = dict(cached)
             payload["task_id"] = task.task_id
@@ -600,6 +802,10 @@ class RunService:
                         detail={"cache_key": cache_key},
                     )
                 self.store.save_result(task, result, valid=True)
+                self.store.update_attempt(
+                    task.active_attempt_id or "", status="completed",
+                    result_path=str(task_pkg.result_path),
+                    error="", finished_at=now_iso())
                 self.store.set_task_status(uid, TaskStatus.VERIFYING.value)
                 self.audit.log("control-plane", "task.cache_hit", subject=uid,
                                payload={"cache_key": cache_key, "source": cache_source,
@@ -611,6 +817,8 @@ class RunService:
             project_id=self.project.project_id, project_root=self.project.root,
             task=task, workdir=workdir, task_dir=str(task_pkg.task_dir),
             prompt_path=str(task_pkg.prompt_path), result_path=str(task_pkg.result_path),
+            attempt_id=attempt_id, request_id=request_id,
+            metadata={"request_marker": request_marker},
             model=request_model,
             context_length=int(agent_profile["context_length"]),
             capability_level=str(agent_profile["capability_level"]),
@@ -636,13 +844,37 @@ class RunService:
                     outcome = adapter.execute(request)
             else:
                 outcome = adapter.execute(request)
+        except Exception as exc:
+            self.store.update_attempt(
+                attempt_id, status="failed", error=str(exc)[:500],
+                finished_at=now_iso())
+            raise
         finally:
             with self._active_tasks_lock:
                 self._active_tasks.discard(uid)
+        interface_binding = ((outcome.extras or {}).get("interface") or {})
+        submission = outcome.submission_receipt or (
+            (interface_binding.get("submission") if isinstance(interface_binding, dict) else {})
+            or {})
+        submission_status = outcome.submission_status or str(submission.get("status") or "")
+        self.store.update_attempt(
+            attempt_id, status=outcome.status, session_id=outcome.session_id,
+            result_path=outcome.result_path or str(task_pkg.result_path),
+            binding={**(resume_session or {}), "marker": request_marker,
+                     "request_id": request_id,
+                     "interface": interface_binding if isinstance(interface_binding, dict) else {},
+                     "session_id": outcome.session_id,
+                     "model_evidence": (outcome.extras or {}).get(
+                         "model_evidence", {}) or {},
+                     "submission": submission},
+            error=outcome.error[:500], finished_at=now_iso(),
+        )
         run_now = self.store.get_run(task.run_id) or {}
         cancel_event = self._cancel_events.get(task.run_id)
         if run_now.get("status") == "canceled" or (
                 cancel_event is not None and cancel_event.is_set()):
+            self.store.update_attempt(attempt_id, status="canceled",
+                                      error="用户停止运行", finished_at=now_iso())
             self.store.set_task_status(uid, TaskStatus.CANCELED.value,
                                        error="用户停止运行", force=True)
             self.leases.release(uid)
@@ -663,6 +895,7 @@ class RunService:
                     task,
                     f"{verify.get('error_code') or 'WORKSPACE_MISMATCH'}: "
                     f"{verify.get('reason', '')}",
+                    allow_adopt=True,
                 )
                 return
         elif interface.get("method") == "gui" and self.config.workspace_verify:
@@ -703,7 +936,46 @@ class RunService:
             self.memory.sync_workflow(task.run_id)
             return
         if outcome.status != "completed":
-            self._retry_or_fail(task, f"{outcome.status}: {outcome.error}")
+            if str(outcome.error_code or "") == "GUI_RESULT_INVALID":
+                repaired = self._repair_result_package(
+                    task, agent, attempt_id, request_id, outcome)
+                if repaired is not None:
+                    self.store.update_attempt(
+                        attempt_id, status="result_repaired",
+                        error="", finished_at=now_iso())
+                    self._finalize_from_result(task, agent, repaired.payload)
+                    return
+            if submission_status in ("accepted", "acceptance_unknown"):
+                # A request that may already be in the external product must
+                # not be sent again automatically.
+                confirmed = submission_status == "accepted"
+                reason = (
+                    "SUBMISSION_ACCEPTED: 已确认送达，等待应用完成；请先核对原请求"
+                    if confirmed else
+                    "SUBMISSION_UNVERIFIED: 点击后未能确认送达；请先核对原请求，禁止直接重发"
+                )
+                self.store.update_attempt(
+                    attempt_id, status=("running" if confirmed else "acceptance_unknown"),
+                    binding={**(resume_session or {}), "marker": request_marker,
+                             "request_id": request_id, "submission": submission},
+                    error=reason, finished_at=now_iso())
+                self.store.set_task_status(uid, TaskStatus.WAITING_USER.value,
+                                           error=reason, force=True)
+                self.store.update_run(
+                    task.run_id, status="waiting_user",
+                    blocked_reason=f"{task.task_id}: {reason}", error=reason)
+                self.audit.log("control-plane", "task.submission_unconfirmed",
+                               subject=uid,
+                               payload={"submission": submission,
+                                        "outcome": outcome.status,
+                                        "request_id": request_id})
+                self.checkpoints.create("task_submission_unconfirmed",
+                                        run_id=task.run_id, task_uid=uid)
+                self.memory.sync_task_state(task.run_id)
+                self.memory.sync_workflow(task.run_id)
+                return
+            self._retry_or_fail(task, f"{outcome.status}: {outcome.error}",
+                                allow_adopt=True)
             return
         try:
             (Path(request.task_dir) / "manual-action.json").unlink()
@@ -711,12 +983,19 @@ class RunService:
             pass
         payload = outcome.result_payload if outcome.result_payload is not None else read_json(task_pkg.persistent_result_path)
         if payload is None:
-            self._retry_or_fail(task, "成果包缺失：Agent 未写入 result.json")
+            self._retry_or_fail(task, "成果包缺失：Agent 未写入 result.json",
+                                allow_adopt=True)
             return
         self._finalize_from_result(task, agent, payload)
 
-    def _analysis_files(self, task: Task, workdir: str) -> tuple[str, str]:
-        """Return (cache_key, file_hash) for a read-only task with a scope."""
+    def _analysis_files(self, task: Task, workdir: str,
+                        model: str = "") -> tuple[str, str]:
+        """Return (exact_cache_key, file_hash) for a read-only task.
+
+        The key is a complete fingerprint: all semantic task fields, the code
+        snapshot, the dependency-artifact manifest, the executor/model and the
+        project.  A near-match is never promoted to this key.
+        """
         if task.spec.type not in ("analysis", "review") or not task.spec.scope:
             return "", ""
         base = Path(workdir)
@@ -732,16 +1011,21 @@ class RunService:
             if any(scope_matches(pattern, rel) for pattern in task.spec.scope):
                 files.append(rel)
         file_hash = tree_hash(files, base=base)
+        attempt = self.store.get_attempt(task.active_attempt_id or "") or {}
+        snapshot = attempt.get("input_snapshot", {}) or {}
+        manifest = snapshot.get("manifest", {}) if isinstance(snapshot.get("manifest"), dict) else {}
+        # Exclude the run-specific task uid so two identical analyses in the
+        # same project can hit the same exact-cache entry.
+        manifest_hash = sha1_hex(stable_json({
+            "base_commit": manifest.get("base_commit", ""),
+            "artifacts": manifest.get("artifacts", []),
+        }))
         key = sha1_hex(stable_json({
             "project_id": task.project_id,
-            "task_id": task.task_id,
-            "objective": task.spec.objective,
-            "type": task.spec.type,
-            "scope": task.spec.scope,
-            "out_of_scope": task.spec.out_of_scope,
-            "acceptance": task.spec.acceptance_criteria,
-            "dependencies": task.spec.dependencies,
+            "spec": task.spec.to_dict(),
             "agent": task.assigned_agent,
+            "model": model,
+            "input_manifest_hash": manifest_hash,
             "file_hash": file_hash,
         }))
         return key, file_hash
@@ -756,7 +1040,9 @@ class RunService:
         return cached if isinstance(cached, dict) else None
 
     def _cache_store(self, task: Task, result: ResultPackage) -> None:
-        key, file_hash = self._analysis_files(task, task.workdir)
+        agent = self.store.get_agent(task.assigned_agent) if task.assigned_agent else None
+        model = self._model_for_agent(agent, task) if agent else task.spec.model
+        key, file_hash = self._analysis_files(task, task.workdir, model)
         if not key:
             return
         self.store.cache_set(key, task.project_id, task.spec.type, file_hash, result.payload)
@@ -837,31 +1123,127 @@ class RunService:
                                           .get("resumed_session_id")),
                        })
 
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _input_manifest(self, task: Task) -> dict[str, Any]:
+        """Input snapshot = base commit + ordered dependency artifact hashes."""
+        artifacts = []
+        for upstream in self._upstream_task_order(task):
+            patch = Path(upstream.patch_path)
+            if not patch.exists() or patch.stat().st_size == 0:
+                raise ConflictError(
+                    f"{task.task_id}: 依赖 {upstream.task_id} 的补丁缺失",
+                    details={"task": upstream.task_id, "patch": str(patch)},
+                )
+            artifacts.append({"task_id": upstream.task_id, "patch": str(patch),
+                              "sha256": self._file_sha256(patch)})
+        payload = {"task_uid": task.uid, "base_commit": task.base_commit,
+                   "artifacts": artifacts}
+        payload["manifest_hash"] = hashlib.sha256(
+            stable_json(payload).encode("utf-8")).hexdigest()
+        return payload
+
+    @staticmethod
+    def _manifest_sidecar(workdir: str) -> Path:
+        return Path(str(workdir) + ".input-manifest.json")
+
     def _prepare_workdir(self, task: Task, run: dict[str, Any],
                          agent: AgentRecord,
-                         resume_session: dict[str, Any] | None = None) -> str:
+                         resume_session: dict[str, Any] | None = None,
+                         attempt_number: int = 1,
+                         manifest: dict[str, Any] | None = None) -> str:
         session = resume_session or {}
         remembered = str(session.get("workdir") or "")
+        manifest = manifest or self._input_manifest(task)
+        dependencies = set(task.spec.dependencies or [])
+        history = set(session.get("tasks") or [])
+        if remembered and Path(remembered).exists() and attempt_number <= 1 \
+                and session.get("resume") and dependencies:
+            path = Path(remembered)
+            inside = run_git(["rev-parse", "--is-inside-work-tree"], cwd=path,
+                             check=False)
+            dirty = run_git(["status", "--porcelain", "-uno"], cwd=path,
+                            check=False)
+            dirty_lines = []
+            for line in (dirty.stdout_text or "").splitlines():
+                if not line.strip():
+                    continue
+                rel = line[3:].strip().strip('"').replace("\\", "/").lstrip("./")
+                # Historical commits may track build outputs.  A changed
+                # dist/index.js is not a reason to abandon the session tree.
+                if any(fnmatch.fnmatch(rel, pattern)
+                       for pattern in PATCH_EXCLUDE_PREFIXES):
+                    continue
+                dirty_lines.append(line)
+            if inside.returncode == 0 and not dirty_lines:
+                # Same Agent continuing its own session: the app conversation
+                # cwd is fixed to this worktree.  Missing dependencies (from
+                # other agents) are composed into this clean tree before the
+                # turn, so the session stays continuous without losing inputs.
+                composed = dependencies <= history
+                if not composed:
+                    composed = self._compose_missing_dependencies(
+                        task, str(path), history)
+                if composed:
+                    head = (run_git(["rev-parse", "HEAD"], cwd=path,
+                                    check=False).stdout_text or "").strip()
+                    write_json(self._manifest_sidecar(str(path)), {
+                        **manifest, "head": head,
+                        "covered_dependencies": sorted(dependencies),
+                        "session_reuse": True, "task_uid": task.uid,
+                    })
+                    self.audit.log("control-plane", "task.session_worktree_reused",
+                                   subject=task.uid,
+                                   payload={"agent_id": agent.agent_id,
+                                            "workdir": str(path), "head": head,
+                                            "covered_dependencies": sorted(dependencies),
+                                            "composed_missing": sorted(
+                                                dependencies - history),
+                                            "manifest_hash": manifest["manifest_hash"]})
+                    return str(path)
         target = Path(remembered) if remembered and Path(remembered).exists() \
             else self.paths.worktree_dir(task.run_id, task.task_id)
         with self._wt_lock:
             reused = False
             if Path(target).exists():
-                # A worktree left by an interrupted run. Reuse only if git agrees.
                 proc = run_git(["rev-parse", "--is-inside-work-tree"], cwd=target, check=False)
-                if proc.returncode == 0:
+                stored = read_json(self._manifest_sidecar(str(target)), None)
+                same_manifest = bool(
+                    isinstance(stored, dict)
+                    and stored.get("manifest_hash") == manifest["manifest_hash"]
+                )
+                # A retry must not inherit the failed attempt's partial edits;
+                # a different manifest means the worktree is not the declared
+                # input snapshot.  Keep the old tree (never delete user work)
+                # and create a new Hub-owned snapshot beside it.
+                same_owner = bool(isinstance(stored, dict)
+                                  and stored.get("task_uid") == task.uid)
+                if proc.returncode == 0 and same_manifest and same_owner \
+                        and int(attempt_number or 1) <= 1:
                     reused = True
                 else:
-                    shutil.rmtree(target, ignore_errors=True)
+                    target = self.paths.worktree_dir(task.run_id, task.task_id) \
+                        if target == Path(remembered) \
+                        else target.with_name(f"{target.name}-a{int(attempt_number or 1)}")
+                    if target.exists():
+                        target = target.with_name(
+                            f"{target.name}-{uuid.uuid4().hex[:6]}")
             if not reused:
                 create_worktree(self.project.root, target, run["base_commit"])
             ensure_dir(target)
-        if remembered and Path(target) == Path(remembered):
+        if reused:
             self.audit.log("control-plane", "task.workdir_reused", subject=task.uid,
                            payload={"agent_id": agent.agent_id,
                                     "workdir": str(target),
+                                    "manifest_hash": manifest["manifest_hash"],
                                     "session_id": session.get("session_id", "")})
-        self._apply_upstream_patches(task, str(target))
+        self._apply_upstream_patches(task, str(target), manifest=manifest)
         return str(target)
 
     def _upstream_task_order(self, task: Task) -> list[Task]:
@@ -886,53 +1268,118 @@ class RunService:
         return order
 
     def _upstream_patch_paths(self, task: Task) -> list[str]:
-        return [t.patch_path for t in self._upstream_task_order(task)
-                if t.patch_path and Path(t.patch_path).exists()
-                and Path(t.patch_path).stat().st_size > 0]
+        # Missing paths are returned on purpose so verification can fail them
+        # instead of silently verifying an incomplete dependency chain.
+        return [t.patch_path for t in self._upstream_task_order(task) if t.patch_path]
 
-    def _apply_upstream_patches(self, task: Task, workdir: str) -> None:
-        """Compose a dependency chain into the task worktree.
-
-        Every task starts from the run's base commit.  A downstream task must
-        see the files produced by its upstream tasks, otherwise T003/T004/T005
-        style build chains each operate on an empty checkout.  Apply dependency
-        patches and commit them as the worktree baseline so the task's own
-        patch only contains its own changes.
-        """
-        order = self._upstream_task_order(task)
+    def _compose_missing_dependencies(self, task: Task, workdir: str,
+                                      history: set[str]) -> bool:
+        """Apply dependencies that never ran in this Agent's session tree."""
+        order = [upstream for upstream in self._upstream_task_order(task)
+                 if upstream.task_id not in history]
+        if not order:
+            return True
+        identity = ["-c", "user.name=AgentMesh", "-c", "user.email=agentmesh@localhost"]
         applied: list[str] = []
         for upstream in order:
             patch = Path(upstream.patch_path)
             if not patch.exists() or patch.stat().st_size == 0:
-                continue
+                return False
             reverse = run_git(["apply", "--reverse", "--check", str(patch)],
                               cwd=workdir, check=False)
             if reverse.returncode == 0:
                 continue
-            # A retried task reuses its worktree, so the upstream patch is
-            # already committed in HEAD while the working tree also contains
-            # this task's unfinished edits.  Check the index/HEAD instead of
-            # reapplying and conflicting with those edits.
+            ok, detail = apply_patch(
+                workdir, patch, three_way=True,
+                exclude_prefixes=PATCH_EXCLUDE_PREFIXES)
+            if not ok:
+                self.audit.log("control-plane", "task.session_dependency_failed",
+                               subject=task.uid,
+                               payload={"upstream": upstream.task_id,
+                                        "detail": detail[:600]})
+                return False
+            run_git([*identity, "add", "-A"], cwd=workdir, check=False)
+            run_git([*identity, "commit", "--allow-empty", "-m",
+                     f"chore: compose {upstream.task_id} into {task.task_id} session tree"],
+                    cwd=workdir, check=False)
+            applied.append(upstream.task_id)
+        self.audit.log("control-plane", "task.session_dependencies_composed",
+                       subject=task.uid,
+                       payload={"upstream": applied, "workdir": workdir})
+        return True
+
+    def _apply_upstream_patches(self, task: Task, workdir: str,
+                                manifest: dict[str, Any] | None = None) -> None:
+        """Compose a dependency chain into the task worktree.
+
+        The exact composition is recorded as an input manifest
+        (base commit + ordered artifact hashes).  Reverse patch checks are
+        diagnostics only; the manifest is the source of truth for reuse.
+        """
+        manifest = manifest or self._input_manifest(task)
+        sidecar = self._manifest_sidecar(workdir)
+        stored = read_json(sidecar, None)
+        head = (run_git(["rev-parse", "HEAD"], cwd=workdir, check=False).stdout_text or "").strip()
+        if isinstance(stored, dict) \
+                and stored.get("manifest_hash") == manifest["manifest_hash"] \
+                and stored.get("head") == head:
+            self.audit.log("control-plane", "task.upstream_already_composed",
+                           subject=task.uid,
+                           payload={"manifest_hash": manifest["manifest_hash"],
+                                    "workdir": workdir})
+            return
+        order = self._upstream_task_order(task)
+        applied: list[str] = []
+        identity = ["-c", "user.name=AgentMesh", "-c", "user.email=agentmesh@localhost"]
+
+        def commit_stage(label: str) -> None:
+            run_git([*identity, "add", "-A"], cwd=workdir, check=False)
+            run_git([*identity, "commit", "--allow-empty", "-m",
+                     f"chore: integrate {label} into {task.task_id}"],
+                    cwd=workdir, check=False)
+
+        for upstream in order:
+            patch = Path(upstream.patch_path)
+            if not patch.exists() or patch.stat().st_size == 0:
+                raise ConflictError(
+                    f"{task.task_id}: 上游补丁缺失 {upstream.task_id}",
+                    details={"patch": str(patch)},
+                )
+            reverse = run_git(["apply", "--reverse", "--check", str(patch)],
+                              cwd=workdir, check=False)
+            if reverse.returncode == 0:
+                self.audit.log("control-plane", "task.upstream_reverse_check_ok",
+                               subject=task.uid,
+                               payload={"upstream": upstream.task_id,
+                                        "note": "diagnostic only"})
+                continue
             indexed = run_git(["apply", "--cached", "--reverse", "--check", str(patch)],
                               cwd=workdir, check=False)
             if indexed.returncode == 0:
                 continue
-            ok, detail = apply_patch(workdir, patch, three_way=False)
+            ok, detail = apply_patch(
+                workdir, patch, three_way=True,
+                exclude_prefixes=PATCH_EXCLUDE_PREFIXES)
             if not ok:
                 raise ConflictError(
                     f"{task.task_id}: 上游补丁无法应用 {upstream.task_id}",
                     details={"patch": str(patch), "detail": detail[:800]},
                 )
             applied.append(upstream.task_id)
-        if applied:
-            identity = ["-c", "user.name=AgentMesh", "-c", "user.email=agentmesh@localhost"]
-            run_git([*identity, "add", "-A"], cwd=workdir, check=False)
-            run_git([*identity, "commit", "--allow-empty", "-m",
-                     f"chore: integrate {', '.join(applied)} into {task.task_id}"],
-                    cwd=workdir, check=False)
-            self.audit.log("control-plane", "task.upstream_patches_applied",
-                           subject=task.uid,
-                           payload={"upstream": applied, "workdir": workdir})
+            # Commit each dependency before the next one: 3-way application of
+            # overlapping old patches needs the preimage blobs in the index.
+            commit_stage(upstream.task_id)
+        if not applied:
+            commit_stage("base")
+        head_after = (run_git(["rev-parse", "HEAD"], cwd=workdir,
+                              check=False).stdout_text or "").strip()
+        write_json(sidecar, {**manifest, "head": head_after,
+                             "applied": applied, "applied_at": now_iso()})
+        self.audit.log("control-plane", "task.upstream_patches_applied",
+                       subject=task.uid,
+                       payload={"upstream": applied, "workdir": workdir,
+                                "manifest_hash": manifest["manifest_hash"],
+                                "head": head_after})
 
     def _select_agent(self, task: Task) -> AgentRecord | None:
         agents = self.store.list_agents()
@@ -975,10 +1422,27 @@ class RunService:
             return None
         agent_id = task.assigned_agent or task.spec.suggested_agent
         if not agent_id:
-            return None
+            raise ValidationError(
+                "任务固定了模型但没有执行 Agent",
+                details={"task_id": task.task_id, "model": task.spec.model})
         agent = next((a for a in self.store.list_agents() if a.agent_id == agent_id), None)
         if agent is None or agent.status in ("offline", "error"):
-            return None
+            raise ValidationError(
+                f"固定执行 Agent {agent_id} 不可用（{getattr(agent, 'status', 'missing')}）",
+                details={"task_id": task.task_id, "agent_id": agent_id,
+                         "model": task.spec.model})
+        known = [row["model"] for row in self.store.list_agent_models(
+            self.project.project_id, agent_id=agent_id)] or list(agent.models or [])
+        if not known:
+            raise ValidationError(
+                f"执行 Agent {agent_id} 没有可证明的模型清单，无法确认固定模型可用",
+                details={"task_id": task.task_id, "agent_id": agent_id,
+                         "model": task.spec.model})
+        if task.spec.model not in known:
+            raise ValidationError(
+                f"固定模型 {task.spec.model} 不在 {agent_id} 的真实模型清单中",
+                details={"task_id": task.task_id, "agent_id": agent_id,
+                         "model": task.spec.model, "available": sorted(known)[:20]})
         return agent
 
     def _agent_profile(self, agent: AgentRecord, task: Task | None,
@@ -1003,6 +1467,22 @@ class RunService:
             context_length=max(0, context_length),
             capability_level=capability_level,
         )
+
+    def _verifier_model(self, agent: AgentRecord) -> str:
+        selected = str((agent.extra or {}).get("selected_model") or "")
+        if selected:
+            return selected
+        models = list(agent.models or [])
+        free = [name for name in models if "free" in str(name).lower()]
+        # opencode-go/* free entries can still be region-gated; the plain
+        # opencode/*-free catalog was probe-verified on this machine.
+        preferred = [name for name in free
+                     if str(name).startswith("opencode/") and str(name).endswith("-free")]
+        if preferred:
+            return str(preferred[0])
+        if free:
+            return str(free[0])
+        return str(models[0]) if models else ""
 
     def _model_for_agent(self, agent: AgentRecord, task: Task | None = None) -> str:
         pinned_ids = {task.assigned_agent, task.spec.suggested_agent} - {""} if task else set()
@@ -1077,13 +1557,48 @@ class RunService:
     # ------------------------------------------------------------------
     # Result -> patch -> verification
     # ------------------------------------------------------------------
-    def _retry_or_fail(self, task: Task, error: str) -> None:
+    def _adopt_active_result_if_present(self, task: Task) -> bool:
+        """A timed-out GUI adapter may still have a complete result file."""
+        attempt = self.store.get_attempt(task.active_attempt_id or "")
+        if not attempt:
+            return False
+        path = Path(str(attempt.get("result_path") or ""))
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+        data = read_json(path, None)
+        if not isinstance(data, dict) or not data:
+            return False
+        agent = self.store.get_agent(task.assigned_agent or "")
+        if not agent:
+            return False
+        try:
+            normalized, _ = ResultPackage.normalize(data)
+            result = ResultPackage.validate(
+                normalized, expected_task_id=task.task_id,
+                expected_agent_id=agent.agent_id)
+        except ValidationError:
+            return False
+        if result.status == "failed":
+            return False
+        self.store.save_result(task, result, valid=True)
+        self.store.set_task_status(task.uid, TaskStatus.VERIFYING.value, force=True)
+        self.audit.log("control-plane", "task.late_result_adopted", subject=task.uid,
+                       payload={"attempt_id": task.active_attempt_id,
+                                "result_path": str(path)})
+        self._ensure_change(task, agent, result)
+        self._finish_verification(task, agent, result)
+        return True
+
+    def _retry_or_fail(self, task: Task, error: str, *,
+                       allow_adopt: bool = False) -> None:
         run = self.store.get_run(task.run_id) or {}
         event = self._cancel_events.get(task.run_id)
         if run.get("status") == "canceled" or (event is not None and event.is_set()):
             self.store.set_task_status(task.uid, TaskStatus.CANCELED.value,
                                        error="用户停止运行", force=True)
             self.leases.release(task.uid)
+            return
+        if allow_adopt and self._adopt_active_result_if_present(task):
             return
         fresh = self.store.get_task(task.uid) or task
         if fresh.attempts <= task.spec.retry_limit:
@@ -1104,6 +1619,133 @@ class RunService:
         self.memory.sync_task_state(task.run_id)
         self.memory.sync_workflow(task.run_id)
 
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        return [value] if value not in (None, "") else []
+
+    def _repair_result_package(self, task: Task, agent: AgentRecord,
+                               attempt_id: str, request_id: str,
+                               outcome: Any) -> ResultPackage | None:
+        """One format-only repair request for an invalid structured package.
+
+        The repair may not change status, add tests/evidence/files, or touch
+        code.  It runs in the same session/workdir and is recorded on the
+        attempt so it can never repeat.
+        """
+        attempt = self.store.get_attempt(attempt_id) or {}
+        binding = dict(attempt.get("binding") or {})
+        if binding.get("result_repair_attempted"):
+            return None
+        original = read_json(getattr(outcome, "result_path", "") or "")
+        if not isinstance(original, dict) or not original:
+            return None
+        binding["result_repair_attempted"] = True
+        self.store.update_attempt(attempt_id, binding=binding)
+        repair_dir = ensure_dir(Path(task.task_dir) / "attempts" / attempt_id)
+        repair_path = repair_dir / "result.repair.json"
+        prompt_path = repair_dir / "result-repair-prompt.md"
+        original_text = json.dumps(original, ensure_ascii=False, indent=2)[:24000]
+        prompt = (
+            "# 成果格式修复（仅格式，不重新执行）\n\n"
+            "执行已经结束，但成果包 JSON 不满足 schema。请只把下面这份原始成果包\n"
+            "重写为合法 schema，不得重新实现任务、不得修改代码、不得运行命令，\n"
+            "不得新增原始包中没有的 tests/evidence/files_changed/artifacts，\n"
+            "不得改变 status（原始 failed/partial 必须保持原样）。\n\n"
+            f"任务：{task.task_id}（{task.spec.objective}）\n"
+            f"必须字段：{', '.join(RESULT_REQUIRED_FIELDS)}\n"
+            f"只写入：`{repair_path}`\n\n"
+            "## 原始成果包\n```json\n"
+            f"{original_text}\n```\n"
+        )
+        atomic_write_text(prompt_path, prompt)
+        resume = {k: v for k, v in binding.items()
+                  if k in ("session_id", "workdir", "model", "resume")}
+        if resume.get("session_id"):
+            resume["resume"] = True
+        attempt_task = Task(
+            uid=task.uid, project_id=task.project_id, plan_id=task.plan_id,
+            run_id=task.run_id, spec=task.spec, status=TaskStatus.RUNNING.value,
+            assigned_agent=agent.agent_id, workdir=task.workdir,
+            task_dir=str(repair_dir), base_commit=task.base_commit,
+            active_attempt_id=attempt_id,
+        )
+        request = ExecutionRequest(
+            project_id=self.project.project_id, project_root=self.project.root,
+            task=attempt_task, workdir=task.workdir, task_dir=str(repair_dir),
+            prompt_path=str(prompt_path), result_path=str(repair_path),
+            model=self._model_for_agent(agent, task), purpose="result_repair",
+            attempt_id=attempt_id, request_id=f"{request_id}-repair",
+            metadata={"request_marker": f"AGENTMESH_GUI_MARKER_REPAIR_{request_id}"},
+            resume_session=resume,
+            timeout_seconds=int(getattr(self.config, "result_repair_timeout_seconds", 300)),
+            full_control=bool(self.config.full_control),
+            cancel_event=self._cancel_event(task.run_id),
+        )
+        self.audit.log("control-plane", "task.result_repair_requested", subject=task.uid,
+                       payload={"attempt_id": attempt_id, "request_id": request_id,
+                                "prompt": str(prompt_path)})
+        try:
+            outcome2 = create_adapter(agent).execute(request)
+        except Exception as exc:
+            binding["result_repair"] = {"status": "failed",
+                                        "error": str(exc)[:500]}
+            self.store.update_attempt(attempt_id, binding=binding)
+            self.audit.log("control-plane", "task.result_repair_failed",
+                           subject=task.uid, payload={"error": str(exc)[:500]})
+            return None
+        self.budget.record(
+            attempt_task, agent.agent_id, request.model, outcome2.usage,
+            duration_ms=outcome2.duration_ms, run_id=task.run_id,
+            status=outcome2.status)
+        data = outcome2.result_payload if isinstance(outcome2.result_payload, dict) \
+            else read_json(repair_path)
+        error = ""
+        result: ResultPackage | None = None
+        if not isinstance(data, dict):
+            error = "修复请求没有写出合法 JSON"
+        else:
+            try:
+                normalized, changed = ResultPackage.normalize(data)
+                result = ResultPackage.validate(
+                    normalized, expected_task_id=task.task_id,
+                    expected_agent_id=agent.agent_id)
+                original_status = str(original.get("status") or "")
+                if original_status and result.status != original_status:
+                    raise ValidationError(
+                        f"修复请求改变了 status: {original_status} -> {result.status}")
+                for key in ("tests", "evidence", "files_changed", "artifacts"):
+                    before = len(self._as_list(original.get(key)))
+                    after = len(self._as_list(result.payload.get(key)))
+                    if after > before:
+                        raise ValidationError(
+                            f"修复请求新增了 {key}（{before} -> {after}），不允许补造证据")
+                binding["result_repair"] = {
+                    "status": "applied", "request_id": f"{request_id}-repair",
+                    "normalized": changed, "result_path": str(repair_path),
+                    "outcome": outcome2.status,
+                }
+            except ValidationError as exc:
+                result = None
+                error = exc.message
+        if result is None:
+            binding["result_repair"] = {
+                "status": "failed", "error": error[:500],
+                "request_id": f"{request_id}-repair",
+                "result_path": str(repair_path),
+            }
+            self.store.update_attempt(attempt_id, binding=binding)
+            self.audit.log("control-plane", "task.result_repair_rejected",
+                           subject=task.uid, payload={"error": error[:500]})
+            return None
+        self.store.update_attempt(attempt_id, binding=binding)
+        self.audit.log("control-plane", "task.result_repaired", subject=task.uid,
+                       payload={"attempt_id": attempt_id,
+                                "request_id": f"{request_id}-repair",
+                                "result_path": str(repair_path)})
+        return result
+
     def _finalize_from_result(self, task: Task, agent: AgentRecord, payload: dict[str, Any]) -> None:
         normalized, normalized_fields = ResultPackage.normalize(payload)
         if normalized_fields:
@@ -1122,29 +1764,41 @@ class RunService:
             self._retry_or_fail(task, f"Agent 报告失败: {result.summary}")
             return
         self.store.save_result(task, result, valid=True)
-        self.store.set_task_status(task.uid, TaskStatus.VERIFYING.value)
+        self.store.set_task_status(task.uid, TaskStatus.VERIFYING.value, force=True)
         self._ensure_change(task, agent, result)
         self._finish_verification(task, agent, result)
 
     def _ensure_change(self, task: Task, agent: AgentRecord, result: ResultPackage) -> None:
         if not task.spec.writable:
             return
-        existing = self.store.list_changes(task_uid=task.uid)
+        attempt_id = str(getattr(task, "active_attempt_id", "") or "")
+        # Every attempt owns its patch.  Reusing a previous attempt's patch is
+        # how a retried task could be verified against old code.
+        if attempt_id:
+            attempt_dir = ensure_dir(Path(task.task_dir) / "attempts" / attempt_id)
+            patch_path = str(attempt_dir / "patch.patch")
+        else:
+            patch_path = str(self.paths.patch_path(task.uid))
+        existing = [c for c in self.store.list_changes(task_uid=task.uid)
+                    if str(getattr(c, "attempt_id", "") or "") == attempt_id
+                    and Path(c.patch_path).exists()]
         if existing:
             task.patch_path = existing[0].patch_path
             self.store.update_task(task.uid, patch_path=task.patch_path)
             return
-        patch_path = str(self.paths.patch_path(task.uid))
         generate_patch(task.workdir, patch_path)
         files = patch_files(patch_path)
         after_hash = tree_hash(files, base=Path(task.workdir)) if files else ""
         change = ChangeRecord(
             change_id=new_id("chg"), project_id=self.project.project_id, task_uid=task.uid,
+            attempt_id=attempt_id,
             agent_id=agent.agent_id, base_commit=task.base_commit,
             base_hash=sha1_hex(task.base_commit), before_hash=sha1_hex(task.base_commit),
             after_hash=after_hash, files=files, patch_path=patch_path,
             status=ChangeStatus.PROPOSED.value, created_at=now_iso(),
         )
+        if attempt_id:
+            self.store.update_attempt(attempt_id, patch_path=patch_path)
         self.store.add_change(change)
         task.patch_path = patch_path
         self.store.update_task(task.uid, patch_path=patch_path)
@@ -1184,12 +1838,20 @@ class RunService:
         try:
             self._finish_verification_impl(task, agent, result)
         except Exception as exc:
+            import traceback
+            stack = traceback.format_exc()
             reason = f"验证执行异常: {exc}"
             self.store.set_task_status(task.uid, TaskStatus.FAILED.value,
                                        error=reason, force=True)
             self.leases.release(task.uid)
+            try:
+                log_dir = ensure_dir(Path(task.task_dir) / "logs")
+                atomic_write_text(log_dir / "verification-error.log", stack)
+            except Exception:
+                pass
             self.audit.log("control-plane", "task.verification_error",
-                           subject=task.uid, payload={"error": str(exc)[:500]})
+                           subject=task.uid, payload={"error": str(exc)[:500],
+                                                      "traceback": stack[-4000:]})
             self.checkpoints.create("task_verification_error", run_id=task.run_id,
                                     task_uid=task.uid)
             self.memory.sync_task_state(task.run_id)
@@ -1197,6 +1859,12 @@ class RunService:
 
     def _finish_verification_impl(self, task: Task, agent: AgentRecord,
                                   result: ResultPackage) -> None:
+        run = self.store.get_run(task.run_id) or {}
+        if run.get("status") == "canceled":
+            self.audit.log("control-plane", "task.verification_skipped_canceled",
+                           subject=task.uid)
+            return
+        verify_epoch = int(run.get("epoch") or 1)
         outcome: VerificationOutcome = self.verifier.verify(
             task, result, upstream_patches=self._upstream_patch_paths(task))
         self.store.add_verification(
@@ -1206,12 +1874,40 @@ class RunService:
         self.audit.log("control-plane", "verification.deterministic", subject=task.uid,
                        payload={"status": outcome.report.status, "checks": outcome.report.checks})
         final_report = outcome.report
-        agent_report = self._independent_verification(task, agent)
-        if agent_report == "waiting":
+        agent_report = self._independent_verification(
+            task, agent, snapshot_dir=outcome.snapshot_dir)
+        run = self.store.get_run(task.run_id) or {}
+        if run.get("status") == "canceled" \
+                or int(run.get("epoch") or 1) != verify_epoch:
+            self.audit.log("control-plane", "task.verification_stale_after_cancel",
+                           subject=task.uid,
+                           payload={"run_epoch": run.get("epoch"),
+                                    "attempt": task.active_attempt_id})
+            return
+        if isinstance(agent_report, str) and agent_report == "waiting":
             self.store.update_task(task.uid, verification_status=final_report.status)
             self.store.set_task_status(task.uid, TaskStatus.WAITING_USER.value,
                                        error="等待独立验证节点提交验证报告", force=True)
             self.checkpoints.create("verification_waiting", run_id=task.run_id, task_uid=task.uid)
+            self.memory.sync_task_state(task.run_id)
+            self.memory.sync_workflow(task.run_id)
+            return
+        if isinstance(agent_report, str):
+            # Required independent verification must never degrade into
+            # "deterministic passed, so the task passed".
+            unavailable = agent_report.startswith("unavailable")
+            reason = agent_report.split(":", 1)[-1].strip() or "独立验证不可用"
+            status = TaskStatus.BLOCKED if unavailable else TaskStatus.FAILED
+            self.store.set_task_status(task.uid, status.value, error=reason, force=True)
+            self.leases.release(task.uid)
+            self.audit.log("control-plane",
+                           "task.verification_blocked" if unavailable
+                           else "task.verification_failed",
+                           subject=task.uid, payload={"reason": reason,
+                                                      "report": agent_report[:500]})
+            self.checkpoints.create(
+                "task_verification_blocked" if unavailable else "task_failed",
+                run_id=task.run_id, task_uid=task.uid)
             self.memory.sync_task_state(task.run_id)
             self.memory.sync_workflow(task.run_id)
             return
@@ -1238,6 +1934,24 @@ class RunService:
             self.memory.sync_task_state(task.run_id)
             self.memory.sync_workflow(task.run_id)
             return
+        blocking_items = _blocking_unresolved(result.unresolved_items)
+        if result.status == "partial" or blocking_items:
+            reason = (
+                "成果状态为 partial，不能升级为完整交付"
+                if result.status == "partial"
+                else "存在未关闭的必需问题: " + "; ".join(blocking_items[:3])
+            )
+            self.store.set_task_status(task.uid, TaskStatus.FAILED.value,
+                                       error=reason, force=True)
+            self.leases.release(task.uid)
+            self.audit.log("control-plane", "task.unresolved_blocked", subject=task.uid,
+                           payload={"status": result.status,
+                                    "unresolved_items": blocking_items[:20]})
+            self.checkpoints.create("task_unresolved_blocked", run_id=task.run_id,
+                                    task_uid=task.uid)
+            self.memory.sync_task_state(task.run_id)
+            self.memory.sync_workflow(task.run_id)
+            return
         if not task.spec.writable:
             try:
                 self._cache_store(task, result)
@@ -1251,14 +1965,33 @@ class RunService:
                                 extra={"verification": final_report.status})
         self.audit.log("control-plane", "task.completed", subject=task.uid,
                        payload={"verification": final_report.status})
+        try:
+            (Path(task.task_dir) / "repair-feedback.json").unlink()
+        except (FileNotFoundError, OSError):
+            pass
         self.memory.sync_task_state(task.run_id)
         self.memory.sync_workflow(task.run_id)
+        # If the loop already exited (human submission / restart), unlock
+        # downstream nodes through the persistent reconcile queue.
+        lock = self._run_locks.get(task.run_id)
+        if lock is None or not lock.locked():
+            self.schedule_reconcile(task.run_id, "task_completed")
 
-    def _independent_verification(self, task: Task, executor: AgentRecord) -> VerificationReport | str | None:
+    def _independent_verification(self, task: Task, executor: AgentRecord,
+                                  snapshot_dir: str = "") -> VerificationReport | str | None:
+        if not self.config.require_independent_verifier:
+            # Explicitly disabled: deterministic checks are the acceptance gate.
+            return None
         verifier = self._select_verifier(executor)
         if not verifier:
+            if self.config.require_independent_verifier:
+                return "unavailable:需要独立验证，但没有可用的验证 Agent"
             return None
-        directory = ensure_dir(self.paths.run_dir(task.run_id) / "verification" / task.task_id)
+        attempt_id = str(getattr(task, "active_attempt_id", "") or "")
+        directory = self.paths.run_dir(task.run_id) / "verification" / task.task_id
+        if attempt_id:
+            directory = directory / attempt_id
+        ensure_dir(directory)
         report_path = directory / "verification.json"
         if report_path.exists():
             data = read_json(report_path)
@@ -1270,18 +2003,25 @@ class RunService:
                 except ValidationError as exc:
                     self.audit.log("control-plane", "verification.invalid_report", subject=task.uid,
                                    payload={"error": exc.message})
-                    return None
+                    return f"invalid:已有验证报告不合法: {exc.message}"
         result = self.store.get_result(task.uid) or {}
         summary = (result.get("payload") or {})
+        recheck = None
+        if task.task_dir:
+            loaded = read_json(Path(task.task_dir) / "repair-feedback.json", None)
+            if isinstance(loaded, dict) and loaded:
+                recheck = loaded
         prompt_path, expected_report = self.prompts.write_verification_request(
             run_id=task.run_id, task=task, verifier=verifier,
-            model=self._model_for_agent(verifier), patch_path=task.patch_path,
+            model=self._verifier_model(verifier), patch_path=task.patch_path,
             result_summary={
                 "task_id": task.task_id, "summary": summary.get("summary"),
                 "files_changed": summary.get("files_changed"), "tests": summary.get("tests"),
                 "evidence": summary.get("evidence"), "risks": summary.get("risks"),
             },
             verification_commands=task.spec.verification_commands,
+            attempt_id=attempt_id,
+            recheck=recheck,
         )
         if self.bus:
             self.bus.publish("prompt", {
@@ -1290,21 +2030,69 @@ class RunService:
                 "patch_path": task.patch_path,
                 "preview": read_text(prompt_path, default="")[:1200],
             }, source=verifier.agent_id, correlation_id=task.uid)
+        verify_workdir = snapshot_dir or task.workdir or self.project.root
+        # Build outputs and installed dependencies are already exercised by
+        # the deterministic verifier.  A semantic re-check only needs sources;
+        # handing a 60MB+ node_modules tree to the verifier agent makes it
+        # scan or dump irrelevant data and time out before writing a report.
+        try:
+            if Path(verify_workdir).exists() and (Path(verify_workdir) / "node_modules").exists():
+                semantic_dir = self.paths.run_dir(task.run_id) / "verify-semantic" / task.task_id
+                if attempt_id:
+                    semantic_dir = semantic_dir / attempt_id
+                if semantic_dir.exists():
+                    shutil.rmtree(semantic_dir, ignore_errors=True)
+                blocked = {"node_modules", "dist", ".git", ".agentloop-task",
+                           ".agentmesh", ".workbuddy", "__pycache__", ".vite", "coverage"}
+                shutil.copytree(verify_workdir, semantic_dir,
+                                ignore=lambda _d, names: [n for n in names if n in blocked])
+                verify_workdir = str(semantic_dir)
+        except Exception as exc:
+            self.audit.log("control-plane", "verification.semantic_snapshot_failed",
+                           subject=task.uid, payload={"error": str(exc)[:300]})
         synthetic = Task(
             uid=f"{task.uid}:verify", project_id=self.project.project_id,
             plan_id=task.plan_id, run_id=task.run_id, spec=task.spec,
-            status=TaskStatus.RUNNING.value, workdir=self.project.root,
+            status=TaskStatus.RUNNING.value, workdir=verify_workdir,
             task_dir=str(prompt_path.parent), base_commit=task.base_commit,
         )
+        verify_attempt_id = new_id("att")
+        verify_request_id = uuid.uuid4().hex
+        verify_marker = f"AGENTMESH_GUI_MARKER_VERIFY_{verify_request_id}"
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
-            task=synthetic, workdir=self.project.root, task_dir=str(prompt_path.parent),
+            task=synthetic, workdir=verify_workdir, task_dir=str(prompt_path.parent),
             prompt_path=str(prompt_path), result_path=str(expected_report),
-            model=self._model_for_agent(verifier),
+            attempt_id=verify_attempt_id, request_id=verify_request_id,
+            metadata={"request_marker": verify_marker},
+            model=self._verifier_model(verifier),
             timeout_seconds=self.config.verify_timeout_seconds, purpose="verify",
             full_control=bool(self.config.full_control),
+            cancel_event=self._cancel_event(task.run_id),
+        )
+        self.store.create_attempt(
+            attempt_id=verify_attempt_id, project_id=self.project.project_id,
+            task_uid=synthetic.uid, run_id=task.run_id, attempt_number=1,
+            request_id=verify_request_id, purpose="verify",
+            workdir=verify_workdir, result_path=str(expected_report),
+            binding={"marker": verify_marker, "phase": "verify",
+                     "target_task": task.uid,
+                     "executor": executor.agent_id},
+            input_snapshot={"snapshot_dir": verify_workdir,
+                            "patch": task.patch_path},
         )
         outcome = create_adapter(verifier).execute(request)
+        self.store.update_attempt(
+            verify_attempt_id, status=outcome.status,
+            session_id=outcome.session_id,
+            result_path=outcome.result_path or str(expected_report),
+            binding={"marker": verify_marker, "phase": "verify",
+                     "target_task": task.uid,
+                     "submission": outcome.submission_receipt,
+                     "model_evidence": (outcome.extras or {}).get(
+                         "model_evidence", {})},
+            error=outcome.error[:500], finished_at=now_iso(),
+        )
         self.budget.record(
             synthetic, verifier.agent_id, request.model, outcome.usage,
             duration_ms=outcome.duration_ms, run_id=task.run_id, status=outcome.status,
@@ -1324,7 +2112,7 @@ class RunService:
         if data is None:
             self.audit.log(verifier.agent_id, "verification.no_report", subject=task.uid,
                            payload={"error": outcome.error[:300]})
-            return None
+            return "invalid:独立验证未产出报告" if self.config.require_independent_verifier else None
         try:
             return VerificationReport.validate(
                 data, expected_task_id=task.task_id, executor_agent=executor.agent_id
@@ -1332,7 +2120,8 @@ class RunService:
         except ValidationError as exc:
             self.audit.log(verifier.agent_id, "verification.invalid_report", subject=task.uid,
                            payload={"error": exc.message})
-            return None
+            return f"invalid:独立验证报告不合法: {exc.message}" \
+                if self.config.require_independent_verifier else None
 
     def _select_verifier(self, executor: AgentRecord) -> AgentRecord | None:
         if not self.config.require_independent_verifier:
@@ -1342,20 +2131,56 @@ class RunService:
             agent = self.store.get_agent(configured)
             if agent and agent.agent_id != executor.agent_id:
                 return agent
-        candidates = [
-            a for a in self.store.list_agents()
-            if a.agent_id != executor.agent_id and a.status != "offline"
-            and a.adapter_type in ("cli", "opencode")
-        ]
+        from ..connectors import is_auto_executable
+        cli_candidates: list[AgentRecord] = []
+        gui_candidates: list[AgentRecord] = []
+        for agent in sorted(self.store.list_agents(), key=lambda a: a.agent_id):
+            if agent.agent_id == executor.agent_id:
+                continue
+            if agent.status in ("offline", "error"):
+                continue
+            if agent.adapter_type in ("cli", "opencode"):
+                cli_candidates.append(agent)
+            elif agent.adapter_type == "gui_automation" and is_auto_executable(agent):
+                # A second desktop agent is a valid independent verifier, but
+                # only as a fallback: GUI verification is slower and may need
+                # the app open.  CLI/opencode stays first.
+                gui_candidates.append(agent)
+        candidates = cli_candidates or gui_candidates
         return candidates[0] if candidates else None
 
     # ------------------------------------------------------------------
     # Waiting-user resume / result import
     # ------------------------------------------------------------------
-    def submit_result(self, uid: str, payload: dict[str, Any] | str | Path) -> dict[str, Any]:
+    def submit_result(self, uid: str, payload: dict[str, Any] | str | Path, *,
+                      attempt_id: str = "", request_id: str = "") -> dict[str, Any]:
         task = self.store.get_task(uid)
         if not task:
             raise NotFoundError(f"任务不存在: {uid}")
+        active_attempt = self.store.get_attempt(task.active_attempt_id or "")
+        identity = {}
+        if active_attempt:
+            if not attempt_id and not request_id:
+                raise ValidationError(
+                    "人工提交必须携带 attempt_id 或 request_id，不能只凭 task_id 覆盖当前成果",
+                    details={"active_attempt_id": task.active_attempt_id,
+                             "request_id": active_attempt.get("request_id", "")})
+            if attempt_id and str(attempt_id) != task.active_attempt_id:
+                raise ConflictError(
+                    "提交的 attempt_id 不是当前活动尝试",
+                    details={"active": task.active_attempt_id,
+                             "submitted": attempt_id})
+            if request_id and str(request_id) != str(active_attempt.get("request_id") or ""):
+                raise ConflictError(
+                    "提交的 request_id 与原请求不匹配",
+                    details={"expected": active_attempt.get("request_id", ""),
+                             "submitted": request_id})
+            identity = {"attempt_id": task.active_attempt_id,
+                        "request_id": active_attempt.get("request_id", "")}
+        elif attempt_id or request_id:
+            raise ValidationError("该任务没有可绑定的 attempt/request")
+        else:
+            self.audit.log("user", "result.submit_legacy_unbound", subject=uid)
         if isinstance(payload, (str, Path)):
             data = read_json(payload)
             if data is None:
@@ -1367,6 +2192,10 @@ class RunService:
             data = payload
         if not isinstance(data, dict):
             raise ValidationError("成果包必须是 JSON 对象")
+        data, normalized_fields = ResultPackage.normalize(data)
+        if normalized_fields:
+            self.audit.log("control-plane", "result.normalized", subject=uid,
+                           payload={"fields": normalized_fields, "source": "human_submit"})
         try:
             result = ResultPackage.validate(
                 data, expected_task_id=task.task_id,
@@ -1380,14 +2209,24 @@ class RunService:
         write_json(persistent, data)
         self.store.save_result(task, result, valid=True)
         self.audit.log("user", "result.submitted", subject=uid,
-                       payload={"status": result.status, "summary": result.summary[:300]})
+                       payload={"status": result.status, "summary": result.summary[:300],
+                                **identity})
         if task.status in (TaskStatus.WAITING_USER.value, TaskStatus.RUNNING.value,
-                           TaskStatus.WAITING_AGENT.value, TaskStatus.VERIFYING.value):
+                           TaskStatus.WAITING_AGENT.value, TaskStatus.VERIFYING.value,
+                           TaskStatus.FAILED.value, TaskStatus.PAUSED.value):
             self.store.set_task_status(uid, TaskStatus.VERIFYING.value, force=True)
             agent = self.store.get_agent(task.assigned_agent) if task.assigned_agent else None
             if agent:
                 self._ensure_change(task, agent, result)
                 self._finish_verification(task, agent, result)
+                # A human submission often happens after the run loop has
+                # exited.  Wake the controller so downstream nodes unlock
+                # without requiring another manual "resume".
+                current = self.store.get_run(task.run_id) or {}
+                if current.get("status") not in (
+                        "canceled", "completed", "pending_acceptance", "pending_merge",
+                        "released"):
+                    self.schedule_reconcile(task.run_id, "human_result_submitted")
             else:
                 self.store.set_task_status(uid, TaskStatus.FAILED.value,
                                            error="成果包对应的执行 Agent 不存在", force=True)
@@ -1425,6 +2264,24 @@ class RunService:
         tasks = self.store.list_tasks(run_id)
         requeued = 0
         for task in tasks:
+            if task.status == TaskStatus.WAITING_USER.value and (
+                    str(task.error or "").startswith("SUBMISSION_")
+                    or str(task.error or "").startswith("MANUAL_ACTION_")):
+                # "Continue" means reconcile the original request first.  A
+                # manual wait is never a licence to send a second prompt; only
+                # the explicit retry action may create a new attempt.
+                self.reconcile_submission(task.uid, by="user")
+                continue
+            if task.status == TaskStatus.VERIFYING.value:
+                if self._is_active(task.uid):
+                    continue
+                stored = self.store.get_result(task.uid)
+                agent = self.store.get_agent(task.assigned_agent or "") if stored else None
+                if stored and stored.get("valid") and agent:
+                    payload = ResultPackage(stored["payload"])
+                    self._ensure_change(task, agent, payload)
+                    self._finish_verification(task, agent, payload)
+                continue
             if task.status not in (TaskStatus.WAITING_USER.value, TaskStatus.BLOCKED.value,
                                    TaskStatus.PAUSED.value, TaskStatus.FAILED.value):
                 continue
@@ -1451,8 +2308,7 @@ class RunService:
                 )
                 approved_after_wait = waiting_for_approval and latest \
                     and latest.status == "approved"
-                manual_restart = (task.error or "").startswith("MANUAL_ACTION_REQUIRED")
-                if approved_after_wait or manual_restart:
+                if approved_after_wait:
                     try:
                         (Path(task.task_dir) / "manual-action.json").unlink()
                     except (FileNotFoundError, OSError):
@@ -1461,9 +2317,7 @@ class RunService:
                     self.store.update_task(task.uid, error="")
                     requeued += 1
                     self.audit.log(
-                        "control-plane",
-                        "task.requeued_after_approval" if approved_after_wait
-                        else "task.requeued_after_manual_action",
+                        "control-plane", "task.requeued_after_approval",
                         subject=task.uid,
                         payload={"approval": latest.approval_id if latest else "",
                                  "kind": latest.kind if latest else ""})
@@ -1532,6 +2386,10 @@ class RunService:
 
     def _request_summary(self, run_id: str, plan: TaskPlan) -> dict[str, Any]:
         run = self.store.get_run(run_id) or {}
+        if run.get("status") == "canceled":
+            self.audit.log("control-plane", "summary.skipped_canceled", subject=run_id)
+            return {"status": "canceled", "run_id": run_id}
+        summary_epoch = int(run.get("epoch") or 1)
         tasks = self.store.list_tasks(run_id)
         changes = [c.to_dict() for c in self.store.list_changes(run_id=run_id)]
         verifications = {t.uid: (self.store.latest_verification(t.uid) or {}) for t in tasks}
@@ -1578,12 +2436,28 @@ class RunService:
             status=TaskStatus.RUNNING.value, workdir=summary_workspace,
             task_dir=str(prompt_path.parent), base_commit=run.get("base_commit", ""),
         )
+        summary_attempt_id = new_id("att")
+        summary_request_id = uuid.uuid4().hex
+        summary_marker = f"AGENTMESH_GUI_MARKER_SUMMARY_{summary_request_id}"
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
             task=synthetic, workdir=summary_workspace, task_dir=str(prompt_path.parent),
             prompt_path=str(prompt_path), result_path=str(agent_summary_path),
+            attempt_id=summary_attempt_id, request_id=summary_request_id,
+            metadata={"request_marker": summary_marker},
             model=run.get("model", ""), timeout_seconds=self.config.summary_timeout_seconds,
             purpose="summary", full_control=bool(self.config.full_control),
+            cancel_event=self._cancel_event(run_id),
+        )
+        self.store.create_attempt(
+            attempt_id=summary_attempt_id, project_id=self.project.project_id,
+            task_uid=synthetic.uid, run_id=run_id, attempt_number=1,
+            request_id=summary_request_id, purpose="summary",
+            workdir=summary_workspace, result_path=str(agent_summary_path),
+            binding={"marker": summary_marker, "phase": "summary",
+                     "round": int(run.get("round_number") or 1)},
+            input_snapshot={"workspace": summary_workspace,
+                            "tasks": [t.uid for t in tasks]},
         )
         activity_path = Path(prompt_path.parent) / "activity.json"
         activity = {
@@ -1596,6 +2470,16 @@ class RunService:
         }
         write_json(activity_path, activity)
         outcome = create_adapter(main_agent).execute(request)
+        self.store.update_attempt(
+            summary_attempt_id, status=outcome.status,
+            session_id=outcome.session_id,
+            result_path=outcome.result_path or str(agent_summary_path),
+            binding={"marker": summary_marker, "phase": "summary",
+                     "submission": outcome.submission_receipt,
+                     "model_evidence": (outcome.extras or {}).get(
+                         "model_evidence", {})},
+            error=outcome.error[:500], finished_at=now_iso(),
+        )
         activity.update({
             "status": outcome.status, "error": outcome.error[:500],
             "finished_at": now_iso(), "duration_ms": outcome.duration_ms,
@@ -1611,6 +2495,22 @@ class RunService:
                 "status": outcome.status, "error": outcome.error[:500],
                 "usage": outcome.usage.to_dict(), "summary_path": str(summary_path),
             }, source=main_agent.agent_id, correlation_id=run_id, sync_level=5)
+        current = self.store.get_run(run_id) or {}
+        cancel_event = self._cancel_events.get(run_id)
+        if current.get("status") == "canceled" \
+                or int(current.get("epoch") or 1) != summary_epoch \
+                or (cancel_event is not None and cancel_event.is_set()):
+            stale = self.paths.run_dir(run_id) / "summary" / f"late-summary-{uuid.uuid4().hex[:8]}.json"
+            ensure_dir(stale.parent)
+            diagnostic = outcome.result_payload if isinstance(outcome.result_payload, dict) else {
+                "status": outcome.status, "error": outcome.error[:1000],
+            }
+            write_json(stale, {"epoch": summary_epoch, "outcome": diagnostic})
+            self.audit.log("control-plane", "summary.stale_after_cancel", subject=run_id,
+                           payload={"epoch": summary_epoch,
+                                    "artifact": str(stale)})
+            return {"status": "canceled", "run_id": run_id,
+                    "stale_summary_artifact": str(stale)}
         if outcome.status in ("waiting_user", "waiting_agent"):
             self.store.update_run(run_id, status="waiting_user")
             self.checkpoints.create("summary_waiting", run_id=run_id,
@@ -1621,11 +2521,13 @@ class RunService:
         if isinstance(data, dict):
             write_json(summary_path, data)
         if data is None:
-            return self._fallback_after_missing_summary(run_id, plan, tasks, outcome)
-        return self.finalize_summary(run_id, data)
+            return self._fallback_after_missing_summary(run_id, plan, tasks, outcome,
+                                                        epoch=summary_epoch)
+        return self.finalize_summary(run_id, data, epoch=summary_epoch)
 
     def _fallback_after_missing_summary(self, run_id: str, plan: TaskPlan,
-                                        tasks: list[Task], outcome: Any) -> dict[str, Any]:
+                                        tasks: list[Task], outcome: Any,
+                                        epoch: int | None = None) -> dict[str, Any]:
         """Do not dead-end when the main GUI agent cannot produce summary.json.
 
         A missing summary with recorded task/verification failures is treated
@@ -1669,7 +2571,7 @@ class RunService:
             }
             self.audit.log("control-plane", "summary.fallback_continue", subject=run_id,
                            payload={"reason": reason, "actions": actions[:12]})
-            return self.finalize_summary(run_id, data)
+            return self.finalize_summary(run_id, data, epoch=epoch)
 
         decision = RoundDecision(
             action="blocked", reason=reason, code="summary-unavailable",
@@ -1707,7 +2609,8 @@ class RunService:
         return self.finalize_summary(run_id, data, auto_start=True)
 
     def finalize_summary(self, run_id: str, data: dict[str, Any], *,
-                         auto_start: bool = False) -> dict[str, Any]:
+                         auto_start: bool = False,
+                         epoch: int | None = None) -> dict[str, Any]:
         required = ("summary_version", "completion", "changes", "verification", "risks",
                     "merge_recommendation", "next_actions")
         missing = [k for k in required if k not in data]
@@ -1727,6 +2630,20 @@ class RunService:
         run = self.store.get_run(run_id)
         if not run:
             raise NotFoundError(f"运行不存在: {run_id}")
+        if run.get("status") == "canceled" or (
+                epoch is not None and int(run.get("epoch") or 1) != int(epoch)):
+            stale = self.paths.run_dir(run_id) / "summary" / \
+                f"late-finalize-{uuid.uuid4().hex[:8]}.json"
+            ensure_dir(stale.parent)
+            write_json(stale, {"epoch": epoch, "run_epoch": run.get("epoch"),
+                               "status": run.get("status"), "summary": data})
+            self.audit.log("control-plane", "summary.stale_finalize", subject=run_id,
+                           payload={"epoch": epoch, "run_epoch": run.get("epoch"),
+                                    "artifact": str(stale)})
+            return {"status": "canceled", "run_id": run_id,
+                    "stale_summary_artifact": str(stale)}
+        if run.get("status") in ("completed", "released"):
+            return {"status": run.get("status"), "run_id": run_id, "ignored": True}
         tasks = self.store.list_tasks(run_id)
         plan = self.store.get_plan(run["plan_id"])
         if not plan:
@@ -2118,6 +3035,228 @@ class RunService:
         self.audit.log(by, "task.canceled", subject=uid)
         return {"status": "canceled", "task_uid": uid}
 
+    def reconcile_submission(self, uid: str, *, by: str = "user") -> dict[str, Any]:
+        """Check the original request delivery; never creates a new request."""
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        attempt = self.store.get_attempt(task.active_attempt_id or "")
+        if not attempt:
+            raise ValidationError("没有可核对的执行尝试（该任务来自旧版本）")
+        agent = self.store.get_agent(task.assigned_agent or "")
+        if not agent:
+            raise ValidationError("执行 Agent 不存在，无法核对")
+        adapter = create_adapter(agent)
+        reconciler = getattr(adapter, "reconcile_submission", None)
+        if not callable(reconciler):
+            return {"status": "unsupported", "task_uid": uid,
+                    "reason": f"{agent.agent_id} 不支持基于原请求的回执核对"}
+        receipt = reconciler(attempt) or {}
+        accepted = str(receipt.get("status") or "") == "accepted"
+        binding = dict(attempt.get("binding") or {})
+        binding["submission"] = receipt
+        self.store.update_attempt(
+            task.active_attempt_id or "",
+            status="running" if accepted else "acceptance_unknown",
+            binding=binding,
+            session_id=str(receipt.get("session_id") or attempt.get("session_id") or ""),
+            result_path=str(receipt.get("result_path") or attempt.get("result_path") or ""),
+            error="" if accepted else str(receipt.get("reason") or "MARKER_NOT_FOUND")[:500],
+        )
+        safe_receipt = {k: v for k, v in receipt.items() if k != "package"}
+        self.audit.log(by, "task.submission_reconciled", subject=uid,
+                       payload={"attempt_id": task.active_attempt_id,
+                                "request_id": attempt.get("request_id", ""),
+                                "receipt": safe_receipt})
+        package = receipt.get("package")
+        if accepted and isinstance(package, dict):
+            try:
+                normalized, changed = ResultPackage.normalize(package)
+                if changed:
+                    self.audit.log("control-plane", "result.normalized",
+                                   subject=task.uid,
+                                   payload={"fields": changed, "source": "reconcile"})
+                result = ResultPackage.validate(
+                    normalized, expected_task_id=task.task_id,
+                    expected_agent_id=agent.agent_id)
+            except ValidationError as exc:
+                self.store.save_result(task, ResultPackage(package), valid=False,
+                                       error=exc.message)
+                reason = f"SUBMISSION_ACCEPTED: 回执已确认，但成果包非法: {exc.message}"
+                self.store.set_task_status(uid, TaskStatus.WAITING_USER.value,
+                                           error=reason, force=True)
+                return {"status": "accepted", "task_uid": uid,
+                        "verified": False, "error": reason, "receipt": safe_receipt}
+            self.store.set_task_status(uid, TaskStatus.VERIFYING.value, force=True)
+            self._finalize_from_result(task, agent, result.payload)
+            current = self.store.get_run(task.run_id) or {}
+            if current.get("status") not in (
+                    "canceled", "completed", "pending_acceptance", "pending_merge",
+                    "released"):
+                self.start(task.run_id, background=True)
+            return {"status": "accepted", "task_uid": uid, "verified": True,
+                    "receipt": safe_receipt}
+        reason = (
+            "SUBMISSION_ACCEPTED: 已确认送达，等待应用完成；可稍后再次核对"
+            if accepted else
+            "SUBMISSION_UNVERIFIED: 仍未找到原请求送达证据；禁止重发，请人工检查应用"
+        )
+        self.store.set_task_status(uid, TaskStatus.WAITING_USER.value,
+                                   error=reason, force=True)
+        return {"status": "accepted" if accepted else "acceptance_unknown",
+                "task_uid": uid, "verified": False,
+                "error": reason, "receipt": safe_receipt}
+
+    def adopt_attempt_result(self, uid: str, attempt_id: str, *,
+                             by: str = "user") -> dict[str, Any]:
+        """Use a valid result already written by a previous attempt.
+
+        A GUI agent may finish writing its result just after the adapter's
+        timeout; retrying then would create a second session and lose the
+        completed review/fix.  Adoption is explicit and audited.
+        """
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        attempt = self.store.get_attempt(attempt_id)
+        if not attempt or str(attempt.get("task_uid")) != uid:
+            raise NotFoundError(f"尝试不存在或不属于该任务: {attempt_id}")
+        result_path = Path(str(attempt.get("result_path") or ""))
+        if not result_path.exists() or result_path.stat().st_size <= 0:
+            raise ValidationError("该尝试没有可采纳的 result.json")
+        data = read_json(result_path, None)
+        if not isinstance(data, dict) or not data:
+            raise ValidationError("该尝试的 result.json 不是有效 JSON 对象")
+        normalized, changed = ResultPackage.normalize(data)
+        if changed:
+            self.audit.log("control-plane", "result.normalized", subject=uid,
+                           payload={"fields": changed, "source": "adopt_attempt"})
+        agent_id = task.assigned_agent or str(normalized.get("agent_id") or "")
+        result = ResultPackage.validate(
+            normalized, expected_task_id=task.task_id,
+            expected_agent_id=agent_id)
+        previous = str(task.active_attempt_id or "")
+        if previous and previous != attempt_id:
+            self.store.update_attempt(
+                previous, status="canceled",
+                error=f"被已完成尝试 {attempt_id} 的成果替代",
+                finished_at=now_iso())
+        self.store.update_task(
+            uid, active_attempt_id=attempt_id,
+            workdir=str(attempt.get("workdir") or task.workdir or ""), error="")
+        task.active_attempt_id = attempt_id
+        self.store.save_result(task, result, valid=True)
+        self.store.set_task_status(uid, TaskStatus.VERIFYING.value, force=True)
+        agent = self.store.get_agent(agent_id)
+        if not agent:
+            raise ValidationError("成果包对应的执行 Agent 不存在")
+        if task.spec.writable and attempt.get("patch_path"):
+            task.patch_path = str(attempt["patch_path"])
+            self.store.update_task(uid, patch_path=task.patch_path)
+        else:
+            self._ensure_change(task, agent, result)
+        self.audit.log(by, "task.attempt_result_adopted", subject=uid,
+                       payload={"attempt_id": attempt_id, "previous": previous,
+                                "result_path": str(result_path)})
+        self._finish_verification(task, agent, result)
+        refreshed = self.store.get_task(uid)
+        return {"status": refreshed.status if refreshed else task.status,
+                "task_uid": uid, "attempt_id": attempt_id,
+                "verification_status": refreshed.verification_status if refreshed else "",
+                "error": (refreshed.error if refreshed else "")[:500]}
+
+    def repair_task(self, uid: str, *, by: str = "user") -> dict[str, Any]:
+        """Re-run a verification-failed task in place with the verifier's findings.
+
+        The Agent already produced a worktree and a session; throwing them away
+        makes the repair blind and repeats the same defect.  The task keeps its
+        conversation/worktree, but the last verification report is written as
+        explicit repair feedback for the next prompt.
+        """
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        if task.status != TaskStatus.FAILED.value:
+            raise ValidationError(f"只有验证失败的节点可以修复（当前 {task.status}）")
+        reports = [r for r in self.store.list_verifications(uid)
+                   if str(r.get("status") or "") == VerificationStatus.FAILED.value]
+        if not reports:
+            raise ValidationError("该节点没有可用的失败验证报告，请使用普通重试")
+        latest = reports[-1]
+        feedback = {
+            "generated_at": now_iso(),
+            "summary": str(latest.get("summary") or "")[:4000],
+            "warnings": list(latest.get("warnings") or [])[:30],
+            "checks": latest.get("checks") or {},
+            "previous_error": str(task.error or "")[:2000],
+            "instruction": (
+                "先读取当前工作树中已有的成果文件，只修复下列验证问题；"
+                "不要重做已完成且正确的部分。修复后重新运行验证命令并提交完整成果包。"
+            ),
+        }
+        task_dir = ensure_dir(Path(task.task_dir or self.paths.task_dir(uid)))
+        feedback_path = task_dir / "repair-feedback.json"
+        write_json(feedback_path, feedback)
+        if task.workdir and Path(task.workdir).exists():
+            # Patch collection leaves intent-to-add entries; they are not
+            # source changes and would otherwise make the worktree look dirty.
+            run_git(["reset"], cwd=task.workdir, check=False)
+        self.store.update_task(uid, attempts=0, error="")
+        self.store.set_task_status(uid, TaskStatus.QUEUED.value, force=True)
+        self.audit.log(by, "task.repair_requested", subject=uid,
+                       payload={"feedback": str(feedback_path),
+                                "warnings": len(feedback["warnings"]),
+                                "workdir": task.workdir})
+        return {"status": "queued", "task_uid": uid,
+                "feedback_path": str(feedback_path),
+                "warnings": len(feedback["warnings"])}
+
+    def resume_interrupted(self, uid: str, *, by: str = "user") -> dict[str, Any]:
+        """Requeue a restart-interrupted task in its own session and worktree.
+
+        Recovery pauses a task whose Agent was killed with the process.  That
+        is not a failed attempt: the Agent's conversation still exists and the
+        task's own worktree is the only place that conversation can continue.
+        Resetting the attempt counter keeps ``_prepare_workdir`` on the
+        attempt-1 reuse path.  A task that already produced a result is
+        rejected so this can never overwrite completed work.
+        """
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        recoverable = task.status == TaskStatus.PAUSED.value
+        if task.status == TaskStatus.WAITING_USER.value \
+                and str(task.error or "").startswith("MANUAL_ACTION_REQUIRED"):
+            # The previous attempt was rejected before any prompt was accepted
+            # (e.g. the app's stale "working" row); it can be re-issued in place.
+            recoverable = True
+        if task.status == TaskStatus.FAILED.value:
+            err = str(task.error or "")
+            if err.startswith("failed: SESSION_BINDING") or \
+                    err.startswith("SESSION_BINDING"):
+                # The app refused a mismatched cwd before accepting the prompt;
+                # no work happened and the session tree is still the right home.
+                recoverable = True
+        if not recoverable:
+            raise ValidationError(f"只有暂停或待人工处理的节点可以原地恢复（当前 {task.status}）")
+        attempt = self.store.get_attempt(task.active_attempt_id or "")
+        if attempt:
+            result_path = Path(str(attempt.get("result_path") or ""))
+            if result_path.exists() and result_path.stat().st_size > 0:
+                raise ConflictError("该节点已有成果包，请使用 reconcile/重新验证")
+            self.store.update_attempt(
+                task.active_attempt_id, status="canceled",
+                error="进程中断，原 attempt 在恢复后原地续跑",
+                finished_at=now_iso())
+        self.store.update_task(uid, attempts=0, error="")
+        self.store.set_task_status(uid, TaskStatus.QUEUED.value, force=True)
+        self.audit.log(by, "task.resume_interrupted", subject=uid,
+                       payload={"attempt_id": task.active_attempt_id,
+                                "workdir": task.workdir})
+        return {"status": "queued", "task_uid": uid,
+                "attempt_id": task.active_attempt_id,
+                "workdir": task.workdir}
+
     def retry_task(self, uid: str, *, by: str = "user") -> dict[str, Any]:
         task = self.store.get_task(uid)
         if not task:
@@ -2129,10 +3268,66 @@ class RunService:
             (Path(task.task_dir) / "manual-action.json").unlink()
         except (FileNotFoundError, OSError):
             pass
+        self.memory.invalidate_task_memories(uid, "任务重试：旧产物/结论已失效")
         self.store.set_task_status(uid, TaskStatus.QUEUED.value, force=True)
         self.store.update_task(uid, error="")
         self.audit.log(by, "task.retry_requested", subject=uid)
         return {"status": "queued", "task_uid": uid}
+
+    def capture_artifacts(self, uid: str, *, by: str = "user") -> dict[str, Any]:
+        """Materialize files a read-only node wrote into its worktree.
+
+        A research node can be planned as ``analysis`` while its expected
+        outputs are documents.  Such a node never goes through ``_ensure_change``
+        and its files would stay in the attempt worktree, invisible to every
+        downstream dependency.  Capturing them as the node's own patch keeps the
+        dependency chain complete without re-running the Agent.
+        """
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        if task.status != TaskStatus.COMPLETED.value:
+            raise ValidationError(f"只有已完成节点可以固化产物（当前 {task.status}）")
+        workdir = Path(task.workdir or "")
+        if not task.workdir or not workdir.exists():
+            raise ValidationError("节点工作目录不存在，无法固化产物")
+        attempt_id = str(getattr(task, "active_attempt_id", "") or "")
+        if attempt_id:
+            attempt_dir = ensure_dir(Path(task.task_dir) / "attempts" / attempt_id)
+            patch_path = str(attempt_dir / "patch.patch")
+        else:
+            patch_path = str(self.paths.patch_path(task.uid))
+        if task.patch_path and Path(task.patch_path).exists() \
+                and Path(task.patch_path).stat().st_size > 0:
+            return {"status": "already_captured", "task_uid": uid,
+                    "patch_path": task.patch_path,
+                    "files": patch_files(task.patch_path)}
+        generate_patch(str(workdir), patch_path)
+        files = patch_files(patch_path)
+        if not files:
+            try:
+                Path(patch_path).unlink()
+            except OSError:
+                pass
+            return {"status": "empty", "task_uid": uid, "files": []}
+        change = ChangeRecord(
+            change_id=new_id("chg"), project_id=self.project.project_id, task_uid=task.uid,
+            attempt_id=attempt_id,
+            agent_id=task.assigned_agent, base_commit=task.base_commit,
+            base_hash=sha1_hex(task.base_commit), before_hash=sha1_hex(task.base_commit),
+            after_hash=tree_hash(files, base=workdir), files=files,
+            patch_path=patch_path, status=ChangeStatus.PROPOSED.value,
+            created_at=now_iso(),
+        )
+        if attempt_id:
+            self.store.update_attempt(attempt_id, patch_path=patch_path)
+        self.store.add_change(change)
+        self.store.update_task(uid, patch_path=patch_path)
+        self.audit.log(by, "task.artifacts_captured", subject=uid,
+                       payload={"attempt_id": attempt_id, "files": files,
+                                "patch_path": patch_path})
+        return {"status": "captured", "task_uid": uid, "attempt_id": attempt_id,
+                "patch_path": patch_path, "files": files}
 
     def reverify_task(self, uid: str, *, by: str = "user") -> dict[str, Any]:
         """Re-run control-plane verification on an existing result, no Agent run.
@@ -2145,13 +3340,22 @@ class RunService:
             raise NotFoundError(f"任务不存在: {uid}")
         if self._is_active(uid):
             raise ConflictError("该节点仍在执行，不能只重新验证")
-        candidates = [
-            Path(task.task_dir) / "result.json" if task.task_dir else Path(),
-            Path(task.result_path) if task.result_path else Path(),
-        ]
+        attempt = self.store.get_attempt(task.active_attempt_id or "")
+        if attempt:
+            # Only the active attempt's immutable result can be re-verified.
+            # Human corrections go through submit_result, not this path.
+            candidates: list[Path] = [Path(str(attempt.get("result_path") or ""))]
+        else:
+            # Legacy rows created before attempts existed are explicitly
+            # unbound; they are usable only on an explicit user action.
+            candidates = [
+                Path(task.task_dir) / "result.json" if task.task_dir else Path(),
+                Path(task.result_path) if task.result_path else Path(),
+            ]
+            self.audit.log(by, "task.reverify_legacy_unbound", subject=uid)
         data: dict[str, Any] = {}
         for path in candidates:
-            if not path or not path.exists():
+            if not path or not str(path) or not path.exists():
                 continue
             loaded = read_json(path, {})
             if isinstance(loaded, dict) and loaded:
@@ -2172,8 +3376,17 @@ class RunService:
         )
         self.store.save_result(task, result, valid=True)
         self.store.set_task_status(uid, TaskStatus.VERIFYING.value, force=True)
-        self.audit.log(by, "task.reverify_requested", subject=uid)
-        self._ensure_change(task, agent, result)
+        if attempt and attempt.get("patch_path"):
+            # Re-verify the attempt's frozen patch; never regenerate from a
+            # possibly changed worktree.
+            task.patch_path = str(attempt["patch_path"])
+            self.store.update_task(uid, patch_path=task.patch_path)
+        else:
+            self._ensure_change(task, agent, result)
+        self.audit.log(by, "task.reverify_requested", subject=uid,
+                       payload={"attempt_id": task.active_attempt_id,
+                                "patch": task.patch_path,
+                                "legacy_unbound": not bool(attempt)})
         self._finish_verification(task, agent, result)
         refreshed = self.store.get_task(uid)
         return {"status": refreshed.status if refreshed else task.status,

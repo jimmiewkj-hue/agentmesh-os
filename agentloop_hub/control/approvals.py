@@ -30,7 +30,14 @@ class ApprovalService:
             run_id=run_id,
         )
         if existing and (not task_uid or existing.task_uid == task_uid):
-            return existing
+            # A pending plan ticket for older content must not be reused for a
+            # new revision; expire it and create a ticket bound to the new hash.
+            if kind == ApprovalKind.PLAN.value and \
+                    str(existing.details.get("plan_hash") or "") != \
+                    str(details.get("plan_hash") or ""):
+                self.store.expire_approval(existing.approval_id)
+            else:
+                return existing
         approval = Approval(
             approval_id=new_id("apr"), project_id=self.project.project_id, kind=kind,
             subject=subject, details=details, status=ApprovalStatus.PENDING.value,
@@ -109,6 +116,10 @@ class ApprovalService:
                 "high_risk_tasks": risk_summary,
                 "main_agent": plan.main_agent_id,
                 "model": plan.model,
+                "plan_hash": plan.content_hash,
+                "plan_revision": int(plan.revision),
+                "project_id": self.project.project_id,
+                "approval_kind": ApprovalKind.PLAN.value,
                 "estimated_tokens": sum(int(t.token_budget or 0) for t in plan.tasks),
                 "what": "批准后才会分发子任务",
                 "why": "用户主权原则：计划须经用户批准",

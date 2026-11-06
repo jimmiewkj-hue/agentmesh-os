@@ -34,6 +34,7 @@ class RecoveryService:
         for run in active_runs:
             for task in self.store.list_tasks(run["run_id"]):
                 if task.status in (TaskStatus.RUNNING.value, TaskStatus.QUEUED.value,
+                                   TaskStatus.VERIFYING.value,
                                    TaskStatus.WAITING_USER.value, TaskStatus.WAITING_AGENT.value):
                     result = self.store.get_result(task.uid)
                     tasks.append({
@@ -70,10 +71,12 @@ class RecoveryService:
             runs = [r for r in runs if r["run_id"] == run_id]
         recovered_tasks = []
         released_leases = 0
+        runs_to_start: list[str] = []
         for run in runs:
             if run["status"] not in ("running", "paused", "waiting_user", "merging"):
                 continue
             tasks = self.store.list_tasks(run["run_id"])
+            needs_work = False
             for task in tasks:
                 if task.status == TaskStatus.RUNNING.value:
                     result = self.store.get_result(task.uid)
@@ -81,6 +84,7 @@ class RecoveryService:
                         self.store.set_task_status(task.uid, TaskStatus.VERIFYING.value,
                                                    error="恢复：从已有成果包继续", force=True)
                         recovered_tasks.append({"task_uid": task.uid, "action": "verify_existing"})
+                        needs_work = True
                     else:
                         changes = changed_paths(task.workdir) if task.workdir and Path(task.workdir).exists() else []
                         self.store.set_task_status(task.uid, TaskStatus.PAUSED.value,
@@ -93,10 +97,22 @@ class RecoveryService:
                         })
                 elif task.status in (TaskStatus.FAILED.value, TaskStatus.CANCELED.value):
                     self.leases.release(task.uid)
+                elif task.status in (TaskStatus.VERIFYING.value, TaskStatus.QUEUED.value):
+                    needs_work = True
             if run["status"] in ("running", "merging"):
-                self.store.update_run(run["run_id"], status="paused", error="程序中断后恢复")
+                if auto_resume and needs_work:
+                    # A recovered verifying task must continue, not be treated
+                    # as a brand-new implementation request.
+                    self.store.update_run(run["run_id"], status="ready",
+                                          error="程序中断后恢复")
+                else:
+                    self.store.update_run(run["run_id"], status="paused",
+                                          error="程序中断后恢复")
             if auto_resume:
                 for task in self.store.list_tasks(run["run_id"]):
+                    if task.status == TaskStatus.VERIFYING.value:
+                        needs_work = True
+                        continue
                     if task.status in (TaskStatus.PAUSED.value, TaskStatus.BLOCKED.value):
                         if task.status == TaskStatus.PAUSED.value and task.workdir and \
                                 Path(task.workdir).exists() and changed_paths(task.workdir):
@@ -105,6 +121,9 @@ class RecoveryService:
                         self.store.set_task_status(task.uid, TaskStatus.QUEUED.value, force=True)
                         self.store.update_task(task.uid, error="")
                         recovered_tasks.append({"task_uid": task.uid, "action": "requeued"})
+                        needs_work = True
+                if needs_work and run["run_id"] not in runs_to_start:
+                    runs_to_start.append(run["run_id"])
         self.audit.log("control-plane", "recovery.completed",
                        payload={"tasks": recovered_tasks, "released_leases": released_leases,
                                 "auto_resume": auto_resume})
@@ -114,5 +133,6 @@ class RecoveryService:
             "status": "recovered",
             "tasks": recovered_tasks,
             "released_leases": released_leases,
+            "runs_to_start": runs_to_start,
             "report": self.inspect(),
         }

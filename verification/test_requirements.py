@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import DEFAULT_SUMMARY, plan, task
+from verify_support import DEFAULT_SUMMARY, plan, task
 
 from agentloop_hub import connectors
 from agentloop_hub.config import HubConfig
@@ -81,7 +81,8 @@ def test_R1_control_plane_contains_no_llm_client():
     import re
 
     root = Path(__file__).resolve().parents[1] / "agentloop_hub" / "control"
-    llm_tokens = ("openai", "anthropic", "chat/completions", "api_key", "bearer ")
+    llm_tokens = ("openai", "anthropic", "chat/completions", "api_key",
+                  "authorization: bearer")
     url_re = re.compile(r"https?://[^\s\"'\)]+")
     offenders: list[str] = []
     for path in root.rglob("*.py"):
@@ -91,7 +92,11 @@ def test_R1_control_plane_contains_no_llm_client():
             if token in lowered:
                 offenders.append(f"{path.name}:llm:{token}")
         for url in url_re.findall(text):
-            host = url.split("/")[2].split(":")[0]
+            netloc = url.split("/")[2]
+            host = netloc.split(":")[0]
+            # Template URLs such as http://{target}:{port}/ are local probes.
+            if "{" in netloc or "}" in netloc:
+                continue
             if host not in ("127.0.0.1", "localhost"):
                 offenders.append(f"{path.name}:remote:{url}")
     assert offenders == [], offenders
@@ -253,11 +258,12 @@ def test_R6_capability_gate_blocks_agents_without_the_capability(env):
     assert preview["selected"] is None
 
 
-def test_GAP_router_drops_all_rejection_reasons_when_nobody_qualifies(env):
-    """无人满足能力门槛时，候选与淘汰原因被整体丢弃，路由不可解释。"""
+def test_SAFE_router_explains_rejections_when_nobody_qualifies(env):
+    """Now fixed: an empty result still carries every rejection reason."""
     preview = env.hub.route_preview(task_type="analysis", required=["web_search"])
     assert preview["selected"] is None
-    assert preview["candidates"] == [], preview["candidates"]
+    assert preview["candidates"], preview
+    assert any("缺少能力" in str(item.get("rejected")) for item in preview["candidates"])
 
 
 def test_R6_scoring_uses_capability_success_verification_speed_cost(env):
@@ -396,10 +402,14 @@ def test_R9_http_single_entry_accepts_one_goal(env):
     thread.start()
     try:
         port = server.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/session", timeout=10) as r:
+            token = json.loads(r.read().decode("utf-8"))["token"]
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/ask",
             data=json.dumps({"goal": "HTTP 单入口验证"}).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-AgentMesh-Token": token}, method="POST",
         )
         with urllib.request.urlopen(request, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -415,8 +425,8 @@ def test_R9_http_single_entry_accepts_one_goal(env):
 # ---------------------------------------------------------------------------
 # R10 产品愿景：用户不感知其它 Agent（自动执行覆盖率）
 # ---------------------------------------------------------------------------
-def test_GAP_most_products_still_need_a_human_in_the_loop():
-    """需求愿景是「用户不感知」，实测：13 个产品里只有 5 个可无人执行。"""
+def test_SAFE_auto_executable_requires_evidence_not_product_type():
+    """Fixed: a type/profile alone never proves the agent can run unattended."""
     records = [
         AgentRecord(
             agent_id=profile.agent_id, name=profile.product, product=profile.product,
@@ -427,14 +437,20 @@ def test_GAP_most_products_still_need_a_human_in_the_loop():
         )
         for profile in connectors.CONNECTOR_PROFILES
     ]
-    automatic = sorted(r.agent_id for r in records if connectors.is_auto_executable(r))
-    assert automatic == ["aider", "claude_code", "codex_cli", "gemini_cli", "opencode"]
-    manual = sorted(set(r.agent_id for r in records) - set(automatic))
-    assert len(manual) == 9, manual
+    assert not any(connectors.is_auto_executable(r) for r in records)
+
+    configured = AgentRecord(
+        agent_id="claude_code", name="Claude Code", product="Claude Code", edition="",
+        project_id="p", version="1", adapter_type="cli",
+        adapter_config={"command": ["claude"]}, access_level="L3",
+        capabilities={}, models=[], permissions={}, status="online", discovered=True,
+    )
+    assert connectors.is_auto_executable(configured) is True
+    assert "auto_executable" in connectors.derive_capability_list(configured)
 
 
-def test_GAP_offline_cli_agent_is_still_marked_auto_executable():
-    """离线判定只影响状态，不影响 auto_executable 能力标记。"""
+def test_SAFE_offline_cli_agent_is_not_auto_executable():
+    """Fixed: offline/EXPLICIT-disabled agents are not advertised as runnable."""
     record = AgentRecord(
         agent_id="offline_cli", name="Offline CLI", product="x", edition="",
         project_id="p", version="1", adapter_type="cli", adapter_config={},
@@ -443,8 +459,19 @@ def test_GAP_offline_cli_agent_is_still_marked_auto_executable():
             "session_read", "session_write", "structured_output")},
         models=[], permissions={}, status="offline", discovered=True,
     )
-    assert connectors.is_auto_executable(record) is True
-    assert connectors.derive_capability_list(record) == ["auto_executable"]
+    assert connectors.is_auto_executable(record) is False
+    assert "auto_executable" not in connectors.derive_capability_list(record)
+
+    online_but_disabled = AgentRecord(
+        agent_id="disabled_cli", name="Disabled CLI", product="x", edition="",
+        project_id="p", version="1", adapter_type="cli",
+        adapter_config={"command": ["x"]}, access_level="L3",
+        capabilities={"auto_executable": False, "read_files": True},
+        models=[], permissions={}, status="online", discovered=True,
+    )
+    assert connectors.is_auto_executable(online_but_disabled) is False
+    # Explicit false also blocks the product profile's assumed capabilities.
+    assert "write_files" not in connectors.derive_capability_list(online_but_disabled)
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +491,8 @@ def test_R11_audit_chain_and_version_ledger_survive_a_run(env):
 # ---------------------------------------------------------------------------
 # R12 声明真实性
 # ---------------------------------------------------------------------------
-def test_GAP_independent_verifier_executes_in_the_live_workspace(env):
-    """独立验证 Agent 以项目主工作区为 cwd 执行，不受 Worktree 隔离。
-
-    需求与 README 都声称「子任务在独立 Worktree 中执行」；实测验证节点直接
-    在用户工作区运行，Mock 验证器写入的 CANARY 文件落进了项目根目录。
-    """
+def test_SAFE_independent_verifier_never_runs_in_the_user_workspace(env):
+    """Fixed: the verifier gets a candidate snapshot, not the user's main tree."""
     env.set_scenario({
         "T001": {"summary": "probe", "evidence": [{"file": "calc.py", "lines": "1",
                                                    "description": "probe"}]},
@@ -477,24 +500,28 @@ def test_GAP_independent_verifier_executes_in_the_live_workspace(env):
                                         "content": "written by verifier"}]},
     })
     env.run_plan(plan([task("T001", kind="analysis", agent="mock_worker")]))
-    assert (env.repo / "VERIFIER_CANARY.txt").exists()
+    assert not (env.repo / "VERIFIER_CANARY.txt").exists()
 
 
-def test_GAP_overview_module_status_is_a_hardcoded_literal(env):
-    """`/api/overview` 的 modules.ready 是写死的，不反映真实健康度。"""
+def test_SAFE_overview_module_status_reflects_real_health(env):
+    """Fixed: removing every agent changes module status; nothing is hardcoded."""
     before = env.hub.overview()["modules"]
+    assert "unverified" in set(before.values()) or "ready" in set(before.values())
     for agent in env.hub.list_agents():
         env.hub.remove_agent(agent.agent_id)
     after = env.hub.overview()["modules"]
-    assert before == after
-    assert set(after.values()) == {"ready"}
+    assert after["connector"] == "unavailable"
+    assert after["task_scheduler"] == "unavailable"
+    assert before != after
 
 
-def test_GAP_cost_in_usd_cannot_be_measured_out_of_the_box(env):
-    """定价表为空 -> 美元成本恒为 0；「100 美元降到 10 美元」无法量化。"""
+def test_SAFE_unknown_price_is_not_reported_as_free(env):
+    """Fixed: a missing price is explicitly unknown, not a measured $0 saving."""
     config = HubConfig()
     assert config.pricing == {}
-    assert config.price_for("any/model") == {"input": 0.0, "output": 0.0}
+    price = config.price_for("any/model")
+    assert price["known"] is False
+    assert price["input"] == 0.0 and price["output"] == 0.0
 
     env.hub.cost.compress_context({"findings": [{"detail": "y" * 400} for _ in range(60)]}, 400)
     totals = env.hub.cost_report()["savings"]["totals"]

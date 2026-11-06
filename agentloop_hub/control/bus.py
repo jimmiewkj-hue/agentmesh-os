@@ -202,21 +202,42 @@ class ContextBus:
             self.project.project_id, after_seq=int(subscription["cursor_seq"]),
             limit=5000,
         )
-        selected = [
+        matches = [
             event for event in scanned
             if (not topic_filter or event["topic"] in topic_filter)
             and (not kind_filter or event["kind"] in kind_filter)
-        ][: max(1, int(limit))]
-        if scanned:
-            self.store.update_bus_cursor(subscription_id, int(scanned[-1]["seq"]))
+        ]
+        selected = matches[: max(1, int(limit))]
+        # Advance only over events actually delivered.  A page must never move
+        # the cursor past matching events it did not return.
+        if selected:
+            new_cursor = int(selected[-1]["seq"])
+        elif scanned and not matches:
+            # Non-matching events are intentionally skipped by this filter.
+            new_cursor = int(scanned[-1]["seq"])
+        else:
+            new_cursor = int(subscription["cursor_seq"])
+        if new_cursor > int(subscription["cursor_seq"]):
+            self.store.update_bus_cursor(subscription_id, new_cursor)
         return {
             "subscription_id": subscription_id,
             "events": selected,
             "count": len(selected),
-            "cursor": int(scanned[-1]["seq"]) if scanned else int(subscription["cursor_seq"]),
-            "has_more": len(scanned) >= 5000,
+            "cursor": new_cursor,
+            "acked_seq": int(subscription.get("acked_seq") or 0),
+            "has_more": len(matches) > len(selected) or len(scanned) >= 5000,
             "polled_at": now_iso(),
         }
+
+    def ack(self, subscription_id: str, seq: int) -> dict[str, Any]:
+        subscription = self.store.get_bus_subscription(subscription_id)
+        if not subscription or subscription["project_id"] != self.project.project_id:
+            raise NotFoundError(f"总线订阅不存在: {subscription_id}")
+        self.store.ack_bus_cursor(subscription_id, int(seq))
+        updated = self.store.get_bus_subscription(subscription_id) or {}
+        return {"subscription_id": subscription_id,
+                "acked_seq": int(updated.get("acked_seq") or 0),
+                "cursor": int(updated.get("cursor_seq") or 0)}
 
     def poll_subscriber(self, subscriber: str, *, limit: int = 100) -> dict[str, Any]:
         subscriptions = self.store.list_bus_subscriptions(self.project.project_id)
@@ -238,7 +259,11 @@ class ContextBus:
     # Digest used by memory bootstrap / main-node summary
     # ------------------------------------------------------------------
     def digest(self, *, correlation_id: str = "", limit: int = 20) -> list[dict[str, Any]]:
-        events = self.events(after_seq=0, limit=limit, correlation_id=correlation_id)
+        events = self.store.list_bus_events(
+            self.project.project_id, after_seq=0, limit=max(5000, int(limit) * 10),
+            correlation_id=correlation_id,
+        )
+        events = events[-max(1, int(limit)):]
         return [
             {
                 "seq": e["seq"], "kind": e["kind"], "topic": e["topic"],
@@ -249,15 +274,14 @@ class ContextBus:
         ]
 
     def recent_digest(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self.store.list_bus_events(self.project.project_id, after_seq=0,
-                                           limit=max(1, limit))
+        rows = self.store.recent_bus_events(self.project.project_id, limit=max(1, limit))
         return [
             {
                 "seq": e["seq"], "kind": e["kind"], "topic": e["topic"],
                 "source": e["source"], "created_at": e["created_at"],
                 "payload": e["payload"],
             }
-            for e in rows[-limit:]
+            for e in rows
         ]
 
 

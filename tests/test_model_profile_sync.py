@@ -13,7 +13,7 @@ from agentloop_hub.control import trae_interface
 from agentloop_hub.control.model_profile import resolve_profile, source_meta
 from agentloop_hub.errors import ValidationError
 from agentloop_hub.models import AgentRecord
-from conftest import make_project
+from hub_test_support import make_project
 
 
 def _agent(app: str) -> AgentRecord:

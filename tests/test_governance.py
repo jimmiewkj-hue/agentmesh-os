@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agentloop_hub.errors import ApprovalRequiredError
-from conftest import make_project
+from hub_test_support import make_project
 
 
 def architecture_plan() -> dict:
@@ -66,7 +66,7 @@ def test_architecture_gate_blocks_plan_until_approved(tmp_path):
 
 def test_acceptance_rejection_fails_run(tmp_path):
     repo, hub, _ = make_project(tmp_path)
-    from conftest import default_plan
+    from hub_test_support import default_plan
     result = hub.import_plan(default_plan(str(tmp_path)))
     hub.decide_approval(result["approval_id"], approve=True)
     run_id = hub.latest_run()["run_id"]
@@ -79,7 +79,7 @@ def test_acceptance_rejection_fails_run(tmp_path):
 
 def test_release_requires_completed_and_acceptance(tmp_path):
     repo, hub, _ = make_project(tmp_path)
-    from conftest import default_plan
+    from hub_test_support import default_plan
     result = hub.import_plan(default_plan(str(tmp_path)))
     hub.decide_approval(result["approval_id"], approve=True)
     run_id = hub.latest_run()["run_id"]

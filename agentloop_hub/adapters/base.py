@@ -16,6 +16,9 @@ class ExecutionUsage:
     reasoning_tokens: int = 0
     total_tokens: int = 0
     cost: float = 0.0
+    # USD and credits are different units and must never be added together.
+    currency: str = ""
+    cost_known: bool = True
     tool_calls: int = 0
     estimated: bool = False
 
@@ -30,6 +33,7 @@ class ExecutionUsage:
             "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens, "reasoning_tokens": self.reasoning_tokens,
             "total_tokens": self.total_tokens, "cost": self.cost,
+            "currency": self.currency, "cost_known": self.cost_known,
             "tool_calls": self.tool_calls, "estimated": self.estimated,
         }
 
@@ -54,6 +58,10 @@ class ExecutionRequest:
     capability_level: str = ""
     timeout_seconds: int = 1800
     purpose: str = "task"
+    # Execution identity.  The Controller mints these before dispatch; a
+    # provider response is only associated with an attempt through them.
+    attempt_id: str = ""
+    request_id: str = ""
     # Run-level chain continuity: for a repeated agent, the control plane
     # passes the prior completed session and its worktree so the adapter can
     # continue that conversation instead of opening a new one.
@@ -87,6 +95,10 @@ class ExecutionOutcome:
     pid: int = 0
     extras: dict[str, Any] = field(default_factory=dict)
     error_code: str = ""
+    # Submission is observed separately from completion: a click is not proof
+    # that the external product accepted the request.
+    submission_status: str = ""  # not_sent | accepted | acceptance_unknown
+    submission_receipt: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -100,6 +112,8 @@ class ExecutionOutcome:
             "logs": self.logs, "error": self.error, "session_id": self.session_id,
             "duration_ms": self.duration_ms, "pid": self.pid, "extras": self.extras,
             "error_code": self.error_code,
+            "submission_status": self.submission_status,
+            "submission_receipt": self.submission_receipt,
         }
 
 

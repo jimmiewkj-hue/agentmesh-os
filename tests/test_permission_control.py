@@ -9,7 +9,7 @@ from agentloop_hub.gui.permissions import (
     PermissionWatcher, _probe_and_click, ensure_trae_full_access,
     ensure_workbuddy_full_access,
 )
-from conftest import make_project
+from hub_test_support import make_project
 
 
 class FakeTransport:

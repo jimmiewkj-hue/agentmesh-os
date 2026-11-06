@@ -19,7 +19,8 @@ def agent(agent_id: str, models: list[str], *, caps: dict | None = None,
     return AgentRecord(
         agent_id=agent_id, name=agent_id, product=agent_id, adapter_type=adapter,
         access_level=level, status=status, models=list(models),
-        adapter_config={"gui_app": agent_id} if adapter == "gui_automation" else {},
+        adapter_config=({"gui_app": agent_id} if adapter == "gui_automation"
+                        else {"command": [agent_id]}),
         capabilities=caps or {
             "read_files": True, "write_files": True, "terminal": True,
             "structured_output": True, "web_search": True,

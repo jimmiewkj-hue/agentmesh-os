@@ -69,10 +69,13 @@ def _script(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _transport(port: int) -> WebSocketTransport:
-    page = _pick_page(_targets(int(port)))
+def _transport(port: int, page_id: str = "") -> WebSocketTransport:
+    page = _pick_page(_targets(int(port)), page_id=page_id)
     if not page:
-        raise RuntimeError(f"CDP 端口 {port} 没有可用的 page 目标")
+        raise RuntimeError(
+            f"CDP 端口 {port} 没有可用的 page 目标"
+            + (f"（已绑定 {page_id}）" if page_id else "")
+        )
     return WebSocketTransport(
         page["webSocketDebuggerUrl"], origin=f"http://127.0.0.1:{int(port)}",
         timeout=10,
@@ -80,7 +83,8 @@ def _transport(port: int) -> WebSocketTransport:
 
 
 def _probe_and_click(port: int, labels: list[str], *,
-                     transport: WebSocketTransport | None = None) -> dict[str, Any]:
+                     transport: WebSocketTransport | None = None,
+                     page_id: str = "") -> dict[str, Any]:
     js = r"""(() => {
       const labels = %s;
       const always = %s;
@@ -93,9 +97,15 @@ def _probe_and_click(port: int, labels: list[str], *,
       const nodes = [...document.querySelectorAll(
         'button,[role="button"],[role="menuitem"],li,div'
       )].filter(vis);
+      // WorkBuddy renders numeric shortcuts: "1\n允许写入".
+      const clean = (raw) => String(raw || '')
+        .trim()
+        .replace(/^\s*\d+\s*[\n.、:：)\]-]?\s*/, '')
+        .trim();
       const matches = [];
       for (const el of nodes) {
-        const text = (el.innerText || '').trim();
+        const raw = (el.innerText || '').trim();
+        const text = clean(raw);
         if (!text) continue;
         for (const label of labels) {
           if (text === label || text.startsWith(label + '\n')) {
@@ -126,7 +136,7 @@ def _probe_and_click(port: int, labels: list[str], *,
       return {ok: false, reason: 'NO_MATCH', labels};
     })()""" % (_script(labels), _script(sorted(ALWAYS_LABELS)))
     own = transport is None
-    tr = transport or _transport(port)
+    tr = transport or _transport(port, page_id=page_id)
     try:
         return _evaluate(tr, js, 10) or {"ok": False, "reason": "EMPTY"}
     finally:
@@ -134,23 +144,25 @@ def _probe_and_click(port: int, labels: list[str], *,
             tr.close()
 
 
-def accept_permission_once(app: str, port: int) -> dict[str, Any]:
+def accept_permission_once(app: str, port: int, page_id: str = "") -> dict[str, Any]:
     labels = APP_LABELS.get(str(app or "").lower())
     if not labels:
         return {"ok": False, "reason": "APP_NOT_SUPPORTED", "app": app}
-    return _probe_and_click(int(port), labels)
+    return _probe_and_click(int(port), labels, page_id=page_id)
 
 
 class PermissionWatcher:
     """Background CDP polling while a GUI agent is working."""
 
     def __init__(self, *, app: str, port: int, log_path: str | Path | None = None,
-                 interval: float = 1.0, clicker: Callable[[str, int], dict[str, Any]] | None = None):
+                 interval: float = 1.0, page_id: str = "",
+                 clicker: Callable[[str, int], dict[str, Any]] | None = None):
         self.app = str(app or "").lower()
         self.port = int(port)
+        self.page_id = str(page_id or "")
         self.log_path = Path(log_path) if log_path else None
         self.interval = float(interval)
-        self.clicker = clicker or accept_permission_once
+        self.clicker = clicker
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.accepted: list[dict[str, Any]] = []
@@ -162,7 +174,8 @@ class PermissionWatcher:
         self._thread = threading.Thread(target=self._run, name=f"perm-{self.app}",
                                         daemon=True)
         self._thread.start()
-        self._log("permission_watcher_start", app=self.app, port=self.port)
+        self._log("permission_watcher_start", app=self.app, port=self.port,
+                  page_id=self.page_id)
         return self
 
     def stop(self) -> None:
@@ -175,7 +188,11 @@ class PermissionWatcher:
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             try:
-                result = self.clicker(self.app, self.port)
+                if self.clicker is not None:
+                    result = self.clicker(self.app, self.port)
+                else:
+                    result = accept_permission_once(self.app, self.port,
+                                                    page_id=self.page_id)
             except Exception as exc:  # transient CDP reloads are normal
                 self.errors.append(str(exc)[:300])
                 continue

@@ -18,8 +18,8 @@ from typing import Any, Iterable
 
 from ..config import HubConfig
 from ..connectors import (
-    derive_capability_list, is_auto_executable, missing_capabilities,
-    required_capabilities_for,
+    capability_evidence, derive_capability_list, is_auto_executable,
+    missing_capabilities, required_capabilities_for,
 )
 from ..models import AgentRecord, Project, Task, TaskSpec
 from ..storage.repo import Store
@@ -55,6 +55,7 @@ class CapabilityRouter:
         self.store = store
         self.project = project
         self.config = config
+        self.last_rejected: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -79,7 +80,8 @@ class CapabilityRouter:
             "task_type": task.spec.type,
             "required_capabilities": required_capabilities_for(task.spec),
             "selected": decision.to_dict() if decision else None,
-            "candidates": decision.candidates if decision else [],
+            "candidates": decision.candidates if decision else self.last_rejected,
+            "rejected": [] if decision else self.last_rejected,
             "generated_at": now_iso(),
         }
 
@@ -90,7 +92,8 @@ class CapabilityRouter:
             "task_type": spec.type,
             "required_capabilities": required_capabilities_for(spec),
             "selected": decision.to_dict() if decision else None,
-            "candidates": decision.candidates if decision else [],
+            "candidates": decision.candidates if decision else self.last_rejected,
+            "rejected": [] if decision else self.last_rejected,
             "generated_at": now_iso(),
         }
 
@@ -102,6 +105,7 @@ class CapabilityRouter:
                 {
                     "agent_id": a.agent_id, "name": a.name,
                     "capabilities": derive_capability_list(a),
+                    "capability_evidence": capability_evidence(a),
                     "stats": stats.get(a.agent_id, {}),
                 }
                 for a in agents
@@ -160,6 +164,7 @@ class CapabilityRouter:
                     reason="沿用任务已分配的 Agent（重试稳定性）",
                     required=required,
                 )
+        self.last_rejected = rejected
         if not eligible:
             return None
         agent, best = eligible[0]

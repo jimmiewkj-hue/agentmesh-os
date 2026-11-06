@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 from typing import Any
 
-from ..errors import NotFoundError, ValidationError
+from ..errors import ConflictError, NotFoundError, ValidationError
 from ..models import (
     MEMORY_SYNC_LEVEL, AgentRecord, Approval, ChangeRecord, Checkpoint, ConversationRecord,
     DecisionRecord, MemoryRecord, Project, ResultPackage, Task, TaskPlan, TaskSpec, TaskStatus,
-    UsageRecord, VerificationReport, assert_task_transition,
+    UsageRecord, VerificationReport, assert_task_transition, plan_content_hash,
 )
 from ..util import hash_obj, new_id, now_iso
 from .db import Database
@@ -42,30 +44,146 @@ def _summary_digest(summary: Any) -> dict[str, Any]:
 
 
 class Store:
-    def __init__(self, db: Database, *, event_sink: Any | None = None):
+    def __init__(self, db: Database, *, event_sink: Any | None = None,
+                 project_id: str = ""):
         self.db = db
         self.event_sink = event_sink
+        self.project_id = project_id
 
     # ------------------------------------------------------------------
     # Context Bus sink
     # ------------------------------------------------------------------
     def emit(self, kind: str, payload: dict[str, Any], *, source: str = "control-plane",
              correlation_id: str = "", topic: str = "", sync_level: int | None = None) -> None:
-        """Publish a domain event to the Context Bus when one is attached.
+        """Persist an intent to publish, then deliver it.
 
-        The store is the single write path for task/run/memory/approval state,
-        so hooking here guarantees that every state change is observable on the
-        bus without duplicating publish calls in each service.
+        Inside a database transaction the outbox row commits with the business
+        state; delivery happens after commit (or on the next drain).  A crash
+        can therefore delay or duplicate a bus event, but cannot lose the fact
+        that the business change happened.
         """
+        outbox_id = new_id("out")
+        project_id = self.project_id or str(
+            getattr(getattr(self.event_sink, "project", None), "project_id", "") or "")
+        try:
+            self.db.execute(
+                "INSERT INTO outbox(outbox_id, project_id, kind, payload, source, "
+                "correlation_id, topic, sync_level, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (outbox_id, project_id, kind, _dumps(payload), source,
+                 correlation_id, topic, sync_level, now_iso()),
+            )
+        except Exception:
+            # Outbox must never break the calling business action; fall back to
+            # best-effort delivery below.
+            if self.event_sink is not None:
+                try:
+                    self.event_sink.emit(kind, payload, source=source,
+                                         correlation_id=correlation_id, topic=topic,
+                                         sync_level=sync_level)
+                except Exception:
+                    pass
+            return
+        if self.db.in_transaction():
+            return
+        self._deliver_outbox(outbox_id)
+
+    def _deliver_outbox(self, outbox_id: str) -> bool:
+        row = self.db.query_one("SELECT * FROM outbox WHERE outbox_id=?", (outbox_id,))
+        if not row or int(row.get("published") or 0):
+            return True
         sink = self.event_sink
         if sink is None:
-            return
+            return False
         try:
-            sink.emit(kind, payload, source=source, correlation_id=correlation_id,
-                      topic=topic, sync_level=sync_level)
-        except Exception:
-            # Bus persistence must never corrupt the control plane transaction.
+            sink.emit(str(row["kind"]), _j(row["payload"], {}),
+                      source=str(row["source"] or "control-plane"),
+                      correlation_id=str(row["correlation_id"] or ""),
+                      topic=str(row["topic"] or ""),
+                      sync_level=(int(row["sync_level"])
+                                  if row.get("sync_level") is not None else None))
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE outbox_id=?",
+                (str(exc)[:500], outbox_id))
+            return False
+        self.db.execute(
+            "UPDATE outbox SET published=1, attempts=attempts+1, last_error='', "
+            "published_at=? WHERE outbox_id=?",
+            (now_iso(), outbox_id))
+        return True
+
+    def drain_outbox(self, *, limit: int = 500) -> dict[str, int]:
+        rows = self.db.query(
+            "SELECT outbox_id FROM outbox WHERE project_id=? AND published=0 "
+            "ORDER BY created_at LIMIT ?",
+            (self.project_id, max(1, int(limit))),
+        )
+        delivered = 0
+        failed = 0
+        for row in rows:
+            if self._deliver_outbox(str(row["outbox_id"])):
+                delivered += 1
+            else:
+                failed += 1
+        return {"delivered": delivered, "failed": failed, "scanned": len(rows)}
+
+    def enqueue_reconcile(self, run_id: str, reason: str) -> str:
+        existing = self.db.query_one(
+            "SELECT todo_id, status FROM reconcile_todos WHERE project_id=? "
+            "AND run_id=? AND reason=? ORDER BY created_at DESC LIMIT 1",
+            (self.project_id, run_id, reason))
+        if existing:
+            # One row per (project, run, reason): a completed wake-up is
+            # reused for the next one.  Inserting a second row and then
+            # marking it done would collide with the older done row on the
+            # (…, status) unique key.
+            if existing["status"] != "pending":
+                self.db.execute(
+                    "UPDATE reconcile_todos SET status='pending', created_at=?, "
+                    "processed_at='' WHERE todo_id=?",
+                    (now_iso(), existing["todo_id"]))
+            return str(existing["todo_id"])
+        todo_id = new_id("todo")
+        try:
+            self.db.execute(
+                "INSERT INTO reconcile_todos(todo_id, project_id, run_id, reason, created_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(project_id, run_id, reason, status) DO NOTHING",
+                (todo_id, self.project_id, run_id, reason, now_iso()))
+        except sqlite3.IntegrityError:
+            # A concurrent enqueue can still lose the upsert race on
+            # deployments whose SQLite build handles the conflict target
+            # differently; the pending row is what matters, not this id.
             pass
+        row = self.db.query_one(
+            "SELECT todo_id FROM reconcile_todos WHERE project_id=? AND run_id=? "
+            "AND reason=? AND status='pending' ORDER BY created_at DESC LIMIT 1",
+            (self.project_id, run_id, reason))
+        return str(row["todo_id"]) if row else ""
+
+    def pending_reconcile(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM reconcile_todos WHERE project_id=? AND status='pending' "
+            "ORDER BY created_at LIMIT ?",
+            (self.project_id, max(1, int(limit))))
+
+    def complete_reconcile(self, todo_id: str) -> None:
+        row = self.db.query_one(
+            "SELECT project_id, run_id, reason FROM reconcile_todos WHERE todo_id=?",
+            (todo_id,))
+        if not row:
+            return
+        # Older databases may already contain both a done row and a newer
+        # pending row for the same intent.  The unique key includes status,
+        # so the pending row can only become done after the stale done row is
+        # removed; the audit table keeps the historical evidence.
+        self.db.execute(
+            "DELETE FROM reconcile_todos WHERE project_id=? AND run_id=? "
+            "AND reason=? AND status='done' AND todo_id<>?",
+            (row["project_id"], row["run_id"], row["reason"], todo_id))
+        self.db.execute(
+            "UPDATE reconcile_todos SET status='done', processed_at=? WHERE todo_id=?",
+            (now_iso(), todo_id))
 
     # ------------------------------------------------------------------
     # Project
@@ -433,22 +551,46 @@ class Store:
     # Plans
     # ------------------------------------------------------------------
     def save_plan(self, plan: TaskPlan) -> None:
-        self.db.execute(
-            """
-            INSERT INTO plans(plan_id, project_id, goal, constraints, tasks, main_agent_id, model,
-                status, raw, created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(plan_id) DO UPDATE SET
-                goal=excluded.goal, constraints=excluded.constraints, tasks=excluded.tasks,
-                main_agent_id=excluded.main_agent_id, model=excluded.model,
-                status=excluded.status, raw=excluded.raw
-            """,
-            (
-                plan.plan_id, plan.project_id, plan.goal, _dumps(plan.constraints),
-                _dumps([t.to_dict() for t in plan.tasks]), plan.main_agent_id, plan.model,
-                plan.status, _dumps(plan.raw), plan.created_at,
-            ),
-        )
+        """Persist a plan revision and invalidate approvals of older content.
+
+        The revision is derived from the executable content hash, not from the
+        caller.  Any pending plan approval for previous content is expired in
+        the same transaction, so an old ticket can never approve new content.
+        """
+        new_hash = plan_content_hash(plan)
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT revision, content_hash FROM plans WHERE plan_id=?",
+                (plan.plan_id,)).fetchone()
+            if row is None:
+                plan.revision = max(1, int(plan.revision or 1))
+            elif row["content_hash"] and row["content_hash"] != new_hash:
+                plan.revision = int(row["revision"] or 1) + 1
+                conn.execute(
+                    "UPDATE approvals SET status='expired' "
+                    "WHERE plan_id=? AND kind='plan' AND status='pending'",
+                    (plan.plan_id,))
+            else:
+                plan.revision = int(row["revision"] or plan.revision or 1)
+            plan.content_hash = new_hash
+            conn.execute(
+                """
+                INSERT INTO plans(plan_id, project_id, goal, constraints, tasks, main_agent_id,
+                    model, status, raw, created_at, revision, content_hash)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    goal=excluded.goal, constraints=excluded.constraints, tasks=excluded.tasks,
+                    main_agent_id=excluded.main_agent_id, model=excluded.model,
+                    status=excluded.status, raw=excluded.raw,
+                    revision=excluded.revision, content_hash=excluded.content_hash
+                """,
+                (
+                    plan.plan_id, plan.project_id, plan.goal, _dumps(plan.constraints),
+                    _dumps([t.to_dict() for t in plan.tasks]), plan.main_agent_id, plan.model,
+                    plan.status, _dumps(plan.raw), plan.created_at,
+                    int(plan.revision), plan.content_hash,
+                ),
+            )
 
     def get_plan(self, plan_id: str) -> TaskPlan | None:
         row = self.db.query_one("SELECT * FROM plans WHERE plan_id=?", (plan_id,))
@@ -463,6 +605,8 @@ class Store:
             tasks=tasks, constraints=_j(row["constraints"], []),
             main_agent_id=row["main_agent_id"], model=row["model"], status=row["status"],
             created_at=row["created_at"], raw=_j(row["raw"], {}),
+            revision=int(row.get("revision") or 1),
+            content_hash=str(row.get("content_hash") or ""),
         )
 
     def list_plans(self, project_id: str, limit: int = 50) -> list[TaskPlan]:
@@ -485,13 +629,15 @@ class Store:
     def create_run(self, project_id: str, plan_id: str, *, main_agent: str, model: str,
                    base_commit: str, base_branch: str, status: str = "ready",
                    round_number: int = 1, max_rounds: int = 0,
-                   goal_status: str = "active") -> str:
-        run_id = new_id("run")
+                   goal_status: str = "active", approval_id: str = "",
+                   run_id: str = "") -> str:
+        run_id = run_id or new_id("run")
         self.db.execute(
-            "INSERT INTO runs(run_id, project_id, plan_id, status, main_agent_id, model, "
+            "INSERT INTO runs(run_id, project_id, plan_id, approval_id, status, main_agent_id, model, "
             "base_commit, base_branch, round_number, max_rounds, goal_status, "
-            "created_at, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, project_id, plan_id, status, main_agent, model, base_commit, base_branch,
+            "created_at, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, project_id, plan_id, approval_id, status, main_agent, model,
+             base_commit, base_branch,
              int(round_number), int(max_rounds), goal_status,
              now_iso(), now_iso() if status == "running" else ""),
         )
@@ -519,11 +665,20 @@ class Store:
         rows = self.list_runs(project_id, 1)
         return rows[0] if rows else None
 
+    def get_run_by_approval(self, approval_id: str) -> dict[str, Any] | None:
+        if not approval_id:
+            return None
+        row = self.db.query_one("SELECT * FROM runs WHERE approval_id=?", (approval_id,))
+        if row:
+            row["summary"] = _j(row["summary"], {})
+        return row
+
     def update_run(self, run_id: str, **fields: Any) -> None:
         allowed = {
             "status", "summary", "error", "started_at", "finished_at", "main_agent_id", "model",
             "acceptance_status", "release_status", "acceptance_at", "release_at",
-            "round_number", "max_rounds", "goal_status", "blocked_reason",
+            "round_number", "max_rounds", "goal_status", "blocked_reason", "epoch",
+            "owner_id",
         }
         assignments = []
         values = []
@@ -554,48 +709,54 @@ class Store:
     # ------------------------------------------------------------------
     def create_tasks(self, run_id: str, plan: TaskPlan, base_commit: str,
                      specs: list[TaskSpec] | None = None) -> list[Task]:
+        with self.db.transaction() as conn:
+            return self._insert_tasks_conn(conn, run_id, plan, base_commit, specs)
+
+    def _insert_tasks_conn(self, conn, run_id: str, plan: TaskPlan, base_commit: str,
+                           specs: list[TaskSpec] | None = None) -> list[Task]:
         tasks: list[Task] = []
         now = now_iso()
-        with self.db.transaction() as conn:
-            for spec in (specs if specs is not None else plan.topological_order()):
-                uid = f"{run_id}:{spec.task_id}"
-                conn.execute(
-                    """
-                    INSERT INTO tasks(uid, project_id, plan_id, run_id, task_id, parent_task_id, title,
-                        objective, type, role, model, suggested_agent, assigned_agent,
-                        scope, out_of_scope, dependencies,
-                        required_capabilities,
-                        input_artifacts, expected_outputs, acceptance_criteria, verification_commands,
-                        token_budget, time_limit_minutes, retry_limit, risk_level, approval_policy,
-                        priority, context_length, capability_level,
-                        status, created_at, updated_at, base_commit)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        uid, plan.project_id, plan.plan_id, run_id, spec.task_id, spec.parent_task_id,
-                        spec.title, spec.objective, spec.type, spec.role, spec.model,
-                        spec.suggested_agent,
-                        # A pinned model is an explicit chain binding; show the
-                        # effective agent immediately. Unpinned tasks stay blank
-                        # so the capability router can still choose.
-                        (spec.suggested_agent if spec.model else ""),
-                        _dumps(spec.scope),
-                        _dumps(spec.out_of_scope), _dumps(spec.dependencies),
-                        _dumps(spec.required_capabilities), _dumps(spec.input_artifacts),
-                        _dumps(spec.expected_outputs), _dumps(spec.acceptance_criteria),
-                        _dumps(spec.verification_commands), int(spec.token_budget),
-                        int(spec.time_limit_minutes), int(spec.retry_limit), spec.risk_level,
-                        spec.approval_policy, int(spec.priority),
-                        int(spec.context_length or 0), spec.capability_level or "",
-                        TaskStatus.QUEUED.value,
-                        now, now, base_commit,
-                    ),
-                )
-                tasks.append(Task(
-                    uid=uid, project_id=plan.project_id, plan_id=plan.plan_id, run_id=run_id,
-                    spec=spec, status=TaskStatus.QUEUED.value, base_commit=base_commit,
-                    created_at=now, updated_at=now,
-                ))
+        for spec in (specs if specs is not None else plan.topological_order()):
+            uid = f"{run_id}:{spec.task_id}"
+            conn.execute(
+                """
+                INSERT INTO tasks(uid, project_id, plan_id, run_id, task_id, parent_task_id,
+                    origin, supersedes, title,
+                    objective, type, role, model, suggested_agent, assigned_agent,
+                    scope, out_of_scope, dependencies,
+                    required_capabilities,
+                    input_artifacts, expected_outputs, acceptance_criteria, verification_commands,
+                    token_budget, time_limit_minutes, retry_limit, risk_level, approval_policy,
+                    priority, context_length, capability_level,
+                    status, created_at, updated_at, base_commit)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    uid, plan.project_id, plan.plan_id, run_id, spec.task_id, spec.parent_task_id,
+                    spec.origin or "user", _dumps(spec.supersedes),
+                    spec.title, spec.objective, spec.type, spec.role, spec.model,
+                    spec.suggested_agent,
+                    # A pinned model is an explicit chain binding; show the
+                    # effective agent immediately. Unpinned tasks stay blank
+                    # so the capability router can still choose.
+                    (spec.suggested_agent if spec.model else ""),
+                    _dumps(spec.scope),
+                    _dumps(spec.out_of_scope), _dumps(spec.dependencies),
+                    _dumps(spec.required_capabilities), _dumps(spec.input_artifacts),
+                    _dumps(spec.expected_outputs), _dumps(spec.acceptance_criteria),
+                    _dumps(spec.verification_commands), int(spec.token_budget),
+                    int(spec.time_limit_minutes), int(spec.retry_limit), spec.risk_level,
+                    spec.approval_policy, int(spec.priority),
+                    int(spec.context_length or 0), spec.capability_level or "",
+                    TaskStatus.QUEUED.value,
+                    now, now, base_commit,
+                ),
+            )
+            tasks.append(Task(
+                uid=uid, project_id=plan.project_id, plan_id=plan.plan_id, run_id=run_id,
+                spec=spec, status=TaskStatus.QUEUED.value, base_commit=base_commit,
+                created_at=now, updated_at=now,
+            ))
         return tasks
 
     def _task_from_row(self, row: dict[str, Any]) -> Task:
@@ -603,6 +764,8 @@ class Store:
             task_id=row["task_id"], title=row["title"], objective=row["objective"],
             type=row["type"], role=str(row.get("role") or ""), model=str(row.get("model") or ""),
             suggested_agent=row["suggested_agent"], parent_task_id=row["parent_task_id"],
+            origin=str(row.get("origin") or "user"),
+            supersedes=_j(row.get("supersedes"), []),
             scope=_j(row["scope"], []), out_of_scope=_j(row["out_of_scope"], []),
             dependencies=_j(row["dependencies"], []),
             required_capabilities=_j(row["required_capabilities"], []),
@@ -623,7 +786,9 @@ class Store:
             workdir=row["workdir"], task_dir=row["task_dir"], base_commit=row["base_commit"],
             patch_path=row["patch_path"], result_path=row["result_path"],
             verification_status=row["verification_status"], error=row["error"],
-            pid=int(row["pid"]), created_at=row["created_at"], updated_at=row["updated_at"],
+            pid=int(row["pid"]),
+            active_attempt_id=str(row.get("active_attempt_id") or ""),
+            created_at=row["created_at"], updated_at=row["updated_at"],
             started_at=row["started_at"], finished_at=row["finished_at"],
         )
 
@@ -651,6 +816,7 @@ class Store:
             "assigned_agent", "attempts", "workdir", "task_dir", "base_commit", "patch_path",
             "result_path", "verification_status", "error", "pid", "started_at", "finished_at",
             "role", "model", "suggested_agent", "context_length", "capability_level",
+            "active_attempt_id",
         }
         assignments = []
         values: list[Any] = []
@@ -665,6 +831,69 @@ class Store:
         values.append(now_iso())
         values.append(uid)
         self.db.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE uid=?", values)
+
+    # ------------------------------------------------------------------
+    # Execution attempts
+    # ------------------------------------------------------------------
+    def create_attempt(self, *, attempt_id: str, project_id: str, task_uid: str,
+                       run_id: str, attempt_number: int, request_id: str,
+                       purpose: str = "task", workdir: str = "",
+                       result_path: str = "", binding: dict[str, Any] | None = None,
+                       input_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        created = now_iso()
+        self.db.execute(
+            "INSERT INTO attempts(attempt_id, project_id, task_uid, run_id, attempt_number, "
+            "request_id, purpose, status, workdir, result_path, binding, input_snapshot, "
+            "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (attempt_id, project_id, task_uid, run_id, int(attempt_number), request_id,
+             purpose, "prepared", workdir, result_path, _dumps(binding or {}),
+             _dumps(input_snapshot or {}), created),
+        )
+        self.emit("task_state", {
+            "phase": "attempt_prepared", "attempt_id": attempt_id,
+            "task_uid": task_uid, "request_id": request_id,
+            "attempt_number": int(attempt_number),
+        }, correlation_id=task_uid)
+        return self.get_attempt(attempt_id) or {}
+
+    def update_attempt(self, attempt_id: str, **fields: Any) -> dict[str, Any]:
+        allowed = {
+            "status", "workdir", "result_path", "patch_path", "report_path",
+            "session_id", "binding", "input_snapshot", "error", "finished_at",
+        }
+        assignments = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValidationError(f"不允许更新 attempt 字段 {key}")
+            if key in ("binding", "input_snapshot") and not isinstance(value, str):
+                value = _dumps(value)
+            assignments.append(f"{key}=?")
+            values.append(value)
+        if not assignments:
+            return self.get_attempt(attempt_id) or {}
+        values.append(attempt_id)
+        self.db.execute(f"UPDATE attempts SET {', '.join(assignments)} WHERE attempt_id=?",
+                        values)
+        return self.get_attempt(attempt_id) or {}
+
+    def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        if not attempt_id:
+            return None
+        row = self.db.query_one("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,))
+        if row:
+            row["binding"] = _j(row.get("binding"), {})
+            row["input_snapshot"] = _j(row.get("input_snapshot"), {})
+        return row
+
+    def list_attempts(self, task_uid: str) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM attempts WHERE task_uid=? ORDER BY attempt_number",
+            (task_uid,))
+        for row in rows:
+            row["binding"] = _j(row.get("binding"), {})
+            row["input_snapshot"] = _j(row.get("input_snapshot"), {})
+        return rows
 
     def set_task_status(self, uid: str, status: str, *, error: str = "", force: bool = False) -> None:
         task = self.get_task(uid)
@@ -710,15 +939,18 @@ class Store:
     def save_result(self, task: Task, result: ResultPackage, *, valid: bool, error: str = "") -> None:
         self.db.execute(
             """
-            INSERT INTO results(task_uid, project_id, task_id, agent_id, status, payload, valid,
-                validation_error, received_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO results(task_uid, project_id, task_id, attempt_id, agent_id, status,
+                payload, valid, validation_error, received_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(task_uid) DO UPDATE SET
+                attempt_id=excluded.attempt_id,
                 agent_id=excluded.agent_id, status=excluded.status, payload=excluded.payload,
                 valid=excluded.valid, validation_error=excluded.validation_error,
                 received_at=excluded.received_at
             """,
-            (task.uid, task.project_id, task.task_id, str(result.payload.get("agent_id", "")),
+            (task.uid, task.project_id, task.task_id,
+             getattr(task, "active_attempt_id", "") or "",
+             str(result.payload.get("agent_id", "")),
              result.status, _dumps(result.payload), 1 if valid else 0, error, now_iso()),
         )
         self.emit("response", {
@@ -781,13 +1013,13 @@ class Store:
     # ------------------------------------------------------------------
     def add_change(self, change: ChangeRecord) -> None:
         self.db.execute(
-            "INSERT INTO changes(change_id, project_id, task_uid, agent_id, base_commit, base_hash, "
-            "before_hash, after_hash, files, patch_path, status, created_at, applied_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (change.change_id, change.project_id, change.task_uid, change.agent_id,
-             change.base_commit, change.base_hash, change.before_hash, change.after_hash,
-             _dumps(change.files), change.patch_path, change.status, change.created_at,
-             change.applied_at),
+            "INSERT INTO changes(change_id, project_id, task_uid, attempt_id, agent_id, "
+            "base_commit, base_hash, before_hash, after_hash, files, patch_path, status, "
+            "created_at, applied_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (change.change_id, change.project_id, change.task_uid, change.attempt_id,
+             change.agent_id, change.base_commit, change.base_hash, change.before_hash,
+             change.after_hash, _dumps(change.files), change.patch_path, change.status,
+             change.created_at, change.applied_at),
         )
         self.emit("file_change", {
             "change_id": change.change_id, "task_uid": change.task_uid,
@@ -836,14 +1068,49 @@ class Store:
         )
 
     def acquire_lease(self, project_id: str, pattern: str, task_uid: str, agent_id: str,
-                      mode: str = "write") -> str:
+                      mode: str = "write", owner_id: str = "") -> str:
         lease_id = new_id("lease")
         self.db.execute(
-            "INSERT INTO file_leases(lease_id, project_id, path_pattern, task_uid, agent_id, mode, "
-            "active, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (lease_id, project_id, pattern, task_uid, agent_id, mode, 1, now_iso()),
+            "INSERT INTO file_leases(lease_id, project_id, path_pattern, task_uid, owner_id, "
+            "agent_id, mode, active, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (lease_id, project_id, pattern, task_uid, owner_id, agent_id, mode, 1,
+             now_iso()),
         )
         return lease_id
+
+    # ------------------------------------------------------------------
+    # Controller instances / heartbeats
+    # ------------------------------------------------------------------
+    def register_controller_instance(self, instance_id: str, project_id: str, *,
+                                     host: str = "", pid: int = 0) -> None:
+        now = now_iso()
+        self.db.execute(
+            "INSERT INTO controller_instances(instance_id, project_id, host, pid, "
+            "started_at, heartbeat_epoch, active) VALUES(?,?,?,?,?,?,1) "
+            "ON CONFLICT(instance_id) DO UPDATE SET heartbeat_epoch=excluded.heartbeat_epoch, "
+            "active=1",
+            (instance_id, project_id, host, int(pid), now, time.time()),
+        )
+
+    def heartbeat_controller_instance(self, instance_id: str) -> None:
+        self.db.execute(
+            "UPDATE controller_instances SET heartbeat_epoch=? WHERE instance_id=?",
+            (time.time(), instance_id))
+
+    def deactivate_controller_instance(self, instance_id: str) -> None:
+        self.db.execute(
+            "UPDATE controller_instances SET active=0 WHERE instance_id=?",
+            (instance_id,))
+
+    def live_controller_ids(self, project_id: str, *, ttl_seconds: float = 30.0,
+                            exclude: str = "") -> set[str]:
+        cutoff = time.time() - float(ttl_seconds)
+        rows = self.db.query(
+            "SELECT instance_id FROM controller_instances WHERE project_id=? AND active=1 "
+            "AND heartbeat_epoch >= ?",
+            (project_id, cutoff))
+        return {str(r["instance_id"]) for r in rows
+                if str(r["instance_id"]) != str(exclude or "")}
 
     def active_leases(self, project_id: str) -> list[dict[str, Any]]:
         return self.db.query(
@@ -908,6 +1175,11 @@ class Store:
             )
         return [self.get_approval(r["approval_id"]) for r in rows]  # type: ignore[list-item]
 
+    def expire_approval(self, approval_id: str) -> None:
+        self.db.execute(
+            "UPDATE approvals SET status='expired' WHERE approval_id=? AND status='pending'",
+            (approval_id,))
+
     def decide_approval(self, approval_id: str, status: str, *, by: str, note: str = "") -> Approval:
         if status not in ("approved", "rejected"):
             raise ValidationError("审批结果必须是 approved/rejected")
@@ -925,6 +1197,90 @@ class Store:
             "task_uid": approval.task_uid,
         }, source=by, correlation_id=approval.run_id or approval.plan_id)
         return approval
+
+    def approve_plan_atomic(self, *, approval_id: str, plan_id: str, project_id: str,
+                            expected_hash: str, expected_revision: int,
+                            base_commit: str, base_branch: str, max_rounds: int,
+                            by: str = "user", note: str = "") -> tuple[str, int]:
+        """Approve a plan revision and create its run/tasks in one transaction.
+
+        The approval must belong to this project, kind and plan, and its
+        frozen (revision, content_hash) must match the stored plan.  The run is
+        unique per approval id, so a double click or a second controller cannot
+        create a second run for the same decision.
+        """
+        run_id = new_id("run")
+        with self.db.transaction() as conn:
+            plan_row = conn.execute(
+                "SELECT * FROM plans WHERE plan_id=?", (plan_id,)).fetchone()
+            if not plan_row:
+                raise NotFoundError(f"计划不存在: {plan_id}")
+            if plan_row["project_id"] != project_id:
+                raise ConflictError("审批对象不属于当前项目")
+            if plan_row["status"] != "pending_approval":
+                raise ConflictError(f"计划状态不是待审批: {plan_row['status']}")
+            if expected_hash and plan_row["content_hash"] != expected_hash:
+                raise ConflictError(
+                    "计划内容已变化，旧审批票据不能批准新修订",
+                    details={"expected_hash": expected_hash,
+                             "current_hash": plan_row["content_hash"]})
+            if int(expected_revision or 0) and int(plan_row["revision"] or 1) != int(expected_revision):
+                raise ConflictError(
+                    "计划修订号已变化，旧审批票据已失效",
+                    details={"expected_revision": expected_revision,
+                             "current_revision": plan_row["revision"]})
+            approval_row = conn.execute(
+                "SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
+            if not approval_row:
+                raise NotFoundError(f"审批不存在: {approval_id}")
+            if approval_row["project_id"] != project_id \
+                    or approval_row["kind"] != "plan" \
+                    or str(approval_row["plan_id"] or "") != plan_id:
+                raise ConflictError("审批票据与计划不匹配")
+            if approval_row["status"] != "pending":
+                raise ConflictError(f"审批已处理: {approval_id} ({approval_row['status']})")
+            details = _j(approval_row["details"], {})
+            if str(details.get("plan_hash") or "") != str(plan_row["content_hash"] or ""):
+                raise ConflictError("审批票据绑定的内容哈希与当前计划不一致")
+            if int(details.get("plan_revision") or 0) != int(plan_row["revision"] or 1):
+                raise ConflictError("审批票据绑定的修订号与当前计划不一致")
+            existing = conn.execute(
+                "SELECT run_id FROM runs WHERE approval_id=?", (approval_id,)).fetchone()
+            if existing:
+                return str(existing["run_id"]), 0
+
+            decided_at = now_iso()
+            updated = conn.execute(
+                "UPDATE approvals SET status='approved', decided_at=?, decided_by=?, note=? "
+                "WHERE approval_id=? AND status='pending'",
+                (decided_at, by, note, approval_id))
+            if updated.rowcount != 1:
+                raise ConflictError("审批已被其他请求处理")
+            conn.execute(
+                "UPDATE plans SET status='approved', approved_at=?, approval_id=? "
+                "WHERE plan_id=? AND status='pending_approval'",
+                (decided_at, approval_id, plan_id))
+            conn.execute(
+                "INSERT INTO runs(run_id, project_id, plan_id, approval_id, status, "
+                "main_agent_id, model, base_commit, base_branch, round_number, max_rounds, "
+                "goal_status, created_at, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, project_id, plan_id, approval_id, "ready",
+                 str(plan_row["main_agent_id"] or ""), str(plan_row["model"] or ""),
+                 base_commit, base_branch, 1, int(max_rounds), "active", decided_at, ""))
+            plan = self._plan_from_row(dict(plan_row))
+            plan.status = "approved"
+            tasks = self._insert_tasks_conn(conn, run_id, plan, base_commit)
+            # Outbox rows commit atomically with the approval/run/tasks.
+            self.emit("governance", {
+                "approval_id": approval_id, "kind": "plan", "status": "approved",
+                "plan_id": plan_id, "run_id": run_id, "decided_by": by,
+            }, source=by, correlation_id=run_id)
+            self.emit("workflow", {
+                "run_id": run_id, "plan_id": plan_id, "status": "ready",
+                "round_number": 1, "max_rounds": int(max_rounds),
+            }, correlation_id=run_id)
+        self.drain_outbox()
+        return run_id, len(tasks)
 
     def find_pending_approval(self, project_id: str, *, kind: str, subject: str = "",
                               plan_id: str = "", run_id: str = "") -> Approval | None:
@@ -953,12 +1309,13 @@ class Store:
         self.db.execute(
             "INSERT INTO usage_records(record_id, project_id, task_uid, run_id, agent_id, model, "
             "input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_calls, "
-            "retries, duration_ms, cost, estimated, status, created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "retries, duration_ms, cost, currency, cost_known, estimated, status, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (usage.record_id, usage.project_id, usage.task_uid, usage.run_id, usage.agent_id,
              usage.model, usage.input_tokens, usage.output_tokens, usage.cached_tokens,
              usage.reasoning_tokens, total, usage.tool_calls, usage.retries, usage.duration_ms,
-             float(usage.cost), 1 if usage.estimated else 0, usage.status, usage.created_at),
+             float(usage.cost), usage.currency or "USD", 1 if usage.cost_known else 0,
+             1 if usage.estimated else 0, usage.status, usage.created_at),
         )
 
     def usage_totals(self, project_id: str, *, run_id: str = "", task_uid: str = "") -> dict[str, Any]:
@@ -974,12 +1331,23 @@ class Store:
             "SELECT COUNT(*) AS records, COALESCE(SUM(input_tokens),0) AS input_tokens, "
             "COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
             "COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens, COALESCE(SUM(total_tokens),0) AS total_tokens, "
-            "COALESCE(SUM(cost),0) AS cost, COALESCE(SUM(tool_calls),0) AS tool_calls, "
+            "COALESCE(SUM(CASE WHEN currency='USD' AND cost_known=1 THEN cost ELSE 0 END),0) AS cost, "
+            "COALESCE(SUM(CASE WHEN currency='credits' THEN cost ELSE 0 END),0) AS credits, "
+            "COALESCE(SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END),0) AS unknown_cost_records, "
+            "COALESCE(SUM(tool_calls),0) AS tool_calls, "
             "COALESCE(SUM(retries),0) AS retries, COALESCE(SUM(duration_ms),0) AS duration_ms "
             f"FROM usage_records WHERE {' AND '.join(clauses)}",
             params,
         )
-        return row or {}
+        out = dict(row or {})
+        by_currency = self.db.query(
+            "SELECT currency, COUNT(*) AS records, ROUND(SUM(cost), 6) AS cost, "
+            "SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END) AS unknown_records "
+            f"FROM usage_records WHERE {' AND '.join(clauses)} GROUP BY currency",
+            params,
+        )
+        out["cost_by_currency"] = by_currency
+        return out
 
     def usage_by_agent(self, project_id: str, *, run_id: str = "") -> list[dict[str, Any]]:
         where = "project_id=?" + (" AND run_id=?" if run_id else "")
@@ -991,9 +1359,11 @@ class Store:
             "COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
             "COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens, "
             "COALESCE(SUM(total_tokens),0) AS total_tokens, "
-            "COALESCE(SUM(cost),0) AS cost, COALESCE(SUM(retries),0) AS retries, "
+            "COALESCE(SUM(cost),0) AS cost, MAX(currency) AS currency, "
+            "MIN(cost_known) AS cost_known, COALESCE(SUM(retries),0) AS retries, "
             "COALESCE(SUM(duration_ms),0) AS duration_ms "
-            f"FROM usage_records WHERE {where} GROUP BY agent_id, model ORDER BY total_tokens DESC",
+            f"FROM usage_records WHERE {where} "
+            "GROUP BY agent_id, model, currency ORDER BY total_tokens DESC",
             params,
         )
 
@@ -1020,6 +1390,8 @@ class Store:
                 cached_tokens=r["cached_tokens"], reasoning_tokens=r["reasoning_tokens"],
                 total_tokens=r["total_tokens"], tool_calls=r["tool_calls"],
                 retries=r["retries"], duration_ms=r["duration_ms"], cost=r["cost"],
+                currency=str(r.get("currency") or "USD"),
+                cost_known=bool(r.get("cost_known", 1)),
                 estimated=bool(r["estimated"]), status=r["status"], created_at=r["created_at"],
             )
             for r in rows
@@ -1516,6 +1888,31 @@ class Store:
             "UPDATE bus_subscriptions SET cursor_seq=?, updated_at=? WHERE subscription_id=?",
             (int(cursor_seq), now_iso(), subscription_id),
         )
+
+    def ack_bus_cursor(self, subscription_id: str, seq: int) -> None:
+        row = self.db.query_one(
+            "SELECT cursor_seq, acked_seq FROM bus_subscriptions WHERE subscription_id=?",
+            (subscription_id,))
+        if not row:
+            return
+        # A consumer can only acknowledge events that were actually delivered.
+        target = min(int(seq), int(row["cursor_seq"] or 0))
+        if target > int(row["acked_seq"] or 0):
+            self.db.execute(
+                "UPDATE bus_subscriptions SET acked_seq=?, updated_at=? "
+                "WHERE subscription_id=?",
+                (target, now_iso(), subscription_id),
+            )
+
+    def recent_bus_events(self, project_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM bus_events WHERE project_id=? ORDER BY seq DESC LIMIT ?",
+            (project_id, max(1, int(limit))),
+        )
+        rows.reverse()
+        for row in rows:
+            row["payload"] = _j(row.get("payload"), {})
+        return rows
 
     def deactivate_bus_subscription(self, subscription_id: str) -> None:
         self.db.execute(

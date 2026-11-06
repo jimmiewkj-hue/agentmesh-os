@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agentloop_hub.errors import ValidationError
-from conftest import default_plan, make_project, register_mock_agents
+from hub_test_support import default_plan, make_project, register_mock_agents
 
 
 def test_request_plan_with_mock_main(tmp_path):

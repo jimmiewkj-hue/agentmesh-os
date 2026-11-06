@@ -111,13 +111,16 @@ class TraeReader:
                 state.prefixed("AI.agent.model.recent_user_selection_by_agent_label"), {})
             selection = recent.get(trae.AGENT_LABEL, {}) if isinstance(recent, dict) else {}
             model = str(selection.get("modelId", "")) if isinstance(selection, dict) else ""
-            if _json_file_ready(self.completion_path):
-                # The agent wrote a complete structured result.  This is a
-                # stronger and faster completion signal than DOM stability.
+            if _json_file_ready(self.completion_path) and marker_seen \
+                    and saw_reply and finished and grew:
+                # The result file is evidence from this turn, not a terminal
+                # signal by itself.  The application must also report the
+                # assistant turn finished and the session must have grown
+                # since the request was sent.
                 return GuiReply(
                     session_id=str(session.get("sessionId") or ""),
                     text=(reply or text)[-60000:],
-                    model=model or expected_model,
+                    model=model,
                     transcript_path=str(state.db),
                     events=max(0, messages - baseline_messages),
                     usage={"source": "cdp-dom+state.vscdb+result-file",
@@ -152,6 +155,12 @@ class TraeReader:
             details={"marker": marker, "saw_reply": saw_reply,
                      "baseline_messages": baseline_messages},
         )
+
+    def has_marker(self, marker: str, *, started_at: float = 0.0) -> dict[str, Any]:
+        """Trae's visible body also contains the composer, so a marker there
+        does not prove the message was sent.  Report unsupported rather than
+        inventing an acceptance receipt."""
+        return {"ok": False, "reason": "NO_TRANSCRIPT_RECEIPT"}
 
     @staticmethod
     def _after_marker(text: str, marker: str) -> str:

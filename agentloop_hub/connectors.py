@@ -141,8 +141,20 @@ def is_auto_executable(agent: AgentRecord) -> bool:
     online agent with a known GUI app profile (window title + transcript reader).
     """
     kind = (agent.adapter_type or "").lower()
+    explicit = (agent.capabilities or {}).get("auto_executable")
+    if explicit is False:
+        return False
+    if explicit is True:
+        return agent.status not in ("offline", "error")
     if kind in ("cli", "opencode"):
-        return True
+        if agent.status in ("offline", "error"):
+            return False
+        config = agent.adapter_config or {}
+        command = config.get("command") or []
+        executable = str(config.get("executable") or "")
+        # CLI is non-interactive by nature, but "type only" is not evidence:
+        # there must be a configured command/executable.
+        return bool(executable or command)
     if kind == "gui_automation":
         config = agent.adapter_config or {}
         return bool(config.get("gui_app")) and agent.status not in ("offline", "error", "unknown")
@@ -157,14 +169,19 @@ def derive_capability_list(agent: AgentRecord) -> list[str]:
     Explicit capability keys win. Product-level assumptions are only added when
     the executable/store is actually present (status != offline).
     """
-    caps: set[str] = {name for name, enabled in (agent.capabilities or {}).items() if enabled}
+    capabilities = agent.capabilities or {}
+    caps: set[str] = {name for name, enabled in capabilities.items() if enabled}
+    explicitly_disabled = {name for name, enabled in capabilities.items()
+                           if enabled is False}
     installed = agent.status not in ("offline", "unknown") or bool(
         (agent.adapter_config or {}).get("executable")
     )
     if installed:
         profile = profile_for(agent.product.lower().replace(" ", "_")) or profile_for(agent.agent_id)
         if profile:
-            caps.update(profile.assumed)
+            # Product assumptions never override an explicit user/declared false.
+            caps.update(set(profile.assumed) - explicitly_disabled)
+    caps -= explicitly_disabled
     # Analysis requires a non-interactive CLI or a verified GUI automation
     # bridge. A file-relay GUI alone still needs a human and is excluded.
     if "read_files" in caps and agent.adapter_type in ("cli", "opencode", "gui_automation"):
@@ -194,6 +211,46 @@ def required_capabilities_for(spec: TaskSpec) -> list[str]:
     return sorted(required)
 
 
+def capability_evidence(agent: AgentRecord) -> dict[str, dict[str, Any]]:
+    """Per-capability evidence: declared / derived / disabled / probed.
+
+    A boolean list alone cannot distinguish an explicit user disable from a
+    product assumption or a real probe.
+    """
+    declared = dict(agent.capabilities or {})
+    evidence: dict[str, dict[str, Any]] = {}
+    profile = profile_for(agent.product.lower().replace(" ", "_")) or profile_for(agent.agent_id)
+    installed = agent.status not in ("offline", "unknown") or bool(
+        (agent.adapter_config or {}).get("executable"))
+    if profile and installed:
+        for name in profile.assumed:
+            evidence.setdefault(name, {"status": "declared",
+                                       "source": f"product_profile:{profile.agent_id}"})
+    for name, enabled in declared.items():
+        evidence[name] = {
+            "status": "declared" if enabled else "disabled",
+            "source": "agent.capabilities",
+        }
+    for name in derive_capability_list(agent):
+        evidence.setdefault(name, {"status": "derived", "source": "capability_rules"})
+    auto_ok = is_auto_executable(agent)
+    if not auto_ok:
+        auto_status = "unavailable"
+    elif str(agent.last_error or "").strip():
+        auto_status = "degraded"
+    else:
+        auto_status = "probed"
+    evidence["auto_executable"] = {
+        "status": auto_status,
+        "source": "adapter_config+status",
+        "adapter_type": agent.adapter_type,
+        "version": agent.version,
+        "checked_at": agent.last_seen,
+        "last_error": str(agent.last_error or "")[:300],
+    }
+    return evidence
+
+
 def agent_descriptor(agent: AgentRecord) -> dict[str, Any]:
     """Unified connector record: ``agent_id`` + ``capability`` list."""
     return {
@@ -209,6 +266,7 @@ def agent_descriptor(agent: AgentRecord) -> dict[str, Any]:
         "models": list(agent.models),
         "sandbox": bool((agent.permissions or {}).get("allowed_roots")),
         "auto_executable": is_auto_executable(agent),
+        "capability_evidence": capability_evidence(agent),
         "execution_mode": agent.adapter_type,
     }
 

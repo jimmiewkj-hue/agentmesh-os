@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agentloop_hub.models import Approval, MemoryType, TaskStatus
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def test_recovery_pauses_interrupted_task_and_releases_lease(tmp_path):

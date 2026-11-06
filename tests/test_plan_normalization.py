@@ -102,6 +102,9 @@ def test_scope_violation_policy_warns_or_fails():
     assert verifier._scope_severity(["src/main.js"], []) == "warning"
     assert verifier._scope_severity(["../outside.js"], []) == "failed"
     assert verifier._scope_severity([".env"], []) == "failed"
-    assert verifier._scope_severity(["src/main.js"], ["src/main.js"]) == "failed"
+    # warn: an explicit out_of_scope edit is reported but does not kill the
+    # task; only strict blocks it (plus traversal/secrets in every policy).
+    assert verifier._scope_severity(["src/main.js"], ["src/main.js"]) == "warning"
     strict = Verifier(None, None, SimpleNamespace(scope_violation_policy="strict"))
     assert strict._scope_severity(["src/main.js"], []) == "failed"
+    assert strict._scope_severity(["src/main.js"], ["src/main.js"]) == "failed"

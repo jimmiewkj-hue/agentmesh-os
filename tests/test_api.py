@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from agentloop_hub.api.server import JobManager, _make_handler
 from agentloop_hub.workspace import WorkspaceManager
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 @pytest.fixture()
@@ -43,10 +43,17 @@ def get(base: str, path: str) -> tuple[int, bytes]:
         return exc.code, exc.read()
 
 
+def control_token(base: str) -> str:
+    with urllib.request.urlopen(base + "/api/session", timeout=10) as res:
+        return json.loads(res.read())["token"]
+
+
 def post(base: str, path: str, body: dict) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base + path, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        base + path, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "X-AgentMesh-Token": control_token(base)})
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
             return res.status, json.loads(res.read())

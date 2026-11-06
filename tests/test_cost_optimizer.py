@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def simple_plan(goal: str, objective: str) -> dict:
@@ -34,15 +34,13 @@ def scenario_for(plan: dict, objective: str) -> dict:
     }
 
 
-def test_semantic_cache_reuses_similar_analysis(tmp_path):
+def test_similar_analysis_is_a_reference_not_a_cached_result(tmp_path):
     objective1 = "检查 calc.py 的加法实现并总结风险"
     objective2 = "排查 calc.py 的加法实现并总结风险"
     plan1 = simple_plan("scan one", objective1)
     plan2 = simple_plan("scan two", objective2)
     scenario = scenario_for(plan1, objective1)
     repo, hub, scenario_path = make_project(tmp_path, scenario=scenario)
-    # Second plan uses a paraphrased objective; exact cache must miss but
-    # semantic cache should hit because the file baseline is identical.
     scenario = scenario_for(plan2, objective2)
     scenario_path.write_text(json.dumps(scenario, ensure_ascii=False), encoding="utf-8")
 
@@ -56,13 +54,12 @@ def test_semantic_cache_reuses_similar_analysis(tmp_path):
         run_ids.append(run_id)
 
     hits = [e for e in hub.audit_events() if e["action"] == "task.cache_hit"]
-    assert hits
-    assert any(h["payload"].get("source") == "semantic_cache" for h in hits)
+    # A paraphrased objective is not proof of the same intent; it must not
+    # silently reuse a prior result or count as a saving.
+    assert not any(h["payload"].get("source") == "semantic_cache" for h in hits)
     savings = hub.cost_report()["savings"]
-    kinds = {row["kind"]: row for row in savings["by_kind"]}
-    assert "semantic_cache" in kinds
-    assert int(kinds["semantic_cache"]["tokens_saved"]) > 0
-    assert savings["semantic_cache"]["hits"] >= 1
+    assert savings["semantic_cache"]["hits"] == 0
+    assert savings["semantic_cache"]["entries"] >= 1
     hub.close()
 
 

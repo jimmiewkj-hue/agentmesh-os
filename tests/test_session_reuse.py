@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from conftest import make_project
+from hub_test_support import make_project
 
 from agentloop_hub.models import Task, TaskSpec
 
@@ -40,9 +40,11 @@ def test_repeated_agent_reuses_recorded_session_and_worktree(tmp_path):
     assert Path(resume["workdir"]) == Path(first)
 
     second = hub.runner._prepare_workdir(task2, run, agent, resume)
-    assert Path(second) == Path(first)
-    assert not (repo / ".agentloop" / "runs" / "run_reuse"
-                / "worktrees" / "T2").exists()
+    # The session continues, but each node keeps its own input/output
+    # boundary: T2 does not inherit T1's uncommitted/undeclared code changes.
+    assert Path(second) != Path(first)
+    assert (repo / ".agentloop" / "runs" / "run_reuse" / "worktrees" / "T2").exists()
+    assert Path(first).exists()
 
     mismatch = hub.runner._resume_session(task2, agent, "another-model")
     assert mismatch["resume"] is False
@@ -75,3 +77,56 @@ def test_completed_node_is_committed_to_shared_worktree(tmp_path):
     assert "T3" in log.stdout_text
     dirty = run_git(["status", "--short"], cwd=workdir, check=False)
     assert dirty.stdout_text.strip() == ""
+
+
+def test_same_agent_linear_chain_reuses_clean_session_worktree(tmp_path):
+    repo, hub, _ = make_project(tmp_path)
+    agent = hub.get_agent("mock_worker")
+    task = _task(hub, tmp_path, "T2")
+    task.spec.dependencies = ["T1"]
+    session = {"resume": True, "session_id": "sess-1",
+               "workdir": str(repo), "tasks": ["T1"]}
+    workdir = hub.runner._prepare_workdir(
+        task, {"base_commit": hub.project.commit}, agent, session)
+    assert Path(workdir) == Path(repo)
+    # Dirty tracked files are never treated as a valid snapshot.
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    task2 = _task(hub, tmp_path, "T3")
+    task2.spec.dependencies = ["T1", "T2"]
+    second = hub.runner._prepare_workdir(
+        task2, {"base_commit": hub.project.commit}, agent,
+        {"resume": True, "session_id": "sess-1", "workdir": str(repo),
+         "tasks": ["T1", "T2"]})
+    assert Path(second) != Path(repo)
+    hub.close()
+
+
+def test_missing_dependencies_are_composed_into_session_tree(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agentloop_hub.workspace import create_worktree, generate_patch, patch_files
+    from hub_test_support import init_repo
+
+    base = init_repo(tmp_path / "repo")
+    patch_wt = tmp_path / "patch-wt"
+    create_worktree(str(base), str(patch_wt), "HEAD")
+    (patch_wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    patch = tmp_path / "dep.patch"
+    generate_patch(str(patch_wt), str(patch))
+
+    from hub_test_support import make_project
+    (tmp_path / "proj").mkdir()
+    repo, hub, _ = make_project(tmp_path / "proj")
+    session_tree = tmp_path / "session-tree"
+    create_worktree(str(repo), str(session_tree), "HEAD")
+    task = Task(uid="run:T2", project_id=hub.project.project_id, plan_id="p",
+                run_id="r",
+                spec=TaskSpec(task_id="T2", title="t", objective="o",
+                              type="implementation", scope=["calc.py"],
+                              dependencies=["T1"]),
+                status="queued")
+    upstream = SimpleNamespace(task_id="T1", patch_path=str(patch))
+    monkeypatch.setattr(hub.runner, "_upstream_task_order", lambda _task: [upstream])
+    assert hub.runner._compose_missing_dependencies(task, str(session_tree), set())
+    assert "return a + b" in (session_tree / "calc.py").read_text(encoding="utf-8")
+    assert "calc.py" in patch_files(patch)
+    hub.close()

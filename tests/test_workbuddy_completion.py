@@ -181,3 +181,46 @@ def test_incomplete_provider_message_surfaces_stream_error(tmp_path, monkeypatch
     thread.join(timeout=2)
     assert info.value.code == "MODEL_STREAM_ERROR"
     assert "Empty stream" in info.value.message
+
+
+def test_adapter_ignores_stale_working_row_when_app_is_not_running(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from agentloop_hub.adapters import gui as gui_module
+    from test_gui_adapter import make_agent, make_request
+
+    class BusyReader:
+        page_id = ""
+
+        def active_sessions(self, **_kwargs):
+            return [{"id": "sess-dead", "cwd": "x", "title": "running",
+                     "status": "working", "last_activity_at": 1}]
+
+    class CdpResult:
+        ok = True
+
+        def to_dict(self):
+            return {"ok": True}
+
+    monkeypatch.setattr(gui_module, "create_reader", lambda *a, **k: BusyReader())
+    monkeypatch.setattr("agentloop_hub.control.apps.process_running",
+                        lambda image: False)
+    monkeypatch.setattr(gui_module, "ensure_workbuddy_cdp",
+                        lambda **kwargs: CdpResult())
+    adapter = gui_module.GuiAutomationAdapter(
+        make_agent("workbuddy"),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "executable": "C:/Program Files/WorkBuddy/WorkBuddy.exe",
+                "workbuddy_active_wait_seconds": 5},
+    )
+    request = make_request(tmp_path)
+    log_path = tmp_path / "gui.log"
+    try:
+        adapter._prepare_interface(
+            SimpleNamespace(app="workbuddy"), request, "prompt", "marker",
+            log_path, time.time() - 1,
+        )
+    except GuiAutomationError as exc:
+        assert exc.code != "APP_BUSY"
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("event") == "workbuddy_stale_session_ignored" for e in events)

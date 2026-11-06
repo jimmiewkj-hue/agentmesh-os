@@ -92,8 +92,29 @@ def make_request(tmp_path: Path, *, purpose: str = "task",
     )
 
 
-def test_gui_adapter_builds_strict_result_package(tmp_path):
+def _result_package(**overrides: Any) -> dict[str, Any]:
+    package = {
+        "task_id": "T1", "agent_id": "qoder_cn", "status": "completed",
+        "summary": "已修复 calc.py，pytest 3 passed",
+        "findings": [], "files_read": ["calc.py"],
+        "files_changed": ["calc.py"],
+        "commands_run": [{"tool": "Bash", "command": "pytest -q"}],
+        "tool_calls": [{"name": "Bash", "input": {"command": "pytest -q"}}],
+        "tests": [{"command": "pytest -q", "result": "passed"}],
+        "evidence": [{"file": "calc.py", "lines": "1-2", "description": "return a + b"}],
+        "risks": [], "unresolved_items": [], "artifacts": [],
+        "token_usage": {"input": 100, "output": 20, "total": 120},
+        "cost_estimate": {"amount": 0, "currency": "credits", "estimated": True},
+        "recommended_next_action": [],
+    }
+    package.update(overrides)
+    return package
+
+
+def test_gui_adapter_uses_agent_result_package(tmp_path):
     request = make_request(tmp_path)
+    package = _result_package()
+    Path(request.result_path).write_text(json.dumps(package), encoding="utf-8")
     reader = StubReader(GuiReply(
         session_id="sess-1", text="已修复 calc.py，pytest 3 passed",
         model="dfmodel", transcript_path=str(tmp_path / "transcript.jsonl"),
@@ -114,11 +135,12 @@ def test_gui_adapter_builds_strict_result_package(tmp_path):
     assert payload["task_id"] == "T1"
     assert payload["agent_id"] == "qoder_cn"
     assert payload["status"] == "completed"
-    assert "已修复" in payload["summary"]
+    assert payload["summary"] == package["summary"]
     assert payload["tool_calls"][0]["name"] == "Bash"
     assert payload["commands_run"][0]["command"] == "pytest -q"
     assert Path(outcome.result_path).exists()
-    assert json.loads(Path(outcome.result_path).read_text(encoding="utf-8"))["task_id"] == "T1"
+    # The agent's raw package stays the source of truth (no rebuilding).
+    assert json.loads(Path(request.result_path).read_text(encoding="utf-8")) == package
     assert outcome.usage.input_tokens == 100
     assert outcome.usage.output_tokens == 20
     assert outcome.session_id == "sess-1"
@@ -129,6 +151,64 @@ def test_gui_adapter_builds_strict_result_package(tmp_path):
     assert driver.sent[0].startswith("请完成 calc.py")
     # The GUI log is written to the task directory.
     assert (Path(request.task_dir) / "gui" / "gui.log").exists()
+
+
+def test_missing_result_package_is_not_synthesized(tmp_path):
+    request = make_request(tmp_path)
+    reader = StubReader(GuiReply(
+        session_id="sess-1", text="已修复 calc.py，pytest 3 passed",
+        model="dfmodel", transcript_path=str(tmp_path / "transcript.jsonl"),
+        tool_calls=[{"name": "Bash", "input": {"command": "pytest -q"}}],
+    ))
+    outcome = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=reader,
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
+    ).execute(request)
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "GUI_RESULT_MISSING"
+    assert outcome.result_payload is None
+    assert not Path(request.result_path).exists()
+
+
+def test_invalid_result_package_is_rejected_and_preserved(tmp_path):
+    request = make_request(tmp_path)
+    bad = _result_package(task_id="SOMEONE-ELSE")
+    Path(request.result_path).write_text(json.dumps(bad), encoding="utf-8")
+    reader = StubReader(GuiReply(
+        session_id="sess-1", text="done", model="dfmodel",
+        transcript_path=str(tmp_path / "transcript.jsonl"),
+    ))
+    outcome = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=reader,
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
+    ).execute(request)
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "GUI_RESULT_INVALID"
+    # The invalid raw package is diagnosis evidence, not rewritten to success.
+    assert json.loads(Path(request.result_path).read_text(encoding="utf-8")) == bad
+
+
+def test_failed_result_status_is_not_upgraded(tmp_path):
+    request = make_request(tmp_path)
+    failed = _result_package(status="failed", summary="tests still fail",
+                             unresolved_items=["unit test failure"])
+    Path(request.result_path).write_text(json.dumps(failed), encoding="utf-8")
+    reader = StubReader(GuiReply(
+        session_id="sess-1", text="tests still fail", model="dfmodel",
+        transcript_path=str(tmp_path / "transcript.jsonl"),
+    ))
+    outcome = GuiAutomationAdapter(
+        make_agent(), driver=StubDriver(), reader=reader,
+        config={"mode": "gui_automation", "gui_app": "qoder_cn",
+                "allow_gui_model_fallback": True},
+    ).execute(request)
+
+    assert outcome.result_payload["status"] == "failed"
+    assert outcome.result_payload["unresolved_items"] == ["unit test failure"]
 
 
 def test_gui_adapter_plan_extracts_fenced_json(tmp_path):
@@ -491,3 +571,35 @@ def test_workbuddy_prepare_resumes_existing_session(tmp_path, monkeypatch):
     assert not switch_calls
     assert not prepare_calls
     assert verify_calls and verify_calls[0]["session_id"] == "sess-1"
+
+
+def test_selection_sync_retries_before_user_storage_boots(monkeypatch):
+    from agentloop_hub.gui import cdp
+
+    monkeypatch.setattr(cdp, "_targets", lambda port: [
+        {"webSocketDebuggerUrl": "ws://stub", "id": "p1", "type": "page",
+         "title": "WorkBuddy"}])
+    responses = [
+        {"result": {"result": {"value": {"ok": False,
+                                         "reason": "NO_USER_STORAGE"}}}},
+        {"result": {"result": {"value": {"ok": True, "changed": False,
+                                         "suffix": "u1"}}}},
+    ]
+
+    class StubTransport:
+        def __init__(self, url, origin="", timeout=10.0):
+            self.url = url
+
+        def call(self, method, params, timeout=10.0):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cdp, "WebSocketTransport", StubTransport)
+    monkeypatch.setattr(cdp.time, "sleep", lambda seconds: None)
+    out = cdp.sync_workbuddy_selection_preferences(
+        port=9223, model_id="glm-5.3-flash", context_length=1000000,
+        capability_level="max", retry_seconds=5.0)
+    assert out["ok"] is True
+    assert not responses

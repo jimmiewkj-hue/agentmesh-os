@@ -181,3 +181,13 @@ def test_task_state_machine_rejects_invalid_transition():
         assert_task_transition(TaskStatus.COMPLETED.value, TaskStatus.RUNNING.value)
     with pytest.raises(StateTransitionError):
         assert_task_transition(TaskStatus.RUNNING.value, TaskStatus.QUEUED.value)
+
+
+def test_scope_entries_strip_planner_parenthetical_annotations():
+    from agentloop_hub.models import normalize_scope_entries
+
+    entries = normalize_scope_entries([
+        "docs/建模管线.md（参数与重建说明草稿）",
+        "src/scene/sky.js (fog and sky)",
+    ])
+    assert entries == ["docs/建模管线.md", "src/scene/sky.js"]

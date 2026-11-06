@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import DEFAULT_SUMMARY, plan, task
+from verify_support import DEFAULT_SUMMARY, plan, task
 
 from agentloop_hub.errors import ValidationError
 from agentloop_hub.hub import Hub
@@ -37,7 +37,7 @@ def _scenario() -> dict:
 
 @pytest.fixture()
 def chain_env(tmp_path: Path):
-    from conftest import Env, build_repo, write_json
+    from verify_support import Env, build_repo, write_json
 
     repo = build_repo(tmp_path)
     summary = write_json(tmp_path / "summary.json", DEFAULT_SUMMARY)
@@ -105,7 +105,13 @@ def test_chain_status_reports_the_model_used_per_stage(chain_env):
     assert status["goal"] == "scan -> review -> test"
 
 
-def test_http_chain_endpoint_configures_and_reports(chain_env):
+def test_http_chain_endpoint_saves_without_running_then_explicit_start(chain_env):
+    """HTTP chain follows the same save -> approve -> start governance gate.
+
+    A bare POST must only persist a pending plan; approving and starting needs
+    an explicit request.  The old default of creating a run on POST is exactly
+    the implicit execution path the audit removed.
+    """
     from agentloop_hub.api.server import JobManager, _make_handler
 
     handler = _make_handler(chain_env.hub, JobManager(), None)
@@ -114,13 +120,29 @@ def test_http_chain_endpoint_configures_and_reports(chain_env):
     thread.start()
     try:
         port = server.server_address[1]
-        body = json.dumps({"goal": "scan -> review -> test", "stages": STAGES,
-                           "start": True, "background": False, "max_parallel": 1})
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/chain", data=body.encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(request, timeout=180) as response:
-            created = json.loads(response.read().decode("utf-8"))
+
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/session", timeout=10) as response:
+            token = json.loads(response.read().decode("utf-8"))["token"]
+
+        def post(payload: dict) -> dict:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/chain",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "X-AgentMesh-Token": token}, method="POST")
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        saved = post({"goal": "scan -> review -> test", "stages": STAGES})
+        assert saved["status"] == "pending_approval"
+        assert saved["run_id"] == ""
+        assert saved["approval_id"]
+        assert chain_env.hub.runs() == []
+
+        created = post({"goal": "scan -> review -> test", "stages": STAGES,
+                        "approve": True, "start": True, "background": False,
+                        "max_parallel": 1})
         assert created["run_id"]
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/chain?run_id={created['run_id']}",
@@ -130,54 +152,6 @@ def test_http_chain_endpoint_configures_and_reports(chain_env):
     finally:
         server.shutdown()
         server.server_close()
-
-
-def test_recommend_models_prefers_free_but_keeps_quality(chain_env):
-    chain_env.hub.register_agent_models("scanner", ["mock/model-a", "opencode/probe-free"])
-    rec = chain_env.hub.recommend_models(task_type="analysis", profile="cost_first")
-    assert rec["recommended"] is not None
-    assert rec["recommended"]["model"] == "opencode/probe-free"
-    assert rec["recommended"]["cost"] == 0.0
-    assert rec["recommended"]["cost_source"] == "free_model"
-
-
-def test_recommend_models_exposes_quality_and_cost_sources(chain_env):
-    rec = chain_env.hub.recommend_models(task_type="implementation", profile="balanced")
-    assert rec["profile"] == "balanced"
-    assert rec["recommended"]["cost_source"] in ("free_model", "trae_catalog_rate", "estimated")
-    assert 0.0 <= rec["recommended"]["quality"] <= 1.0
-    assert rec["note"]
-
-
-def test_preflight_cli_agents_binds_workspace_without_opening_apps(chain_env):
-    report = chain_env.hub.preflight_agents(
-        [{"agent_id": "scanner", "model": "mock/model-a"},
-         {"agent_id": "tester", "model": "mock/model-a"}],
-        workspace=str(chain_env.repo), open_apps=False)
-    assert report["total"] == 2
-    assert report["ready"] == 2, report
-    for item in report["agents"]:
-        assert item["workspace_set"] is True
-        assert item["model_set"] is True
-        assert item["ok"] is True
-
-
-def test_preflight_rejects_unknown_model(chain_env):
-    report = chain_env.hub.preflight_agents(
-        [{"agent_id": "scanner", "model": "not-a-real-model"}],
-        workspace=str(chain_env.repo), open_apps=False)
-    assert report["ready"] == 0
-    assert "真实模型清单" in report["agents"][0]["error"]
-
-
-def test_run_bindings_report_per_stage(chain_env):
-    out = chain_env.hub.configure_chain(goal="scan -> review -> test", stages=STAGES,
-                                       start=True, background=False)
-    bindings = chain_env.hub.run_bindings(out["run_id"])
-    assert len(bindings["stages"]) == 3
-    assert {row["agent_id"] for row in bindings["stages"]} == {"scanner", "reviewer", "tester"}
-    assert all(row["model"] == "mock/model-a" for row in bindings["stages"])
-    assert all(row["workspace"] for row in bindings["stages"])
 
 
 def test_recommend_models_prefers_free_but_keeps_quality(chain_env):

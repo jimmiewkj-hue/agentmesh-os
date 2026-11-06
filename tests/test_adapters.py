@@ -12,7 +12,7 @@ from agentloop_hub.adapters.opencode import OpenCodeAdapter
 from agentloop_hub.adapters.relay import FileRelayAdapter, ManualAdapter
 from agentloop_hub.models import AgentRecord, Task, TaskSpec
 from agentloop_hub.util import sha256_file
-from conftest import MOCK_AGENT
+from hub_test_support import MOCK_AGENT
 
 
 def make_task(tmp_path, task_id="T1", *, type="implementation") -> Task:

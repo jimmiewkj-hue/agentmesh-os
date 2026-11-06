@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import secrets
+import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +32,17 @@ from ..util import new_id, now_iso, tail_text
 from ..workspace.manager import WorkspaceManager
 
 
+MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_header_name(value: str) -> str:
+    try:
+        return str(urlparse("http://" + str(value or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
 STATUS_MAP = {
     "not_found": HTTPStatus.NOT_FOUND,
     "validation_error": HTTPStatus.BAD_REQUEST,
@@ -46,29 +60,73 @@ STATUS_MAP = {
 
 
 class JobManager:
-    def __init__(self):
+    def __init__(self, path: str | Path | None = None):
+        self.path = Path(path) if path else None
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        if self.path and self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            for job in (data.get("jobs") if isinstance(data, dict) else []) or []:
+                if not isinstance(job, dict) or not job.get("job_id"):
+                    continue
+                if job.get("status") == "running":
+                    # The worker thread died with the previous process.
+                    job["status"] = "interrupted"
+                    job["error"] = {
+                        "code": "service_restarted",
+                        "message": "控制服务重启，任务是否完成需查看计划/运行记录",
+                    }
+                    job["business_status"] = "unknown"
+                self._jobs[str(job["job_id"])] = job
+
+    def _persist(self) -> None:
+        if not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"jobs": sorted(self._jobs.values(),
+                                      key=lambda j: j.get("created_at", ""), reverse=True)[:100]}
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, default=str),
+                           encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception:
+            pass
 
     def submit(self, label: str, fn: Callable[[], Any]) -> str:
         job_id = new_id("job")
-        job = {"job_id": job_id, "label": label, "status": "running",
-               "created_at": now_iso(), "result": None, "error": None}
+        job = {"job_id": job_id, "label": label, "phase": "running",
+               "status": "running", "created_at": now_iso(),
+               "result": None, "error": None, "business_status": "running"}
         with self._lock:
             self._jobs[job_id] = job
+            self._persist()
 
         def runner() -> None:
             try:
                 result = fn()
                 job["result"] = result
                 job["status"] = "completed"
+                # Thread completion is not business completion: keep both facts.
+                business = ""
+                if isinstance(result, dict):
+                    business = str(result.get("status") or "")
+                job["business_status"] = business or "completed"
+                job["phase"] = business or "completed"
             except Exception as exc:
                 job["error"] = exc.to_dict() if isinstance(exc, HubError) else {
                     "code": "internal_error", "message": str(exc)
                 }
                 job["status"] = "failed"
+                job["business_status"] = "failed"
+                job["phase"] = "failed"
             finally:
                 job["finished_at"] = now_iso()
+                with self._lock:
+                    self._persist()
 
         threading.Thread(target=runner, name=f"job-{job_id}", daemon=True).start()
         return job_id
@@ -115,7 +173,9 @@ class HubServer:
         self.host = host
         self.port = port
         self.manager = WorkspaceManager(self.project_root)
-        self.jobs = JobManager()
+        jobs_path = (Path(self.project_root) / ".agentloop" / "jobs.json"
+                     if self.project_root else None)
+        self.jobs = JobManager(jobs_path)
         handler = _make_handler(None, self.jobs, self.manager)
         self.httpd = ThreadingHTTPServer((host, port), handler)
         self.httpd.daemon_threads = True
@@ -179,6 +239,10 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
     if provider is None:
         raise ConfigError("需要 Hub 或 WorkspaceManager")
     static_dir = Path(__file__).parent / "static"
+    # Per-process control token.  The UI reads it from /api/session; a
+    # cross-origin page cannot read that response (no CORS headers) and every
+    # mutating request must carry it.
+    auth_token = secrets.token_urlsafe(32)
 
     def current_hub() -> Hub:
         return provider.require()  # type: ignore[union-attr]
@@ -204,6 +268,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0:
                 return {}
+            if length > MAX_REQUEST_BODY_BYTES:
+                raise ValidationError(
+                    f"请求体过大（{length} 字节，上限 {MAX_REQUEST_BODY_BYTES}）")
             raw = self.rfile.read(length)
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -211,14 +278,75 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 raise ValidationError(f"请求体不是有效 JSON: {exc}")
             return data if isinstance(data, dict) else {"value": data}
 
+        def _drain_body(self) -> None:
+            """Read and discard a rejected request body before replying.
+
+            On Windows a client still writing a body can otherwise see
+            WSAECONNABORTED instead of the intended 403/415 response.
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if 0 < length <= MAX_REQUEST_BODY_BYTES:
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
+
         def _error(self, exc: Exception) -> None:
             if isinstance(exc, HubError):
                 status = STATUS_MAP.get(exc.code, HTTPStatus.INTERNAL_SERVER_ERROR)
                 self._json(status, {"error": exc.to_dict()})
             else:
+                # The public response carries an actionable id; the traceback
+                # stays in the local console log only.
+                error_id = uuid.uuid4().hex[:12]
+                print(f"[api-error {error_id}] {type(exc).__name__}: {exc}\n"
+                      f"{traceback.format_exc()}", file=sys.stderr)
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
-                           {"error": {"code": "internal_error", "message": str(exc),
-                                      "traceback": traceback.format_exc()[-3000:]}})
+                           {"error": {"code": "internal_error",
+                                      "message": "服务器内部错误，请用错误编号查看本地日志",
+                                      "error_id": error_id}})
+
+        def _require_local(self) -> None:
+            """All control endpoints are loopback-only and host/origin checked."""
+            peer = ""
+            try:
+                peer = str(self.client_address[0] or "")
+            except (AttributeError, IndexError, TypeError):
+                peer = ""
+            if not is_loopback_address(peer):
+                raise PermissionDeniedError(
+                    f"控制接口仅允许本机访问（请求来自 {peer or '未知地址'}）")
+            host = _host_header_name(str(self.headers.get("Host") or ""))
+            if host and host not in LOCAL_HOSTNAMES:
+                raise PermissionDeniedError(f"Host 不是本机地址: {host}")
+            origin = str(self.headers.get("Origin") or "").strip()
+            if origin:
+                parsed = urlparse(origin)
+                if (parsed.hostname or "").lower() not in LOCAL_HOSTNAMES:
+                    raise PermissionDeniedError(f"跨源请求被拒绝: {origin}")
+
+        def _guard_write(self, *, require_json: bool = True) -> None:
+            try:
+                self._require_local()
+            except Exception:
+                self._drain_body()
+                raise
+            token = str(self.headers.get("X-AgentMesh-Token") or "")
+            if not secrets.compare_digest(token, auth_token):
+                self._drain_body()
+                raise PermissionDeniedError("缺少或错误的控制令牌")
+            if require_json:
+                ctype = str(self.headers.get("Content-Type") or "").split(";")[0]
+                if ctype.strip().lower() != "application/json":
+                    self._drain_body()
+                    raise PermissionDeniedError("写入请求必须使用 application/json")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > MAX_REQUEST_BODY_BYTES:
+                    raise ValidationError(
+                        f"请求体过大（{length} 字节，上限 {MAX_REQUEST_BODY_BYTES}）")
 
         def _require_loopback(self) -> None:
             """Filesystem browsing is a local-only capability.
@@ -260,9 +388,16 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
             try:
                 if path == "/api/stream":
+                    self._require_local()
                     self._stream(query)
                     return
+                if path == "/api/session":
+                    self._require_local()
+                    self._json(200, {"token": auth_token,
+                                     "host": self.headers.get("Host", "")})
+                    return
                 if path.startswith("/api/"):
+                    self._require_local()
                     self._route_get(path, query)
                 elif not self._static(path):
                     self.send_error(404)
@@ -272,6 +407,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
+                self._guard_write()
                 self._route_post(unquote(parsed.path), self._body())
             except Exception as exc:
                 self._error(exc)
@@ -279,6 +415,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
         def do_DELETE(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
+                self._guard_write(require_json=False)
                 hub = current_hub()
                 parts = unquote(parsed.path).strip("/").split("/")
                 if parts[:2] == ["api", "agents"] and len(parts) == 3:
@@ -314,14 +451,21 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             after_seq = int(query.get("after_seq", "0") or 0)
             interval = min(10.0, max(0.4, float(query.get("interval", "1.5") or 1.5)))
             run_id = query.get("run_id", "")
+            project_id = current_hub().project.project_id
             offsets: dict[str, int] = {}
             last_snapshot = 0.0
             last_ping = time.monotonic()
-            if not self._sse("hello", {"status": "connected", "time": now_iso()}):
+            if not self._sse("hello", {"status": "connected", "time": now_iso(),
+                                       "project_id": project_id}):
                 return
             try:
                 while True:
                     hub = current_hub()
+                    if hub.project.project_id != project_id:
+                        # A cursor from another project must never be reused.
+                        self._sse("project_changed", {
+                            "from": project_id, "to": hub.project.project_id})
+                        return
                     events = hub.bus_events(after_seq=after_seq, limit=400)["events"]
                     for event in events:
                         after_seq = int(event["seq"])
@@ -685,7 +829,8 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                         max_parallel=int(body.get("max_parallel", 1) or 1),
                         start=bool(body.get("start", True)),
                         background=bool(body.get("background", True)),
-                        polish=bool(body.get("polish", False)), **common))
+                        polish=bool(body.get("polish", False)),
+                        approve=bool(body.get("approve", False)), **common))
                     self._json(202, {"job_id": job_id})
                 else:
                     self._json(200, hub.solve(
@@ -693,7 +838,8 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                         max_parallel=int(body.get("max_parallel", 1) or 1),
                         start=bool(body.get("start", True)),
                         background=bool(body.get("background", True)),
-                        polish=bool(body.get("polish", False)), **common))
+                        polish=bool(body.get("polish", False)),
+                        approve=bool(body.get("approve", False)), **common))
                 return
             if path == "/api/segment":
                 self._json(200, hub.segment_goal(
@@ -730,7 +876,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 result = hub.preflight_agents(
                     list(body.get("stages") or []),
                     workspace=str(body.get("workspace", "")),
-                    open_apps=bool(body.get("open_apps", True)),
+                    open_apps=bool(body.get("open_apps", False)),
                     full_control=bool(body.get("full_control", True)),
                     config=dict(body.get("config") or {}),
                 )
@@ -776,6 +922,11 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.bus_poll(
                     str(body.get("subscription_id", "")),
                     limit=int(body.get("limit", 100) or 100)))
+                return
+            if path == "/api/bus/ack":
+                self._json(200, hub.bus_ack(
+                    str(body.get("subscription_id", "")),
+                    int(body.get("seq", 0) or 0)))
                 return
             if path == "/api/bus/unsubscribe":
                 self._json(200, hub.bus_unsubscribe(str(body.get("subscription_id", ""))))
@@ -900,11 +1051,33 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "release":
                 self._json(200, hub.request_release(parts[2]))
                 return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "summary":
+                self._json(200, hub.submit_summary(parts[2], body.get("summary") or body))
+                return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] in ("result", "submit-result"):
-                self._json(200, hub.submit_result(parts[2], body.get("payload") or body.get("path") or body))
+                self._json(200, hub.submit_result(
+                    parts[2], body.get("payload") or body.get("path") or body,
+                    attempt_id=str(body.get("attempt_id", "")),
+                    request_id=str(body.get("request_id", ""))))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "retry":
                 self._json(200, hub.retry_task(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "resume-interrupted":
+                self._json(200, hub.resume_interrupted(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "repair":
+                self._json(200, hub.repair_task(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "reconcile":
+                self._json(200, hub.reconcile_task(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "capture-artifacts":
+                self._json(200, hub.capture_artifacts(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "adopt-attempt":
+                self._json(200, hub.runner.adopt_attempt_result(
+                    parts[2], str(body.get("attempt_id", ""))))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "reverify":
                 self._json(200, hub.reverify_task(parts[2]))
@@ -918,6 +1091,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                                     if body.get("context_length") is not None else None),
                     capability_level=(str(body.get("capability_level"))
                                       if body.get("capability_level") is not None else None),
+                    requeue=bool(body.get("requeue", False)),
                 ))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "cancel":
@@ -935,6 +1109,11 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                                     commit=bool(body.get("commit", False)))\
                     if approval_id else hub.merge(run_id, commit=bool(body.get("commit", False)))
                 self._json(200, outcome)
+                return
+            if path == "/api/merge/recheck":
+                self._json(200, hub.recheck_merge(
+                    str(body.get("run_id", "")),
+                    commit=bool(body.get("commit", True))))
                 return
             if path.startswith("/api/rollback/"):
                 kind = path.split("/")[-1]

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
 from ..adapters import create_adapter
 from ..adapters.base import ExecutionRequest
-from ..errors import NotFoundError, ValidationError
+from ..errors import ConflictError, NotFoundError, ValidationError
 from ..workspace import create_worktree
 from ..models import (
     AgentRecord, Project, Task, TaskPlan, TaskSpec, TaskStatus,
@@ -106,13 +107,26 @@ class PlanningService:
             workdir=workspace, task_dir=str(prompt_path.parent),
             token_budget=self.config.default_plan_token_budget,
         )
+        attempt_id = new_id("att")
+        request_id = uuid.uuid4().hex
+        request_marker = f"AGENTMESH_GUI_MARKER_PLAN_{request_id}"
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
             task=synthetic, workdir=workspace, task_dir=str(prompt_path.parent),
             prompt_path=str(prompt_path), result_path=str(agent_plan_path),
+            attempt_id=attempt_id, request_id=request_id,
+            metadata={"request_marker": request_marker},
             model=model or (self._main_model() or ""),
             timeout_seconds=self.config.plan_timeout_seconds, purpose="plan",
             full_control=bool(self.config.full_control),
+        )
+        self.store.create_attempt(
+            attempt_id=attempt_id, project_id=self.project.project_id,
+            task_uid=synthetic.uid, run_id="", attempt_number=1,
+            request_id=request_id, purpose="plan", workdir=str(workspace),
+            result_path=str(agent_plan_path),
+            binding={"marker": request_marker, "phase": "plan"},
+            input_snapshot={"goal": goal, "plan_id": plan_id},
         )
         self.audit.log("control-plane", "workspace.created", subject=plan_id,
                        payload={"expected": workspace, "kind": "plan",
@@ -129,6 +143,15 @@ class PlanningService:
         write_json(activity_path, activity)
         adapter = create_adapter(main)
         outcome = adapter.execute(request)
+        self.store.update_attempt(
+            attempt_id, status=outcome.status, session_id=outcome.session_id,
+            result_path=outcome.result_path or str(agent_plan_path),
+            binding={"marker": request_marker, "phase": "plan",
+                     "submission": outcome.submission_receipt,
+                     "model_evidence": (outcome.extras or {}).get(
+                         "model_evidence", {})},
+            error=outcome.error[:500], finished_at=now_iso(),
+        )
         activity.update({
             "status": outcome.status, "error": outcome.error[:500],
             "finished_at": now_iso(), "duration_ms": outcome.duration_ms,
@@ -255,8 +278,11 @@ class PlanningService:
         if result.get("status") != "completed":
             return result
         try:
+            payload = dict(result["plan"])
+            for internal in ("revision", "content_hash", "status", "created_at"):
+                payload.pop(internal, None)
             plan = TaskPlan.from_dict(
-                result["plan"], project_id=self.project.project_id,
+                payload, project_id=self.project.project_id,
                 plan_id=str(result["plan_id"]),
             )
         except ValidationError as exc:
@@ -408,37 +434,66 @@ class PlanningService:
         plan = self.store.get_plan(plan_id)
         if not plan:
             raise NotFoundError(f"计划不存在: {plan_id}")
-        if plan.status != "pending_approval":
-            raise ValidationError(f"计划状态不是待审批: {plan.status}")
-        if self.governance:
-            self.governance.require_architecture(plan)
         approval = self.store.get_approval(approval_id) if approval_id else \
             self.approvals.ensure_plan_approval(plan)
         if not approval:
             raise NotFoundError(f"审批不存在: {approval_id}")
-        if approval.status == "pending":
-            approval = self.approvals.decide(approval.approval_id, approved=True, note=note, by=by)
-        if approval.status != "approved":
-            self.store.update_plan_status(plan_id, "rejected", approval_id=approval.approval_id)
-            self.audit.log(by, "plan.rejected", subject=plan_id, payload={"note": note})
-            return {"status": "rejected", "plan_id": plan_id}
+        if approval.project_id != self.project.project_id \
+                or approval.kind != "plan" or approval.plan_id != plan_id:
+            raise ConflictError(
+                "审批票据不属于该计划",
+                details={"approval_id": approval.approval_id,
+                         "kind": approval.kind, "plan_id": approval.plan_id},
+            )
+        if approval.status == "approved":
+            existing = self.store.get_run_by_approval(approval.approval_id)
+            if existing:
+                return {"status": "approved", "plan_id": plan_id,
+                        "run_id": existing["run_id"],
+                        "approval_id": approval.approval_id,
+                        "tasks": len(self.store.list_tasks(existing["run_id"])),
+                        "idempotent": True}
+            raise ConflictError("审批已通过但对应运行缺失，拒绝再次创建运行")
+        if approval.status != "pending":
+            raise ConflictError(f"审批已失效或被拒绝: {approval.approval_id} "
+                                f"({approval.status})")
+        if plan.status != "pending_approval":
+            raise ConflictError(f"计划状态不是待审批: {plan.status}")
+        details = approval.details or {}
+        if str(details.get("plan_hash") or "") != str(plan.content_hash or ""):
+            raise ConflictError(
+                "审批票据绑定的内容哈希与当前计划不一致，请重新审批",
+                details={"ticket_hash": details.get("plan_hash"),
+                         "plan_hash": plan.content_hash},
+            )
+        if int(details.get("plan_revision") or 0) != int(plan.revision or 1):
+            raise ConflictError(
+                "审批票据绑定的修订号与当前计划不一致，请重新审批",
+                details={"ticket_revision": details.get("plan_revision"),
+                         "plan_revision": plan.revision},
+            )
+        if self.governance:
+            self.governance.require_architecture(plan)
 
-        self.store.update_plan_status(plan_id, "approved", approved_at=now_iso(),
-                                      approval_id=approval.approval_id)
         base_commit = self.project.commit
-        run_id = self.store.create_run(
-            self.project.project_id, plan_id, main_agent=plan.main_agent_id,
-            model=plan.model, base_commit=base_commit, base_branch=self.project.branch,
-            status="ready", round_number=1,
-            max_rounds=int(self.config.max_rounds),
+        run_id, task_count = self.store.approve_plan_atomic(
+            approval_id=approval.approval_id, plan_id=plan_id,
+            project_id=self.project.project_id,
+            expected_hash=plan.content_hash,
+            expected_revision=int(plan.revision or 1),
+            base_commit=base_commit, base_branch=self.project.branch,
+            max_rounds=int(self.config.max_rounds), by=by, note=note,
         )
-        tasks = self.store.create_tasks(run_id, plan, base_commit)
+        if not task_count:
+            task_count = len(self.store.list_tasks(run_id))
         self.checkpoints.create("plan_approved", run_id=run_id,
-                                extra={"plan_id": plan_id, "tasks": len(tasks)})
+                                extra={"plan_id": plan_id, "tasks": task_count})
         self.audit.log(by, "plan.approved", subject=plan_id,
-                       payload={"run_id": run_id, "approval_id": approval.approval_id})
+                       payload={"run_id": run_id, "approval_id": approval.approval_id,
+                                "plan_revision": plan.revision,
+                                "plan_hash": plan.content_hash})
         self.memory.record_decision(
-            f"批准计划：{plan.goal}（{len(tasks)} 个任务）", agent_id=plan.main_agent_id,
+            f"批准计划：{plan.goal}（{task_count} 个任务）", agent_id=plan.main_agent_id,
             model=plan.model, approved=True,
         )
         self.memory.sync_workflow(run_id)
@@ -446,11 +501,11 @@ class PlanningService:
         if self.bus:
             self.bus.publish("workflow", {
                 "phase": "plan_approved", "plan_id": plan_id, "run_id": run_id,
-                "goal": plan.goal, "tasks": len(tasks),
+                "goal": plan.goal, "tasks": task_count,
                 "priorities": {t.task_id: t.priority for t in plan.tasks},
             }, source=by, correlation_id=run_id, sync_level=5)
         return {"status": "approved", "plan_id": plan_id, "run_id": run_id,
-                "approval_id": approval.approval_id, "tasks": len(tasks)}
+                "approval_id": approval.approval_id, "tasks": task_count}
 
     def reject_plan(self, plan_id: str, *, approval_id: str = "", note: str = "",
                     by: str = "user") -> dict[str, Any]:

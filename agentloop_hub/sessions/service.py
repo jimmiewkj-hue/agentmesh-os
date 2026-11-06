@@ -30,10 +30,12 @@ class ImportResult:
     imported: int
     skipped: int
     records: list[ConversationRecord]
+    unchanged: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "agent_id": self.agent_id, "imported": self.imported, "skipped": self.skipped,
+            "unchanged": self.unchanged,
             "records": [r.to_dict() for r in self.records],
         }
 
@@ -60,33 +62,40 @@ class SessionImportService:
 
         records: list[ConversationRecord] = []
         skipped = 0
+        unchanged = 0
         for session in sessions:
             if len(records) >= limit:
                 break
-            if not include_unscoped and not self._scope_ok(session):
+            scoped = self._scope_ok(session)
+            if not scoped and not (include_unscoped and not session.cwd):
+                # include_unscoped only admits records with no project claim.
+                # Explicitly different projects and path mentions in text are
+                # not ownership evidence.
                 skipped += 1
+                continue
+            existing = self.store.get_conversation(
+                self.project.project_id, agent.agent_id, session.session_id)
+            if existing and session.fingerprint \
+                    and existing.get("fingerprint") == session.fingerprint \
+                    and existing.get("raw_path") and Path(existing["raw_path"]).exists():
+                unchanged += 1
                 continue
             record = self._archive(agent, session)
             records.append(record)
         self.store.append_audit(
             self.project.project_id, "session-importer", "sessions.imported",
             subject=agent.agent_id,
-            payload={"imported": len(records), "skipped": skipped, "limit": limit},
+            payload={"imported": len(records), "skipped": skipped,
+                     "unchanged": unchanged, "limit": limit},
         )
-        return ImportResult(agent.agent_id, len(records), skipped, records)
+        return ImportResult(agent.agent_id, len(records), skipped, records, unchanged)
 
     def _scope_ok(self, session: ParsedSession) -> bool:
-        if session.cwd:
-            from .common import project_matches
-            return project_matches(session.cwd, self.project.root)
-        # ZCode rollouts do not record a cwd. Keep sessions whose recorded text
-        # mentions the project root; never import unrelated history silently.
-        needle = self.project.root.replace("\\", "/").lower()
-        haystack = "\n".join(
-            m.text + " " + json.dumps(m.tool_calls, ensure_ascii=False)
-            for m in session.messages
-        ).replace("\\", "/").lower()
-        return needle in haystack
+        if not session.cwd:
+            # Unscoped history is never auto-attributed from text mentions.
+            return False
+        from .common import project_matches
+        return project_matches(session.cwd, self.project.root)
 
     def _archive(self, agent: AgentRecord, session: ParsedSession) -> ConversationRecord:
         target_dir = ensure_dir(Path(self.project.root) / ".agentloop" / "conversations" / agent.agent_id)

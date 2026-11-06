@@ -977,6 +977,19 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
             outcome = open_trae_workspace(app=app, workspace=workspace,
                                           executable=executable, config=config)
             opened = outcome.to_dict()
+            if not outcome.ok:
+                # A live DevTools endpoint does not prove the requested
+                # workspace was opened.  Never report success when the folder
+                # switch failed: the caller would type the prompt into the
+                # user's unrelated window.
+                return InterfaceOutcome(
+                    False, "cdp", {"port": port, "reused": True,
+                                   "workspace": workspace}, {},
+                    reason=outcome.reason or "Trae 工作区打开失败",
+                    error_code=outcome.error_code or "WORKSPACE_SWITCH_FAILED",
+                    evidence={"port": port, "reused": True,
+                              "workspace_open": opened},
+                )
         return InterfaceOutcome(True, "cdp", {"port": port, "reused": True,
                                               "workspace": workspace},
                                 {"source": f"http://127.0.0.1:{port}/json/version",

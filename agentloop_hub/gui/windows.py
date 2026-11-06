@@ -82,6 +82,42 @@ def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
     return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
 
 
+def process_identity(pid: int) -> dict[str, Any]:
+    """PID + absolute process start time, to distinguish PID reuse."""
+    if os.name != "nt" or not pid:
+        return {}
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return {"pid": int(pid), "started_at": "", "error": "OPEN_FAILED"}
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created),
+                                        ctypes.byref(exited), ctypes.byref(kernel),
+                                        ctypes.byref(user)):
+            return {"pid": int(pid), "started_at": "", "error": "QUERY_FAILED"}
+        value = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        epoch = value / 10_000_000 - 11644473600
+        return {"pid": int(pid), "started_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch)),
+            "started_epoch": round(epoch, 3)}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def window_process_identity(hwnd: int) -> dict[str, Any]:
+    if os.name != "nt" or not hwnd:
+        return {}
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+    identity = process_identity(int(pid.value or 0))
+    identity["hwnd"] = int(hwnd)
+    return identity
+
+
 def find_window(title_part: str) -> tuple[int, tuple[int, int, int, int]] | None:
     matches: list[tuple[int, tuple[int, int, int, int]]] = []
 

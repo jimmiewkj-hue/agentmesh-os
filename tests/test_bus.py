@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def test_bus_publish_subscribe_poll_and_replay(tmp_path):
@@ -76,4 +76,46 @@ def test_bus_payload_is_capped(tmp_path):
     event = hub.bus_publish("response", big, source="worker")
     assert event["payload"].get("_truncated") is True
     assert event["tokens"] > 0
+    hub.close()
+
+
+def test_bus_pagination_never_skips_undelivered_matches(tmp_path):
+    repo, hub, _ = make_project(tmp_path)
+    e1 = hub.bus_publish("workflow", {"i": 1}, source="user")
+    e2 = hub.bus_publish("workflow", {"i": 2}, source="user")
+    e3 = hub.bus_publish("workflow", {"i": 3}, source="user")
+    sub = hub.store.create_bus_subscription(
+        hub.project.project_id, "pager", topics=[], kinds=["workflow"],
+        cursor_seq=int(e1["seq"]) - 1,
+    )
+    got = []
+    for _ in range(3):
+        page = hub.bus_poll(sub["subscription_id"], limit=1)
+        got.extend(int(ev["seq"]) for ev in page["events"])
+    assert got == [int(e1["seq"]), int(e2["seq"]), int(e3["seq"])]
+    hub.close()
+
+
+def test_bus_ack_is_separate_from_delivered_cursor(tmp_path):
+    repo, hub, _ = make_project(tmp_path)
+    event = hub.bus_publish("workflow", {"i": 1}, source="user")
+    sub = hub.bus_subscribe("acker", kinds=["workflow"])
+    page = hub.bus_poll(sub["subscription_id"], limit=10)
+    assert page["count"] >= 1
+    # Acknowledging a never-delivered future seq cannot move the ack cursor.
+    hub.bus_ack(sub["subscription_id"], int(event["seq"]) + 999)
+    after = hub.store.get_bus_subscription(sub["subscription_id"])
+    assert int(after["acked_seq"]) <= int(after["cursor_seq"])
+    hub.bus_ack(sub["subscription_id"], int(page["events"][-1]["seq"]))
+    after = hub.store.get_bus_subscription(sub["subscription_id"])
+    assert int(after["acked_seq"]) == int(page["events"][-1]["seq"])
+    hub.close()
+
+
+def test_recent_digest_returns_the_newest_events(tmp_path):
+    repo, hub, _ = make_project(tmp_path)
+    for index in range(12):
+        hub.bus_publish("workflow", {"i": index}, source="user")
+    digest = hub.bus.recent_digest(limit=5)
+    assert [item["payload"]["i"] for item in digest] == [7, 8, 9, 10, 11]
     hub.close()

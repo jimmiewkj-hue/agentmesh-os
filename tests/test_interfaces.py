@@ -175,6 +175,7 @@ def test_qoder_prepare_session_moves_transcript_and_updates_db(tmp_path, monkeyp
     outcome = iface.prepare_qoder_session(
         workspace=workspace, model="DeepSeek-Flash",
         config={"qoder_db": str(db), "qoder_projects": str(projects)},
+        allow_restart=True, allow_history_migration=True,
     )
     assert outcome.ok, outcome
     conn = sqlite3.connect(db)
@@ -222,6 +223,7 @@ def test_qoder_prepare_falls_back_to_session_with_transcript(tmp_path, monkeypat
     outcome = iface.prepare_qoder_session(
         workspace=workspace, model="DeepSeek-Flash",
         config={"qoder_db": str(db), "qoder_projects": str(projects)},
+        allow_restart=True, allow_history_migration=True,
     )
     assert outcome.ok, outcome
     assert outcome.evidence["session_id"] == "qoder-sess"

@@ -57,6 +57,8 @@ class HubConfig:
     summary_timeout_seconds: int = 600
     verify_timeout_seconds: int = 180
     verify_server_probe_seconds: int = 15
+    # One format-only repair request for an invalid result package.
+    result_repair_timeout_seconds: int = 300
     # Repeated nodes for the same Agent continue that Agent's prior
     # conversation and worktree instead of starting a fresh one.
     chain_reuse_agent_sessions: bool = True
@@ -138,6 +140,9 @@ class HubConfig:
     round_replan: bool = True
     workspace_verify: bool = True
     interface_restart_timeout_seconds: int = 60
+    # Continue verification/queued work left by a crashed controller.  Only
+    # runs that were still "running" are touched, never explicit pauses.
+    auto_reconcile_on_startup: bool = True
 
     dangerous_command_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_DANGEROUS_PATTERNS))
     high_risk_file_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_HIGH_RISK_FILE_PATTERNS))
@@ -164,6 +169,7 @@ class HubConfig:
             "summary_timeout_seconds": self.summary_timeout_seconds,
             "verify_timeout_seconds": self.verify_timeout_seconds,
             "verify_server_probe_seconds": self.verify_server_probe_seconds,
+            "result_repair_timeout_seconds": self.result_repair_timeout_seconds,
             "chain_reuse_agent_sessions": self.chain_reuse_agent_sessions,
             "default_task_token_budget": self.default_task_token_budget,
             "default_project_token_budget": self.default_project_token_budget,
@@ -196,6 +202,7 @@ class HubConfig:
             "require_independent_verifier": self.require_independent_verifier,
             "verify_build": self.verify_build,
             "verifier_agent_id": self.verifier_agent_id,
+            "scope_violation_policy": self.scope_violation_policy,
             "workbuddy_welcome_mode": self.workbuddy_welcome_mode,
             "workbuddy_permission_mode": self.workbuddy_permission_mode,
             "workbuddy_agent_mode": self.workbuddy_agent_mode,
@@ -206,6 +213,7 @@ class HubConfig:
             "round_replan": self.round_replan,
             "workspace_verify": self.workspace_verify,
             "interface_restart_timeout_seconds": self.interface_restart_timeout_seconds,
+            "auto_reconcile_on_startup": self.auto_reconcile_on_startup,
             "dangerous_command_patterns": self.dangerous_command_patterns,
             "high_risk_file_patterns": self.high_risk_file_patterns,
             "excluded_paths": self.excluded_paths,
@@ -218,8 +226,15 @@ class HubConfig:
         allowed = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         cfg = cls()
         for key, value in (data or {}).items():
-            if key in allowed and value is not None:
-                setattr(cfg, key, value)
+            if key not in allowed or value is None:
+                continue
+            if key == "scope_violation_policy":
+                value = str(value).strip().lower()
+                if value not in ("warn", "strict"):
+                    raise ValueError(
+                        f"非法 scope_violation_policy: {value!r}（只允许 warn/strict）"
+                    )
+            setattr(cfg, key, value)
         return cfg
 
     def merged(self, overlay: dict[str, Any]) -> "HubConfig":
@@ -230,11 +245,13 @@ class HubConfig:
     def price_for(self, model: str) -> dict[str, float]:
         key = (model or "").strip()
         if not key:
-            return {"input": 0.0, "output": 0.0}
+            return {"input": 0.0, "output": 0.0, "known": False}
         entry = self.pricing.get(key) or self.pricing.get(key.split("/")[-1]) or {}
         return {
             "input": float(entry.get("input", 0.0) or 0.0),
             "output": float(entry.get("output", 0.0) or 0.0),
+            # A missing price is unknown, not free.
+            "known": bool(entry),
         }
 
 

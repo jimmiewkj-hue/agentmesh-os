@@ -9,6 +9,7 @@ from ..storage.repo import Store
 class LeaseManager:
     def __init__(self, store: Store):
         self.store = store
+        self.owner_id = ""
 
     def conflicts(self, project_id: str, task: Task) -> list[dict]:
         if not task.spec.writable:
@@ -32,13 +33,15 @@ class LeaseManager:
         if not task.spec.writable:
             return
         for pattern in task.spec.scope:
-            self.store.acquire_lease(project_id, pattern, task.uid, task.assigned_agent, "write")
+            self.store.acquire_lease(project_id, pattern, task.uid, task.assigned_agent,
+                                     "write", owner_id=self.owner_id)
 
     def release(self, task_uid: str) -> None:
         self.store.release_task_leases(task_uid)
 
     def release_stale(self, project_id: str, *, keep_run_ids: set[str] | None = None,
-                      include_running: bool = False) -> list[str]:
+                      include_running: bool = False,
+                      live_owners: set[str] | None = None) -> list[str]:
         """Release leases whose run is no longer active.
 
         An aborted control plane (crash, kill, power loss) never reaches the
@@ -46,17 +49,28 @@ class LeaseManager:
         writable task in the project is blocked by a phantom conflict.
         """
         keep = set(keep_run_ids or set())
+        live = set(live_owners or set())
         released: list[str] = []
         for lease in self.store.active_leases(project_id):
             task_uid = str(lease.get("task_uid") or "")
             run_id = task_uid.split(":", 1)[0] if ":" in task_uid else ""
             if run_id and run_id in keep:
                 continue
+            owner = str(lease.get("owner_id") or "")
+            if owner and owner in live:
+                # The owning controller is still heartbeating: never release.
+                continue
             run = self.store.get_run(run_id) if run_id else None
+            run_owner = str((run or {}).get("owner_id") or "")
+            if run_owner and run_owner in live:
+                continue
             if run and run.get("status") in ("running", "ready", "pending_acceptance",
                                              "pending_merge", "merging", "waiting_user"):
-                # At control-plane start any "running" run belongs to a previous
-                # process; callers pass include_running=True there.
+                # Legacy rows have no owner.  If a live controller exists it
+                # may own this work; only a fresh start with no live owners may
+                # treat a "running" run as orphaned.
+                if not owner and live:
+                    continue
                 if not include_running:
                     continue
             self.store.release_task_leases(task_uid)

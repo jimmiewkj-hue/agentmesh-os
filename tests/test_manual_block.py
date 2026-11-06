@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 from agentloop_hub.adapters.base import ExecutionOutcome
 from agentloop_hub.adapters.gui import GuiAutomationAdapter

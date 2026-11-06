@@ -11,8 +11,8 @@ from ..models import ChangeStatus, Project, Task, TaskStatus
 from ..storage.repo import Store
 from ..util import now_iso
 from ..workspace import (
-    apply_patch, commit_all, patch_files, remove_worktree, reverse_patch, status_porcelain,
-    run_git,
+    PATCH_EXCLUDE_PREFIXES, apply_patch, commit_all, patch_files, remove_worktree,
+    reverse_patch, status_porcelain, run_git,
 )
 from .approvals import ApprovalService
 from .audit import AuditService
@@ -49,13 +49,21 @@ class MergeService:
         plan = self.store.get_plan(run["plan_id"])
         if not plan:
             raise NotFoundError(f"计划不存在: {run['plan_id']}")
-        approval = self.store.get_approval(approval_id) if approval_id else \
-            self.approvals.ensure_merge_approval(
-                run_id, plan.goal,
-                [{"task_id": t.task_id, "patch": t.patch_path} for t in self.store.list_tasks(run_id)
-                 if t.patch_path],
-                run.get("summary", {}),
-            )
+        if not approval_id:
+            patches = []
+            for task in self.store.list_tasks(run_id):
+                if not task.patch_path:
+                    continue
+                verification = self.store.latest_verification(task.uid) or {}
+                patches.append({
+                    "task_id": task.task_id, "patch": task.patch_path,
+                    "verification": task.verification_status,
+                    "warnings": list(verification.get("warnings") or [])[:20],
+                })
+            approval = self.approvals.ensure_merge_approval(
+                run_id, plan.goal, patches, run.get("summary", {}))
+        else:
+            approval = self.store.get_approval(approval_id)
         if not approval or approval.status != "approved":
             raise ApprovalRequiredError("合并需要用户批准", details={"approval_id": approval_id})
         tasks = [t for t in self.store.list_tasks(run_id)
@@ -72,7 +80,9 @@ class MergeService:
             if not Path(patch).exists() or not Path(patch).read_text(encoding="utf-8", errors="replace").strip():
                 self.audit.log(by, "merge.skip_empty", subject=task_row.uid)
                 continue
-            ok, message = apply_patch(self.project.root, patch, three_way=True)
+            ok, message = apply_patch(
+                self.project.root, patch, three_way=True,
+                exclude_prefixes=PATCH_EXCLUDE_PREFIXES)
             if not ok:
                 for applied_task in applied:
                     self._mark_change(applied_task.uid, ChangeStatus.APPLIED.value)
@@ -121,6 +131,59 @@ class MergeService:
             self.memory.sync_workflow(run_id)
             self.memory.sync_task_state(run_id)
         return {"status": "completed", "run_id": run_id, "applied": [t.task_id for t in applied],
+                "commit": commit_hash, "verification": verification}
+
+    def recheck_merge(self, run_id: str, *, commit: bool = True,
+                      by: str = "user") -> dict[str, Any]:
+        """Re-run post-merge verification after an environment-only failure.
+
+        The patches stay applied; only the verification result is recomputed
+        with the corrected command environment (Blender PATH, long-running
+        preview servers).  Never applies or reverts task patches.
+        """
+        run = self.store.get_run(run_id)
+        if not run:
+            raise NotFoundError(f"运行不存在: {run_id}")
+        tasks = self.store.list_tasks(run_id)
+        applied = []
+        for task in tasks:
+            if not task.patch_path:
+                continue
+            changes = self.store.list_changes(task_uid=task.uid)
+            if any(c.status == ChangeStatus.APPLIED.value for c in changes):
+                applied.append(task)
+        if not applied:
+            raise ConflictError("没有已应用的合并补丁可重新校验")
+        verification = self._post_merge_verification(applied)
+        if any(v["result"] == "failed" for v in verification):
+            self.store.update_run(run_id, status="failed", error="合并后验证失败")
+            self.audit.log(by, "merge.recheck_failed", subject=run_id,
+                           payload={"verification": verification})
+            return {"status": "verification_failed", "run_id": run_id,
+                    "verification": verification}
+        commit_hash = ""
+        if commit or self.config.auto_merge_commit:
+            commit_hash = commit_all(self.project.root, f"agentloop: merge run {run_id}")
+        branch = run.get("base_branch") or self.project.branch
+        commit_value = commit_hash or (run_git(
+            ["rev-parse", "HEAD"], cwd=self.project.root,
+            check=False).stdout_text or "").strip()
+        self.store.update_project_git(self.project.project_id, branch=branch, commit=commit_value)
+        self.store.update_run(run_id, status="completed", error="", finished_at=now_iso())
+        self._refresh_final_summary(
+            run, run_id=run_id, applied=applied, verification=verification,
+            commit=commit_value, status="completed", committed=bool(commit_hash))
+        self.checkpoints.create("after_merge_recheck", run_id=run_id,
+                                extra={"applied": [t.task_id for t in applied],
+                                       "commit": commit_hash})
+        self.audit.log(by, "merge.rechecked", subject=run_id,
+                       payload={"applied": [t.task_id for t in applied],
+                                "commit": commit_hash})
+        if self.memory:
+            self.memory.sync_workflow(run_id)
+            self.memory.sync_task_state(run_id)
+        return {"status": "completed", "run_id": run_id,
+                "applied": [t.task_id for t in applied],
                 "commit": commit_hash, "verification": verification}
 
     def _refresh_final_summary(self, run: dict[str, Any], *, run_id: str,
@@ -173,7 +236,8 @@ class MergeService:
         patch_file_set: set[str] = set()
         for task in tasks:
             if task.patch_path and Path(task.patch_path).exists():
-                patch_file_set.update(patch_files(task.patch_path))
+                patch_file_set.update(patch_files(
+                    task.patch_path, exclude_prefixes=PATCH_EXCLUDE_PREFIXES))
         dirty = status_porcelain(self.project.root)
         conflicts = [
             d for d in dirty
@@ -207,6 +271,18 @@ class MergeService:
                 left, right = patches[i][0].task_id, patches[j][0].task_id
                 if self._continuation_overlap(deps, left, right):
                     continue
+                left_task, right_task = patches[i][0], patches[j][0]
+                # A documentation node is expected to update upstream docs
+                # (README/spec) in place; patches are still applied in
+                # dependency order, so this is a continuation, not a race.
+                doc_continuation = False
+                for later, earlier in ((left_task, right_task), (right_task, left_task)):
+                    if str(later.spec.type) == "documentation" \
+                            and self._depends_on(deps, later.task_id, earlier.task_id):
+                        doc_continuation = True
+                        break
+                if doc_continuation:
+                    continue
                 raise ConflictError(
                     f"任务 {patches[i][0].task_id} 与 {patches[j][0].task_id} 修改了相同文件",
                     details={"files": sorted(overlap)},
@@ -221,16 +297,15 @@ class MergeService:
     @classmethod
     def _continuation_overlap(cls, deps: dict[str, list[str]],
                               left: str, right: str) -> bool:
-        """Allow a later round to edit a file it is repairing.
+        """Allow a downstream task to edit a file created by an ancestor.
 
-        Same-round tasks and ordinary plan tasks keep the strict no-overlap
-        rule; only an ``R<n>_`` task that depends on an earlier round may
-        compose patches on the same file.
+        Patches are applied in dependency order and each downstream patch was
+        composed on top of its ancestors, so overlap within a dependency chain
+        is a continuation.  Unrelated tasks editing the same file still
+        conflict because their order is not defined.
         """
         for child, parent in ((left, right), (right, left)):
-            child_round = cls._round_of(child)
-            if child_round and cls._round_of(parent) != child_round \
-                    and cls._depends_on(deps, child, parent):
+            if cls._depends_on(deps, child, parent):
                 return True
         return False
 
@@ -249,14 +324,22 @@ class MergeService:
         return False
 
     def _post_merge_verification(self, tasks: list[Task]) -> list[dict[str, Any]]:
+        from .verification import Verifier
+
         out = []
         for task in tasks:
             for command in task.spec.verification_commands:
-                proc = run_command(command, cwd=self.project.root,
-                                   timeout=self.config.verify_timeout_seconds)
+                proc = run_command(
+                    command, cwd=self.project.root,
+                    timeout=self.config.verify_timeout_seconds,
+                    long_running_timeout=self.config.verify_server_probe_seconds,
+                    env=Verifier._command_env(command),
+                )
+                passed = bool(proc.ok or (proc.long_running and proc.server_ready))
                 out.append({
                     "task_id": task.task_id, "command": command,
-                    "exit_code": proc.exit_code, "result": "passed" if proc.ok else "failed",
+                    "exit_code": proc.exit_code, "result": "passed" if passed else "failed",
+                    "long_running": proc.long_running, "server_ready": proc.server_ready,
                     "output": (proc.stdout + "\n" + proc.stderr)[-1000:],
                 })
         return out

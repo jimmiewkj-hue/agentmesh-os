@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import socket
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,13 +21,17 @@ from .connectors import (
     CONNECTOR_PROFILES, TASK_CAPABILITY_REQUIREMENTS, connector_manifest,
     derive_capability_list, is_auto_executable,
 )
-from .errors import ApprovalRequiredError, ConfigError, NotFoundError, ValidationError
+from .errors import (
+    ApprovalRequiredError, ConfigError, ConflictError, NotFoundError, ValidationError,
+)
 from .models import (AgentRecord, CAPABILITY_RANK, Project, Task, TaskSpec,
                      TaskStatus, TaskType, normalize_capability_level)
 from .sessions.service import SessionImportService
 from .storage.db import Database
 from .storage.repo import Store
-from .util import atomic_write_text, ensure_dir, read_json, read_text, sha1_hex, write_json
+from .util import (
+    atomic_write_text, ensure_dir, now_iso, read_json, read_text, sha1_hex, write_json,
+)
 from .workspace import detect_repo, is_git_repo
 from .workspace.identity import build_project, canonical_path
 from .control.approvals import ApprovalService
@@ -63,14 +71,37 @@ class Hub:
         self.store = Store(self.db)
         self._new_project = False
         self.project = self._open_project()
+        self.store.project_id = self.project.project_id
+        # Controller ownership: a second process must not release the leases of
+        # a controller that is still heartbeating.
+        self.instance_id = f"ctl_{uuid.uuid4().hex}"
+        self.store.register_controller_instance(
+            self.instance_id, self.project.project_id,
+            host=socket.gethostname(), pid=os.getpid())
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="agentmesh-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
         # The bus is the single information path; Store writes automatically
         # fan out task/workflow/knowledge/file/governance/message/response events.
         self.bus = ContextBus(self.store, self.project, self.config)
         self.store.event_sink = self.bus
+        try:
+            self.store.drain_outbox()
+        except Exception:
+            pass
         self.audit = AuditService(self.store, self.project.project_id)
         self.budget = BudgetManager(self.store, self.project, self.config)
         self.approvals = ApprovalService(self.store, self.project, self.config)
         self.memory = MemoryService(self.store, self.project, self.config)
+        try:
+            previous_commit = self.store.get_setting("last_project_commit")
+            if previous_commit and previous_commit != self.project.commit:
+                self.memory.invalidate_on_baseline_change(
+                    previous_commit, self.project.commit)
+            self.store.set_setting("last_project_commit", self.project.commit)
+        except Exception:
+            pass
         self.context = ContextBuilder(self.store, self.project, self.config)
         self.router = CapabilityRouter(self.store, self.project, self.config)
         self.cost = CostOptimizer(self.store, self.project, self.config)
@@ -118,11 +149,13 @@ class Hub:
         # An interrupted control plane leaves write leases behind; release the
         # ones whose run is no longer active so later tasks are not blocked by
         # a phantom scope conflict.
+        self.runner.owner_id = self.instance_id
+        self.runner.leases.owner_id = self.instance_id
         try:
-            # A fresh control-plane process cannot own a live run yet, so every
-            # "running" run at this point is orphaned and its leases are stale.
+            live = self.store.live_controller_ids(
+                self.project.project_id, ttl_seconds=30.0, exclude=self.instance_id)
             self.stale_leases_released = self.runner.leases.release_stale(
-                self.project.project_id, include_running=True)
+                self.project.project_id, include_running=True, live_owners=live)
         except Exception:
             self.stale_leases_released = []
         self._migrate_legacy_budget()
@@ -141,6 +174,9 @@ class Hub:
                 self.memory.seed_code_structure()
         if auto_discover:
             self.discover(merge=True)
+        if bool(getattr(self.config, "auto_reconcile_on_startup", True)):
+            threading.Thread(target=self._startup_reconcile,
+                             name="agentmesh-startup-reconcile", daemon=True).start()
 
     def _migrate_legacy_budget(self) -> None:
         """1000000 was the old default; budgets are advisory now."""
@@ -651,8 +687,10 @@ class Hub:
         self.audit.log("user", "context.read", subject=uid, payload={"level": level})
         return detail
 
-    def submit_result(self, uid: str, payload: dict[str, Any] | str | Path) -> dict[str, Any]:
-        return self.runner.submit_result(uid, payload)
+    def submit_result(self, uid: str, payload: dict[str, Any] | str | Path, *,
+                      attempt_id: str = "", request_id: str = "") -> dict[str, Any]:
+        return self.runner.submit_result(uid, payload, attempt_id=attempt_id,
+                                         request_id=request_id)
 
     def submit_summary(self, run_id: str, payload: dict[str, Any] | str | Path) -> dict[str, Any]:
         return self.runner.submit_summary(run_id, payload)
@@ -677,12 +715,25 @@ class Hub:
     def retry_task(self, uid: str) -> dict[str, Any]:
         return self.runner.retry_task(uid)
 
+    def resume_interrupted(self, uid: str) -> dict[str, Any]:
+        return self.runner.resume_interrupted(uid)
+
+    def repair_task(self, uid: str) -> dict[str, Any]:
+        return self.runner.repair_task(uid)
+
+    def capture_artifacts(self, uid: str) -> dict[str, Any]:
+        return self.runner.capture_artifacts(uid)
+
+    def reconcile_task(self, uid: str) -> dict[str, Any]:
+        return self.runner.reconcile_submission(uid)
+
     def reverify_task(self, uid: str) -> dict[str, Any]:
         return self.runner.reverify_task(uid)
 
     def update_task_binding(self, uid: str, *, agent_id: str = "", model: str = "",
                             context_length: int | None = None,
-                            capability_level: str | None = None) -> dict[str, Any]:
+                            capability_level: str | None = None,
+                            requeue: bool = False) -> dict[str, Any]:
         """Edit a chain node's agent/model/profile while the run is active."""
         task = self.store.get_task(uid)
         if not task:
@@ -727,11 +778,26 @@ class Hub:
             "requested": {"context_length": context_length,
                           "capability_level": capability_level},
         })
+        if requeue:
+            # A relay/manual wait has no result; switching to an executable
+            # agent must re-dispatch the same attempt-1 session/worktree.
+            if task.status in ("running", "verifying") or self.runner._is_active(uid):
+                raise ValidationError("该节点正在执行，不能改绑后立即重新派发")
+            existing = self.store.get_result(uid)
+            if existing and existing.get("valid"):
+                raise ConflictError("该节点已有成果包，不能改绑重跑")
+            self.store.update_task(uid, attempts=0, error="")
+            self.store.set_task_status(uid, "queued", force=True)
+            self.audit.log("user", "task.reassigned_requeued", subject=uid,
+                           payload={"agent_id": agent.agent_id, "model": name})
         refreshed = self.store.get_task(uid)
         return refreshed.to_dict() if refreshed else task.to_dict()
 
     def merge(self, run_id: str, *, approval_id: str = "", commit: bool = False) -> dict[str, Any]:
         return self.merge_service.merge(run_id, approval_id=approval_id, commit=commit)
+
+    def recheck_merge(self, run_id: str, *, commit: bool = True) -> dict[str, Any]:
+        return self.merge_service.recheck_merge(run_id, commit=commit)
 
     def rollback_task(self, uid: str) -> dict[str, Any]:
         return self.merge_service.rollback_task(uid)
@@ -761,6 +827,19 @@ class Hub:
                 "计划包含架构设计，需先通过架构审批",
                 details={"plan_id": existing.plan_id, "approval_id": approval_id},
             )
+        if existing.kind == "plan" and existing.plan_id:
+            # Plan approval is atomic with run/task creation and validates the
+            # ticket against the exact revision.  It must not be pre-decided by
+            # the generic path.
+            if approve:
+                result = self.planning.approve_plan(existing.plan_id,
+                                                    approval_id=approval_id, note=note)
+                approval = self.store.get_approval(approval_id) or existing
+            else:
+                approval = self.approvals.decide(approval_id, approved=False, note=note)
+                self.planning.reject_plan(existing.plan_id, approval_id=approval_id, note=note)
+                result = {"status": "rejected", "plan_id": existing.plan_id}
+            return {"approval": approval.to_dict(), "outcome": result}
         approval = self.approvals.decide(approval_id, approved=approve, note=note)
         if approval.kind == "high_risk" and approve and approval.task_uid:
             task = self.store.get_task(approval.task_uid)
@@ -772,13 +851,9 @@ class Hub:
                     subject=task.uid,
                     payload={"approval_id": approval_id, "task_id": task.task_id},
                 )
-        if approval.kind == "plan" and approval.plan_id:
-            if approve:
-                result = self.planning.approve_plan(approval.plan_id, approval_id=approval_id, note=note)
-            else:
-                self.planning.reject_plan(approval.plan_id, approval_id=approval_id, note=note)
-                result = {"status": "rejected", "plan_id": approval.plan_id}
-            return {"approval": approval.to_dict(), "outcome": result}
+                # A persisted reconcile todo makes the wake survive a crash;
+                # schedule_reconcile also tries to start the controller now.
+                self.runner.schedule_reconcile(task.run_id, "high_risk_approved")
         if approval.kind == "architecture" and approval.plan_id:
             return {"approval": approval.to_dict(),
                     "outcome": {"status": "approved" if approve else "rejected",
@@ -863,7 +938,15 @@ class Hub:
         return {"package": package, "files": files}
 
     def recover(self, *, run_id: str = "", auto_resume: bool = False) -> dict[str, Any]:
-        return self.recovery.recover(run_id=run_id, auto_resume=auto_resume)
+        result = self.recovery.recover(run_id=run_id, auto_resume=auto_resume)
+        for target in result.get("runs_to_start") or []:
+            try:
+                result.setdefault("started", []).append(
+                    self.runner.start(target, background=True))
+            except Exception as exc:  # recovery must report, not crash the caller
+                result.setdefault("start_errors", []).append(
+                    {"run_id": target, "error": str(exc)[:300]})
+        return result
 
     def recovery_report(self) -> dict[str, Any]:
         return self.recovery.inspect()
@@ -907,6 +990,9 @@ class Hub:
 
     def bus_poll(self, subscription_id: str, *, limit: int = 100) -> dict[str, Any]:
         return self.bus.poll(subscription_id, limit=limit)
+
+    def bus_ack(self, subscription_id: str, seq: int) -> dict[str, Any]:
+        return self.bus.ack(subscription_id, seq)
 
     def bus_unsubscribe(self, subscription_id: str) -> dict[str, Any]:
         return self.bus.unsubscribe(subscription_id)
@@ -1086,7 +1172,8 @@ class Hub:
     def solve(self, goal: str, *, executor_agent: str = "", executor_model: str = "",
               commander_agent: str = "", commander_model: str = "",
               max_tasks: int = 4, max_parallel: int = 1, start: bool = True,
-              background: bool = True, polish: bool = False) -> dict[str, Any]:
+              background: bool = True, polish: bool = False,
+              approve: bool = False) -> dict[str, Any]:
         """One request in, a routed multi-model run (and a final answer) out.
 
         Steps: segment -> resolve each role against the real catalog -> pin
@@ -1166,10 +1253,24 @@ class Hub:
             main_agent_id=commander_agent or "",
             model=commander_model or "",
         )
+        if not approve:
+            # Batch/one-shot callers must opt into approval explicitly; the
+            # plan and its approval stay visible and pending otherwise.
+            return {
+                "status": "pending_approval", "plan_id": imported["plan_id"],
+                "approval_id": imported.get("approval_id", ""),
+                "architecture_approval_id": imported.get("architecture_approval_id", ""),
+                "goal": goal, "run_id": "", "confidence": segment.confidence,
+                "tasks": [spec.to_dict() for spec in segment.tasks],
+                "bindings": bindings, "notes": notes,
+                "premium_tasks": premium_used,
+                "premium_budget": policy.max_premium_tasks_per_run,
+                "next": "批准计划后调用 start_run",
+            }
         architecture_id = imported.get("architecture_approval_id") or ""
         if architecture_id:
             self.decide_approval(architecture_id, approve=True)
-        plan_approval = _approval_id_for(self, "plan", imported["plan_id"])
+        plan_approval = str(imported.get("approval_id") or "")
         approved = self.decide_approval(plan_approval, approve=True)
         run_id = approved["outcome"]["run_id"]
         for spec in segment.tasks:
@@ -1373,14 +1474,21 @@ class Hub:
                 )
             prepared = self._bind_chain_to_plan(plan, prepared)
             self.store.save_plan(plan)
+            plan_approval = self.approvals.ensure_plan_approval(plan)
             self.audit.log("user", "chain.bound", subject=plan_id, payload={
                 "goal": plan.goal,
+                "plan_revision": plan.revision,
+                "plan_hash": plan.content_hash,
+                "approval_id": plan_approval.approval_id,
                 "stages": [{"task_id": s["task_id"], "agent": s["agent_id"],
                             "model": s["model"], "type": s["type"]} for s in prepared],
             })
             outcome: dict[str, Any] = {
                 "status": "bound", "plan_id": plan_id, "run_id": "",
                 "main_agent_id": main_agent_id or plan.main_agent_id,
+                "approval_id": plan_approval.approval_id,
+                "plan_revision": plan.revision,
+                "plan_hash": plan.content_hash,
                 "stages": prepared,
                 "next": "到第 4 步批准计划，再点击开始执行",
             }
@@ -1388,7 +1496,7 @@ class Hub:
                 for item in self.approvals.pending():
                     if item.kind == "architecture" and item.plan_id == plan_id:
                         self.decide_approval(item.approval_id, approve=True)
-                approval_id = _approval_id_for(self, "plan", plan_id)
+                approval_id = plan_approval.approval_id
                 approved = self.decide_approval(approval_id, approve=True)
                 run_id = approved["outcome"]["run_id"]
                 for stage in prepared:
@@ -1455,11 +1563,18 @@ class Hub:
         if imported_plan is not None:
             prepared = self._bind_chain_to_plan(imported_plan, prepared)
             self.store.save_plan(imported_plan)
+            # Binding changed executable content, so the ticket created during
+            # import is expired by save_plan.  Approve the new revision only.
+            plan_approval = self.approvals.ensure_plan_approval(imported_plan)
+            imported["approval_id"] = plan_approval.approval_id
             self.audit.log("user", "chain.pins_applied", subject=imported_plan.plan_id,
-                           payload={"stages": [
-                               {"task_id": s["task_id"], "agent": s["agent_id"],
-                                "model": s["model"], "type": s["type"]}
-                               for s in prepared]})
+                           payload={"plan_revision": imported_plan.revision,
+                                    "plan_hash": imported_plan.content_hash,
+                                    "approval_id": plan_approval.approval_id,
+                                    "stages": [
+                                        {"task_id": s["task_id"], "agent": s["agent_id"],
+                                         "model": s["model"], "type": s["type"]}
+                                        for s in prepared]})
         outcome = {
             "status": "pending_approval", "plan_id": imported["plan_id"],
             "run_id": "", "main_agent_id": main_agent_id or "",
@@ -1478,7 +1593,7 @@ class Hub:
         architecture_id = imported.get("architecture_approval_id") or ""
         if architecture_id:
             self.decide_approval(architecture_id, approve=True)
-        plan_approval = _approval_id_for(self, "plan", imported["plan_id"])
+        plan_approval = str(imported.get("approval_id") or "")
         approved = self.decide_approval(plan_approval, approve=True)
         run_id = approved["outcome"]["run_id"]
         for stage in prepared:
@@ -1554,16 +1669,37 @@ class Hub:
         silently retarget a different plan.
         """
         by_id = {task.task_id: task for task in plan.tasks}
-        if len(prepared) != len(plan.tasks):
-            raise ValidationError(
-                f"阶段数量（{len(prepared)}）与计划任务数（{len(plan.tasks)}）不一致",
-                details={"plan_id": plan.plan_id,
-                         "tasks": [t.task_id for t in plan.tasks]},
-            )
-        for index, stage in enumerate(prepared):
-            spec = by_id.get(stage["task_id"]) if stage["task_id"] else plan.tasks[index]
-            if spec is None:
-                raise ValidationError(f"计划中没有任务 {stage['task_id']}")
+        user_tasks = [task for task in plan.tasks
+                      if str(getattr(task, "origin", "user") or "user") != "system"]
+        explicit = [bool(stage.get("task_id")) for stage in prepared]
+        if any(explicit) and not all(explicit):
+            raise ValidationError("链路阶段必须全部指定 task_id，或全部按顺序绑定")
+        if all(explicit):
+            targets = []
+            for stage in prepared:
+                spec = by_id.get(str(stage["task_id"]))
+                if spec is None:
+                    raise ValidationError(f"计划中没有任务 {stage['task_id']}")
+                if str(getattr(spec, "origin", "user") or "user") == "system":
+                    raise ValidationError(
+                        f"系统治理节点 {spec.task_id} 不能绑定为链路阶段")
+                targets.append(spec)
+            missing = [task.task_id for task in user_tasks if task not in targets]
+            if missing:
+                raise ValidationError(
+                    f"阶段数量与用户任务数不一致，缺少: {missing}",
+                    details={"plan_id": plan.plan_id, "missing": missing})
+        else:
+            if len(prepared) != len(user_tasks):
+                raise ValidationError(
+                    f"阶段数量（{len(prepared)}）与用户任务数（{len(user_tasks)}）不一致",
+                    details={"plan_id": plan.plan_id,
+                             "user_tasks": [t.task_id for t in user_tasks],
+                             "system_tasks": [t.task_id for t in plan.tasks
+                                              if t not in user_tasks]},
+                )
+            targets = list(user_tasks)
+        for stage, spec in zip(prepared, targets):
             if not stage["task_id"]:
                 stage["task_id"] = spec.task_id
             old = {"agent": spec.suggested_agent, "model": spec.model,
@@ -1582,7 +1718,7 @@ class Hub:
     # Preflight: open the selected agents and bind workspace + model
     # ------------------------------------------------------------------
     def preflight_agents(self, stages: list[dict[str, Any]], *,
-                         workspace: str = "", open_apps: bool = True,
+                         workspace: str = "", open_apps: bool = False,
                          full_control: bool = True,
                          config: dict[str, Any] | None = None) -> dict[str, Any]:
         """Open every selected agent and verify its workspace + model.
@@ -1667,9 +1803,25 @@ class Hub:
                     })
                 elif app == "qoder_cn":
                     qkey = qoder_model_key(model)
+                    if not open_apps:
+                        # Read-only preflight: verify the existing binding and
+                        # never stop the app or migrate the user's transcript.
+                        verify = verify_qoder_session(
+                            workspace=root, model=model, started_at=0,
+                            config=cfg, strict_daemon=False)
+                        item.update({
+                            "ok": verify.ok, "stage": "read_only",
+                            "read_only": True, "workspace_set": verify.ok,
+                            "model_set": verify.ok, "verify": verify.to_dict(),
+                            "error": "" if verify.ok else verify.reason,
+                        })
+                        report.append(item)
+                        continue
                     prep = prepare_qoder_session(
                         workspace=root, model=qkey, config=cfg,
                         permission_mode=("bypassPermissions" if full_control else ""),
+                        allow_restart=open_apps,
+                        allow_history_migration=open_apps,
                     )
                     if not prep.ok:
                         item.update({"ok": False, "stage": "launch", "error": prep.reason})
@@ -1693,7 +1845,7 @@ class Hub:
                     cdp = ensure_workbuddy_cdp(
                         executable=str(cfg.get("executable") or ""),
                         port=int(cfg.get("workbuddy_cdp_port") or 9223),
-                        allow_restart=open_apps,
+                        allow_restart=open_apps, allow_launch=open_apps,
                     )
                     item.update({
                         "ok": cdp.ok, "stage": "ready" if cdp.ok else "launch",
@@ -1871,8 +2023,26 @@ class Hub:
         if stages is not None and not isinstance(stages, list):
             raise ValidationError("stages 必须是数组")
         path = Path(self.paths.base) / "chain-draft.json"
+        existing = read_json(path, {}) or {}
+        existing_revision = int(existing.get("revision") or 0)
+        base_revision = draft.get("base_revision")
+        if base_revision is not None and str(base_revision) != "":
+            try:
+                base_value = int(base_revision)
+            except (TypeError, ValueError):
+                raise ValidationError("base_revision 必须是整数")
+            if existing_revision and base_value != existing_revision:
+                raise ConflictError(
+                    "草稿已被另一处更新，请刷新后合并",
+                    details={"server_revision": existing_revision,
+                             "base_revision": base_value},
+                )
+        revision = existing_revision + 1
         payload = {
             "project_id": self.project.project_id,
+            "revision": revision,
+            "updated_at": now_iso(),
+            "updated_by": str(draft.get("client_id") or ""),
             "plan_id": str(draft.get("plan_id") or ""),
             "goal": str(draft.get("goal") or ""),
             "policy": str(draft.get("policy") or "balanced"),
@@ -2109,11 +2279,26 @@ class Hub:
             "sync": self.sync_status(),
             "models": self.model_catalog.catalog(),
             "agent_versions": self.versions.status(),
-            "modules": {
-                "connector": "ready", "unified_memory": "ready", "context_bus": "ready",
-                "task_scheduler": "ready", "capability_router": "ready",
-                "cost_optimizer": "ready", "human_governance": "ready",
-            },
+            "modules": self._module_status(),
+        }
+
+    def _module_status(self) -> dict[str, str]:
+        """Module health is evidence-based, never a hardcoded all-ready list."""
+        agents = self.list_agents()
+        online = [a for a in agents if a.status not in ("offline", "error", "unknown")]
+        try:
+            bus_ok = bool(self.bus.verify().get("ok"))
+        except Exception:
+            bus_ok = False
+        return {
+            "connector": "ready" if online else ("degraded" if agents else "unavailable"),
+            "unified_memory": "ready",
+            "context_bus": "ready" if bus_ok else "degraded",
+            "task_scheduler": "ready" if agents else "unavailable",
+            "capability_router": "ready" if online else "degraded",
+            # Without a price table USD cost is unknown, not proven zero.
+            "cost_optimizer": "ready" if self.config.pricing else "unverified",
+            "human_governance": "ready",
         }
 
     def doctor(self) -> dict[str, Any]:
@@ -2174,7 +2359,48 @@ class Hub:
             "checks": checks,
         }
 
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(10.0):
+            try:
+                self.store.heartbeat_controller_instance(self.instance_id)
+            except Exception:
+                continue
+
+    def _startup_reconcile(self) -> None:
+        """Resume verification/queued work from a crashed controller.
+
+        Only runs that were still `running` are touched; explicit pauses and
+        waiting-human states are never auto-started.
+        """
+        try:
+            time.sleep(0.5)
+            self.store.drain_outbox()
+            live = self.store.live_controller_ids(
+                self.project.project_id, ttl_seconds=30.0, exclude=self.instance_id)
+            for run in self.store.list_runs(self.project.project_id, limit=20):
+                if run.get("status") != "running":
+                    continue
+                run_owner = str(run.get("owner_id") or "")
+                if run_owner and run_owner in live:
+                    continue
+                tasks = self.store.list_tasks(run["run_id"])
+                if any(task.status in (TaskStatus.VERIFYING.value,
+                                       TaskStatus.RUNNING.value,
+                                       TaskStatus.QUEUED.value) for task in tasks):
+                    self.runner.schedule_reconcile(
+                        run["run_id"], "startup_recovery")
+        except Exception:
+            return
+
     def close(self) -> None:
+        try:
+            self._heartbeat_stop.set()
+        except Exception:
+            pass
+        try:
+            self.store.deactivate_controller_instance(self.instance_id)
+        except Exception:
+            pass
         self.db.close_thread()
 
 

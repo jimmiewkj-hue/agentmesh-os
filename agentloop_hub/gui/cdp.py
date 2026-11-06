@@ -266,6 +266,7 @@ def send_visible_prompt_via_cdp(text: str, *, port: int,
                                 timeout: float = 10.0,
                                 submit_retries: int = 20,
                                 submit_interval: float = 0.5,
+                                page_id: str = "",
                                 transport: CdpTransport | None = None) -> dict[str, Any]:
     """Insert into the visible composer and click its send control.
 
@@ -277,7 +278,7 @@ def send_visible_prompt_via_cdp(text: str, *, port: int,
     """
     own = transport is None
     if own:
-        chosen = _pick_page(_targets(port))
+        chosen = _pick_page(_targets(port), page_id=page_id)
         if not chosen:
             raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
         transport = WebSocketTransport(chosen["webSocketDebuggerUrl"],
@@ -316,10 +317,11 @@ def send_visible_prompt_via_cdp(text: str, *, port: int,
 
 
 def composer_text_via_cdp(port: int = 9223, *, timeout: float = 10.0,
+                          page_id: str = "",
                           transport: CdpTransport | None = None) -> dict[str, Any]:
     own = transport is None
     if own:
-        chosen = _pick_page(_targets(port))
+        chosen = _pick_page(_targets(port), page_id=page_id)
         if not chosen:
             raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
         transport = WebSocketTransport(chosen["webSocketDebuggerUrl"],
@@ -358,8 +360,9 @@ def switch_workbuddy_conversation(session_id: str, port: int = 9223, *,
       await api.setCurrentConversation(value);
       await new Promise(resolve => setTimeout(resolve, 700));
       const current = typeof api.currentId === 'string' ? api.currentId : '';
-      if (!current || current === sessionId) {
-        return {ok: true, current_id: current || sessionId};
+      // An empty current id proves nothing; only an exact match does.
+      if (current === sessionId) {
+        return {ok: true, current_id: current};
       }
     } catch (err) {
       error = String(err);
@@ -386,7 +389,7 @@ def switch_workbuddy_conversation(session_id: str, port: int = 9223, *,
 
 
 def send_workbuddy_conversation_prompt(session_id: str, text: str,
-                                       port: int = 9223, *,
+                                       port: int = 9223, *, page_id: str = "",
                                        timeout: float = 30.0) -> dict[str, Any]:
     """Send a prompt into an existing WorkBuddy conversation via prepareInput.
 
@@ -397,7 +400,7 @@ def send_workbuddy_conversation_prompt(session_id: str, text: str,
     session_id = str(session_id or "").strip()
     if not session_id:
         return {"ok": False, "reason": "EMPTY_SESSION_ID"}
-    page = _pick_page(_targets(port))
+    page = _pick_page(_targets(port), page_id=page_id)
     if not page:
         return {"ok": False, "reason": "NO_CDP_PAGE"}
     transport = WebSocketTransport(
@@ -410,9 +413,11 @@ def send_workbuddy_conversation_prompt(session_id: str, text: str,
   if (!api || typeof api.prepareInput !== 'function') {
     return {ok: false, reason: 'NO_PREPARE_INPUT'};
   }
-  if (api.currentId && api.currentId !== sessionId) {
-    return {ok: false, reason: 'CONVERSATION_MISMATCH',
-            current_id: api.currentId};
+  if (!api.currentId || api.currentId !== sessionId) {
+    // Sending into "active" without a proven current session is exactly the
+    // unowned-target bug: empty currentId must block, not pass.
+    return {ok: false, reason: 'CONVERSATION_UNVERIFIED',
+            current_id: api.currentId || ''};
   }
   try {
     await api.prepareInput({
@@ -505,7 +510,7 @@ def sync_workbuddy_selection_preferences(
         *, port: int = 9223, model_id: str = "", context_length: int = 0,
         capability_level: str = "", user_id: str = "",
         reload_if_changed: bool = True,
-        timeout: float = 20.0) -> dict[str, Any]:
+        timeout: float = 20.0, retry_seconds: float = 15.0) -> dict[str, Any]:
     """Write WorkBuddy's own new-task preferences before the deeplink.
 
     WorkBuddy keeps the per-model context window in
@@ -518,14 +523,22 @@ def sync_workbuddy_selection_preferences(
     model_id = str(model_id or "").strip()
     if not model_id or (not context_length and not capability_level):
         return {"ok": True, "changed": False, "skipped": "no profile"}
-    page = _pick_page(_targets(port))
-    if not page:
-        return {"ok": False, "reason": "NO_CDP_PAGE"}
-    transport = WebSocketTransport(
-        page["webSocketDebuggerUrl"],
-        origin=f"http://127.0.0.1:{int(port)}", timeout=timeout)
-    try:
-        expression = """(async () => {
+    # A freshly started WorkBuddy renderer exposes the page before its
+    # user-scoped storage finishes booting.  Treating that transient state as
+    # a hard failure burned whole task attempts, so wait for wb.storage.user.
+    deadline = time.time() + max(0.0, float(retry_seconds))
+    while True:
+        page = _pick_page(_targets(port))
+        if not page:
+            if time.time() >= deadline:
+                return {"ok": False, "reason": "NO_CDP_PAGE"}
+            time.sleep(0.5)
+            continue
+        transport = WebSocketTransport(
+            page["webSocketDebuggerUrl"],
+            origin=f"http://127.0.0.1:{int(port)}", timeout=timeout)
+        try:
+            expression = """(async () => {
   const modelId = %s, context = %d, capability = %s, userId = %s;
   const storage = globalThis.wb?.storage?.user;
   if (!storage) return {ok: false, reason: 'NO_USER_STORAGE'};
@@ -585,18 +598,22 @@ def sync_workbuddy_selection_preferences(
   };
 })()""" % (json.dumps(model_id), int(context_length or 0),
            json.dumps(str(capability_level or "")), json.dumps(str(user_id or "")))
-        response = transport.call("Runtime.evaluate", {
-            "expression": expression, "awaitPromise": True,
-            "returnByValue": True,
-        }, timeout)
-        value = response.get("result", {}).get("result", {}).get("value") or {}
-        if response.get("result", {}).get("exceptionDetails"):
-            return {"ok": False, "reason": "SCRIPT_ERROR",
-                    "details": response["result"]["exceptionDetails"]}
-    except Exception as exc:
-        return {"ok": False, "reason": str(exc)}
-    finally:
-        transport.close()
+            response = transport.call("Runtime.evaluate", {
+                "expression": expression, "awaitPromise": True,
+                "returnByValue": True,
+            }, timeout)
+            value = response.get("result", {}).get("result", {}).get("value") or {}
+            if response.get("result", {}).get("exceptionDetails"):
+                return {"ok": False, "reason": "SCRIPT_ERROR",
+                        "details": response["result"]["exceptionDetails"]}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+        finally:
+            transport.close()
+        if value.get("reason") == "NO_USER_STORAGE" and time.time() < deadline:
+            time.sleep(0.5)
+            continue
+        break
     if value.get("ok") and value.get("changed") and reload_if_changed:
         try:
             transport = WebSocketTransport(
@@ -621,6 +638,7 @@ def submit_composer_via_cdp(port: int = 9223, *, timeout: float = 10.0,
                             submit_retries: int = 12,
                             submit_interval: float = 0.4,
                             expect_contains: str = "",
+                            page_id: str = "",
                             transport: CdpTransport | None = None) -> dict[str, Any]:
     """Submit an already-prefilled composer (WorkBuddy deeplink path).
 
@@ -630,7 +648,7 @@ def submit_composer_via_cdp(port: int = 9223, *, timeout: float = 10.0,
     """
     own = transport is None
     if own:
-        chosen = _pick_page(_targets(port))
+        chosen = _pick_page(_targets(port), page_id=page_id)
         if not chosen:
             raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
         transport = WebSocketTransport(chosen["webSocketDebuggerUrl"],
@@ -772,11 +790,16 @@ def send_prompt_via_cdp(text: str, *, port: int = 9222, timeout: float = 10.0,
 
 
 
-def stop_workbuddy_task(port: int = 9223, *, timeout: float = 6.0) -> dict[str, Any]:
-    """Click WorkBuddy's own visible stop control (no OS input)."""
-    own = True
+def stop_workbuddy_task(port: int = 9223, *, timeout: float = 6.0,
+                        page_id: str = "", session_id: str = "") -> dict[str, Any]:
+    """Click WorkBuddy's own visible stop control (no OS input).
+
+    With a session id, the click is only sent when the renderer's current
+    conversation still matches that session.  A missing match is reported as
+    unconfirmed instead of stopping whatever conversation happens to be active.
+    """
     try:
-        page = _pick_page(_targets(port))
+        page = _pick_page(_targets(port), page_id=page_id)
         if not page:
             return {"ok": False, "reason": "NO_PAGE"}
         transport = WebSocketTransport(page["webSocketDebuggerUrl"],
@@ -786,7 +809,12 @@ def stop_workbuddy_task(port: int = 9223, *, timeout: float = 6.0) -> dict[str, 
         return {"ok": False, "reason": str(exc)}
     try:
         value = _evaluate(transport, """
-(() => {
+((sessionId) => {
+  const api = globalThis.wb?.conversations;
+  if (sessionId && (!api || api.currentId !== sessionId)) {
+    return {ok: false, reason: 'CONVERSATION_UNVERIFIED',
+            current_id: (api && api.currentId) || ''};
+  }
   for (const el of document.querySelectorAll('button,[role="button"],div')) {
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) continue;
@@ -795,8 +823,8 @@ def stop_workbuddy_task(port: int = 9223, *, timeout: float = 6.0) -> dict[str, 
     if (/(stop|停止|中断)/i.test(label)) { el.click(); return {ok: true, label: label.slice(0,120)}; }
   }
   return {ok: false, reason: 'NO_STOP_BUTTON'};
-})()
-""", timeout) or {}
+})(%s)
+""" % json.dumps(session_id), timeout) or {}
         return value
     finally:
         transport.close()

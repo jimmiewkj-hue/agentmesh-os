@@ -72,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--max-tasks", type=int, default=4)
     solve.add_argument("--max-parallel", type=int, default=1)
     solve.add_argument("--no-start", action="store_true", help="只生成计划与绑定，不运行")
+    solve.add_argument("--approve", action="store_true",
+                       help="显式批准本次计划（批处理必须显式授权）")
     solve.add_argument("--polish", action="store_true", help="用汇总角色润色最终答案")
     solve.add_argument("--block", action="store_true", help="前台等待运行结束后输出答案")
 
@@ -532,6 +534,7 @@ def _solve_command(hub: Hub, args: argparse.Namespace) -> Any:
         start=not args.no_start,
         background=False if (args.block or not args.no_start) else True,
         polish=args.polish,
+        approve=bool(getattr(args, "approve", False)),
     )
     if args.no_start or not result.get("run_id"):
         return result

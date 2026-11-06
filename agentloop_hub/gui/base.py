@@ -21,6 +21,7 @@ GUI_ERROR_CODES: dict[str, str] = {
     "GUI_STALLED": "Agent 会话长时间无新增事件（疑似卡死）",
     "GUI_REPLY_PARSE_FAILED": "无法从回复中解析结构化 JSON",
     "GUI_RESULT_MISSING": "Agent 未产出成果包",
+    "GUI_RESULT_INVALID": "Agent 产出的成果包不合法",
     "GUI_SCREENSHOT_FAILED": "截图失败",
     "GUI_DRIVER_ERROR": "GUI 驱动内部错误",
     "GUI_INPUT_FORBIDDEN": "零 OS 输入策略禁止键鼠/剪贴板合成",
@@ -39,6 +40,8 @@ GUI_ERROR_CODES: dict[str, str] = {
     "MODEL_STREAM_ERROR": "模型流在应用内中断（上游返回错误/空流）",
     "GUI_CANCELED": "任务在 Agent 应用内被用户中断",
     "PROFILE_SYNC_FAILED": "模型上下文/能力等级未能写入 Agent 应用",
+    "PERMISSION_TOO_BROAD": "会话权限高于本次授权范围，无法安全继续",
+    "SESSION_BINDING_UNCONFIRMED": "无法证明本次执行会话/窗口的归属",
 }
 
 

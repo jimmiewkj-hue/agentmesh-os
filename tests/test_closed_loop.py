@@ -8,7 +8,7 @@ import pytest
 
 from agentloop_hub.errors import ConflictError, ValidationError
 from agentloop_hub.models import TaskStatus
-from conftest import default_plan, make_project, register_mock_agents, write_scenario
+from hub_test_support import default_plan, make_project, register_mock_agents, write_scenario
 
 
 def run_plan(hub, goal="fix add"):
@@ -273,7 +273,10 @@ def test_relay_result_submission_and_resume(tmp_path):
         "token_usage": {"input": 10, "output": 2}, "cost_estimate": {},
         "recommended_next_action": [],
     }
-    hub.submit_result(t1["uid"], payload)
+    attempt = hub.store.get_attempt(t1["active_attempt_id"]) if t1.get("active_attempt_id") else {}
+    hub.submit_result(t1["uid"], payload,
+                      attempt_id=t1.get("active_attempt_id", ""),
+                      request_id=str((attempt or {}).get("request_id") or ""))
     # After submitting the result the control plane can finish verification.
     result2 = hub.start_run(run_id, max_parallel=2)
     assert result2["status"] in ("pending_acceptance", "waiting_user"), result2

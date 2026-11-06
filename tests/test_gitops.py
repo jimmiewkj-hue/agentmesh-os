@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -106,3 +107,91 @@ def test_status_porcelain_parsing(git_repo):
     status = status_porcelain(git_repo)
     assert status[0]["path"] == "calc.py"
     assert status[0]["status"].strip().startswith("M")
+
+
+def test_generated_patch_excludes_dependencies_and_build_output(git_repo, tmp_path):
+    wt = tmp_path / "wt_excl"
+    create_worktree(str(git_repo), str(wt), "HEAD")
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (wt / "node_modules" / ".bin").mkdir(parents=True)
+    (wt / "node_modules" / ".bin" / "browsers").write_text("x", encoding="utf-8")
+    (wt / "dist" / "assets").mkdir(parents=True)
+    (wt / "dist" / "assets" / "app.js").write_text("built", encoding="utf-8")
+    (wt / "docs").mkdir()
+    (wt / "docs" / "note.md").write_text("note", encoding="utf-8")
+    patch = tmp_path / "out.patch"
+    generate_patch(str(wt), str(patch))
+    files = patch_files(patch)
+    assert "calc.py" in files
+    assert "docs/note.md" in files
+    assert not any(name.startswith("node_modules/") for name in files)
+    assert not any(name.startswith("dist/") for name in files)
+
+
+def test_applying_old_patch_can_exclude_build_artifacts(git_repo, tmp_path):
+    wt = tmp_path / "wt_old"
+    create_worktree(str(git_repo), str(wt), "HEAD")
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (wt / "dist").mkdir()
+    (wt / "dist" / "app.js").write_text("built", encoding="utf-8")
+    (wt / "node_modules" / ".bin").mkdir(parents=True)
+    (wt / "node_modules" / ".bin" / "tool").write_text("x", encoding="utf-8")
+    full_patch = tmp_path / "full.patch"
+    generate_patch(str(wt), str(full_patch), exclude_prefixes=())
+    assert any(name.startswith("dist/") for name in patch_files(full_patch))
+
+    target = tmp_path / "wt_apply"
+    create_worktree(str(git_repo), str(target), "HEAD")
+    from agentloop_hub.workspace import PATCH_EXCLUDE_PREFIXES
+    ok, message = apply_patch(
+        str(target), str(full_patch), three_way=False,
+        exclude_prefixes=PATCH_EXCLUDE_PREFIXES)
+    assert ok, message
+    assert "return a + b" in (target / "calc.py").read_text(encoding="utf-8")
+    assert not (target / "dist").exists()
+    assert not (target / "node_modules").exists()
+
+
+def test_patch_files_decodes_quoted_git_paths(tmp_path):
+    patch = tmp_path / "quoted.patch"
+    patch.write_text(
+        r'diff --git "a/docs/01-\345\213\230\345\257\237.md" '
+        r'"b/docs/01-\345\213\230\345\257\237.md"' + "\n" +
+        r'--- "a/docs/01-\345\213\230\345\257\237.md"' + "\n" +
+        r'+++ "b/docs/01-\345\213\230\345\257\237.md"' + "\n" +
+        "@@ -0,0 +1 @@\n+hello\n",
+        encoding="utf-8",
+    )
+    assert patch_files(patch) == ["docs/01-勘察.md"]
+
+
+def test_overlapping_upstream_patches_compose_with_three_way(git_repo, tmp_path):
+    from agentloop_hub.workspace import create_worktree
+
+    first = tmp_path / "first"
+    create_worktree(str(git_repo), str(first), "HEAD")
+    (first / "shared.txt").write_text("one\n", encoding="utf-8")
+    (first / "a.txt").write_text("a\n", encoding="utf-8")
+    patch_a = tmp_path / "a.patch"
+    generate_patch(str(first), str(patch_a))
+
+    second = tmp_path / "second"
+    create_worktree(str(git_repo), str(second), "HEAD")
+    apply_patch(str(second), str(patch_a), three_way=True)
+    subprocess.run(["git", "add", "-A"], cwd=second, check=True)
+    subprocess.run(["git", "commit", "-qm", "a"], cwd=second, check=True)
+    (second / "shared.txt").write_text("two\n", encoding="utf-8")
+    (second / "b.txt").write_text("b\n", encoding="utf-8")
+    patch_b = tmp_path / "b.patch"
+    generate_patch(str(second), str(patch_b))
+
+    third = tmp_path / "third"
+    create_worktree(str(git_repo), str(third), "HEAD")
+    ok, message = apply_patch(str(third), str(patch_a), three_way=True)
+    assert ok, message
+    subprocess.run(["git", "add", "-A"], cwd=third, check=True)
+    subprocess.run(["git", "commit", "-qm", "a"], cwd=third, check=True)
+    ok, message = apply_patch(str(third), str(patch_b), three_way=True)
+    assert ok, message
+    assert (third / "shared.txt").read_text(encoding="utf-8") == "two\n"
+    assert (third / "a.txt").exists() and (third / "b.txt").exists()

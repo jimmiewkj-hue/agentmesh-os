@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from conftest import make_project
+from hub_test_support import make_project
 
 
 def test_version_ledger_and_drift_detection(tmp_path):

@@ -334,8 +334,12 @@ def build_workbuddy_deeplink(*, workspace: str, model_key: str, prompt: str,
     params = {
         "action": "start", "prompt": prompt, "cwd": str(workspace),
         "model": model_key, "welcomeMode": welcome_mode,
-        "permissionMode": permission_mode, "mode": agent_mode,
+        "mode": agent_mode,
     }
+    # An empty permission mode means "do not request elevated access"; omit
+    # the field instead of sending an invalid value.
+    if permission_mode:
+        params["permissionMode"] = permission_mode
     query = "&".join(f"{key}={quote(str(value), safe='')}" for key, value in params.items())
     return f"workbuddy://task?{query}"
 
@@ -396,7 +400,8 @@ def _norm_path(value: str | Path) -> str:
 def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
                          timeout_seconds: float = 40.0,
                          force_restart: bool = False,
-                         allow_restart: bool = False) -> InterfaceOutcome:
+                         allow_restart: bool = False,
+                         allow_launch: bool = True) -> InterfaceOutcome:
     """Make sure WorkBuddy's renderer exposes DevTools.
 
     WorkBuddy's task deeplink only calls ``prepareInput``; it does not send.
@@ -438,6 +443,14 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
             error_code="APP_RESTART_REQUIRED",
             evidence={"port": int(port), "process_running": True,
                       "required": "explicit restart"},
+        )
+    if not running and not allow_launch:
+        return InterfaceOutcome(
+            False, "cdp", {"port": int(port), "running": False}, {},
+            reason="只读预检不会启动 WorkBuddy",
+            error_code="APP_NOT_RUNNING",
+            evidence={"port": int(port), "process_running": False,
+                      "launch_allowed": False},
         )
     close_info: dict[str, Any] = {"method": "not_running"}
     if running:
@@ -691,9 +704,16 @@ def verify_workbuddy_task(*, workspace: str, model: str, started_at: float,
     elif actual["source_mode"] != expected["source_mode"]:
         code = "GUI_MODE_MISMATCH"
         reason = f"期望模式 {expected['source_mode']}，实际 {actual['source_mode']}"
-    elif actual["permission_mode"] != expected["permission_mode"]:
+    elif expected["permission_mode"] and actual["permission_mode"] != expected["permission_mode"]:
         code = "GUI_MODE_MISMATCH"
         reason = f"期望权限 {expected['permission_mode']}，实际 {actual['permission_mode']}"
+    elif not expected["permission_mode"] and str(actual["permission_mode"]).lower() in (
+            "fullaccess", "full_access", "bypasspermissions", "bypass_permissions"):
+        code = "PERMISSION_TOO_BROAD"
+        reason = (
+            "未开启完全控制，但 WorkBuddy 会话仍为完全访问；"
+            "无法在不使用 OS 输入的情况下收紧，已阻止继续"
+        )
     return InterfaceOutcome(not code, "db_read", expected, actual,
                             evidence=evidence, reason=reason, error_code=code)
 
@@ -914,19 +934,38 @@ def prepare_qoder_session(*, workspace: str, model: str,
                           permission_mode: str = "",
                           stop_process: Any = None,
                           start_app: Any = None,
-                          timeout_seconds: float = 30.0) -> InterfaceOutcome:
+                          timeout_seconds: float = 30.0,
+                          allow_restart: bool = False,
+                          allow_history_migration: bool = False,
+                          owned_session_id: str = "") -> InterfaceOutcome:
     """Move the current Qoder session onto ``workspace`` and set its model.
 
     The Qoder agent runtime resumes from the transcript, so both the sqlite
     session row and the transcript's ``workspace-directories`` event are
     rewritten.  The app is restarted because it restores the last session at
     startup.
+
+    This operation stops every Qoder process and rewrites the user's current
+    transcript.  It is therefore only allowed when the caller explicitly
+    authorises a restart *and* history migration (the preflight/restart action
+    in the UI).  A normal task preparation gets a structured block instead of
+    silently touching the user's own session.
     """
     config = dict(config or {})
     key = qoder_model_key(model)
     if not key:
         return InterfaceOutcome(False, "db_write", {"model": model}, {},
                                 reason="model is empty", error_code="MODEL_UNAVAILABLE")
+    if not (allow_restart and allow_history_migration):
+        return InterfaceOutcome(
+            False, "blocked", {"workspace": workspace, "model": key}, {},
+            evidence={"owned_session_id": owned_session_id},
+            reason=(
+                "Qoder 常规执行不允许停止应用或迁移用户历史会话；"
+                "请在预检/重启步骤中显式授权，或先为本次运行建立独立会话"
+            ),
+            error_code="SESSION_BINDING_UNCONFIRMED",
+        )
     db = qoder_db_path(config)
     projects = qoder_projects_root(config)
     current = _qoder_current_session(db)

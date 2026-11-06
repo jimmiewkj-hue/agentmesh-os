@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from conftest import ROOT, default_plan, make_project
+from hub_test_support import ROOT, default_plan, make_project
 
 
 def cli(repo: Path, *args: str) -> subprocess.CompletedProcess:

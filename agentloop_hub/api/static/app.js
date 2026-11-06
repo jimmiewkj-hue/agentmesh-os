@@ -11,6 +11,13 @@ const state = {
   chainDraft: null, chainRunId: '', chainTimer: null,
   chainHydratedFor: '', chainPersistTimer: null, manualAlertKey: '',
   bindingTask: null,
+  // Which control last changed the main model.  Save and plan generation must
+  // read the same canonical value, not two competing fields.
+  mainModelSource: 'select',
+  chainDraftStatus: 'saved', chainConflict: false,
+  // Incremented on every project switch.  Late responses from the previous
+  // project are discarded instead of overwriting the new view.
+  wsGeneration: 0,
 };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
@@ -32,8 +39,19 @@ function toast(msg, error = false) {
   setTimeout(() => { t.className = 'toast' + (error ? ' error' : ''); }, 3800);
 }
 
+let controlToken = '';
+async function ensureControlToken() {
+  if (controlToken) return controlToken;
+  const res = await fetch('/api/session', { cache: 'no-store' });
+  const data = await res.json();
+  controlToken = data.token || '';
+  return controlToken;
+}
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const token = await ensureControlToken();
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (token) headers['X-AgentMesh-Token'] = token;
+  const res = await fetch(path, { ...opts, headers });
   let data;
   try { data = await res.json(); } catch (e) { data = { error: { message: '响应不是 JSON' } }; }
   if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
@@ -115,10 +133,13 @@ function route() {
 }
 
 async function refresh() {
+  const generation = state.wsGeneration;
   try {
     const ws = await api('/api/workspace');
+    if (generation !== state.wsGeneration) return;
     state.workspace = ws;
     state.settings = await api('/api/settings').catch(() => null);
+    if (generation !== state.wsGeneration) return;
     if (!ws.open) {
       state.overview = null; state.models = null; state.versionStatus = null;
       render();
@@ -133,6 +154,7 @@ async function refresh() {
       api('/api/agents/models'), api('/api/agents/version-status'),
       api('/api/agents/models/sync').catch(() => null),
     ]);
+    if (generation !== state.wsGeneration) return;
     state.overview = ov;
     state.plans = plans.plans || [];
     state.runs = runs.runs || [];
@@ -248,7 +270,11 @@ function modelOptions(agentId, selected) {
   const names = [];
   (item.models || []).forEach((m) => {
     names.push(m.name);
-    const label = m.display_name || m.name;
+    const baseLabel = m.display_name || m.name;
+    // Two real ids can share one display label; keep the id visible so the
+    // picker is not ambiguous.
+    const label = (m.display_name && m.display_name !== m.name)
+      ? `${baseLabel} (${m.name})` : baseLabel;
     const rate = (m.rate != null) ? ` · x${m.rate}` : '';
     html += `<option value="${esc(m.name)}" ${m.name === selected ? 'selected' : ''}>${esc(label)}${rate} · ${esc(m.source_label || m.source)}</option>`;
   });
@@ -380,8 +406,13 @@ function renderCommandAgents() {
   const selectedMain = $('mainAgent').value || mainId;
   const mainEntry = ((state.models || {}).by_agent || {})[selectedMain] || {};
   $('mainModelSelect').innerHTML = modelOptions(selectedMain, mainEntry.selected_model || (main ? main.model : ''));
+  const modelInput = $('mainModel');
+  if (modelInput && !modelInput.dataset.bound) {
+    modelInput.dataset.bound = '1';
+    modelInput.addEventListener('input', onMainModelInput);
+  }
   if (main && !$('mainModel').value) $('mainModel').value = main.model || '';
-  const mainModel = $('mainModelSelect').value || (main ? main.model : '');
+  const mainModel = currentMainModel() || (main ? main.model : '');
   fillProfileInputs('mainContext', 'mainCapability', selectedMain, mainModel);
   $('mainBudget').value = main ? (main.budget_tokens || 0) : 0;
   const mainWarning = mainEntry.profile_warning || '';
@@ -433,16 +464,24 @@ function onMainAgentChange() {
     : '该 Agent 暂未探测到模型；可手填模型名。';
 }
 function syncMainCustom() {
+  state.mainModelSource = 'select';
   $('mainModel').value = $('mainModelSelect').value;
   fillProfileInputs('mainContext', 'mainCapability', $('mainAgent').value,
     $('mainModelSelect').value);
 }
+function onMainModelInput() {
+  state.mainModelSource = 'input';
+}
+function currentMainModel() {
+  const typed = ($('mainModel') && $('mainModel').value || '').trim();
+  const selected = ($('mainModelSelect') && $('mainModelSelect').value) || '';
+  if (state.mainModelSource === 'input') return typed || selected;
+  return selected || typed;
+}
 
 async function autoMain() {
   try {
-    const r = await post('/api/main/auto', {
-      model: $('mainModel').value.trim() || $('mainModelSelect').value,
-    });
+    const r = await post('/api/main/auto', { model: currentMainModel() });
     toast(`自动主节点：${r.agent_id} · ${r.model}`);
     refresh();
   } catch (e) { toast(e.message, true); }
@@ -477,7 +516,7 @@ async function saveBudget() {
 async function saveMain() {
   const agent = $('mainAgent').value;
   if (!agent) { toast('请选择主节点 Agent', true); return; }
-  const model = $('mainModel').value.trim() || $('mainModelSelect').value;
+  const model = currentMainModel();
   const contextLength = Math.max(0, Number($('mainContext').value || 0));
   const capabilityLevel = $('mainCapability').value || '';
   try {
@@ -597,8 +636,10 @@ function renderCommandChainNodes() {
     (((state.overview || {}).manual_actions) || []).map((a) => [a.task_uid, a.manual_action || {}]));
   const rows = tasks.map((t) => {
     const manualKind = (manualByUid[t.uid] || {}).kind || '';
-    const canRetry = ['failed', 'blocked'].includes(t.status)
-      || (t.status === 'waiting_user' && manualKind !== 'manual_submit');
+    const submissionUnconfirmed = String(t.error || '').startsWith('SUBMISSION_');
+    const canRetry = !submissionUnconfirmed && (
+      ['failed', 'blocked'].includes(t.status)
+      || (t.status === 'waiting_user' && manualKind !== 'manual_submit'));
     const manual = String(t.error || '').startsWith('MANUAL_ACTION_REQUIRED');
     const started = t.started_at ? new Date(t.started_at).getTime() : 0;
     const finished = t.finished_at ? new Date(t.finished_at).getTime() : 0;
@@ -618,6 +659,7 @@ function renderCommandChainNodes() {
         ? '验证通过但有警告（可能是 scope 超出计划范围），详见任务详情' : '')).slice(0, 160))}</td>
       <td>${!['completed', 'canceled', 'rejected', 'running', 'verifying'].includes(t.status)
         ? `<button class="small" onclick="openBindingEditor('${esc(t.uid)}')">编辑绑定</button>` : ''}
+        ${submissionUnconfirmed ? `<button class="primary small" onclick="reconcileNode('${esc(t.uid)}','${esc(run.run_id)}')">核对原请求</button>` : ''}
         ${canRetry ? `<button class="small" onclick="retryNode('${esc(t.uid)}','${esc(run.run_id)}')">重试节点</button>` : ''}
         ${t.status === 'failed' ? `<button class="small" onclick="reverifyNode('${esc(t.uid)}')">重新验证</button>` : ''}
         ${manual ? `<button class="small" onclick="refresh()">刷新状态</button>` : ''}</td>
@@ -680,7 +722,8 @@ function renderBlockAlert() {
       <div class="row" style="margin-top:6px">
         ${restart ? `<button class="primary small" onclick="restartAgentInterface('${esc(a.agent_id)}','${esc(a.task_uid)}','${esc(run.run_id)}')">重启 Agent 接口</button>` : ''}
         ${synthetic ? `<button class="primary small" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
-        ${!synthetic && (restart || ['agent_not_running', 'agent_busy', 'login_required'].includes(kind)) ? `<button class="small" onclick="retryNode('${esc(a.task_uid)}','${esc(run.run_id)}')">重试该节点</button>` : ''}
+        ${!synthetic && String(a.error || '').startsWith('SUBMISSION_') ? `<button class="primary small" onclick="reconcileNode('${esc(a.task_uid)}','${esc(run.run_id)}')">核对原请求</button>` : ''}
+        ${!synthetic && !String(a.error || '').startsWith('SUBMISSION_') && (restart || ['agent_not_running', 'agent_busy', 'login_required'].includes(kind)) ? `<button class="small" onclick="retryNode('${esc(a.task_uid)}','${esc(run.run_id)}')">重试该节点</button>` : ''}
         <button class="small" onclick="refresh()">刷新状态</button>
       </div>
     </div>`;
@@ -727,11 +770,24 @@ function renderAgents() {
   const agents = ov.agents.list || [];
   const manifest = ((ov.connectors || {}).manifest || {}).agents || [];
   const capabilityById = Object.fromEntries(manifest.map((m) => [m.agent_id, m.capability || []]));
+  const evidenceById = Object.fromEntries(manifest.map((m) => [m.agent_id, m.capability_evidence || {}]));
   const scoreById = Object.fromEntries((((ov.router || {}).agents) || []).map((r) => [r.agent_id, r.stats || {}]));
   const modelsByAgent = (state.models || {}).by_agent || {};
   $('agentCards').innerHTML = agents.map((a) => {
     const capabilityList = capabilityById[a.agent_id] || Object.entries(a.capabilities || {}).filter(([k, v]) => v).map(([k]) => k);
-    const caps = capabilityList.map((k) => `<span class="tag">${esc(k)}</span>`).join('');
+    const evidence = evidenceById[a.agent_id] || {};
+    const evidenceClass = { disabled: 'bad', degraded: 'warn', probed: 'ok', declared: '' };
+    const caps = capabilityList.map((k) => {
+      const e = evidence[k] || {};
+      const cls = evidenceClass[e.status] || '';
+      const tip = [e.status, e.source].filter(Boolean).join(' · ');
+      return `<span class="tag ${cls}" title="${esc(tip)}">${esc(k)}${e.status ? ' · ' + esc(e.status) : ''}</span>`;
+    }).join('');
+    const auto = evidence.auto_executable || {};
+    const autoPill = auto.status
+      ? `<span class="pill ${auto.status === 'probed' ? 'ok' : auto.status === 'degraded' ? 'warn' : 'bad'}"
+           title="${esc(auto.last_error || auto.source || '')}">自动执行 ${esc(auto.status)}</span>`
+      : '';
     const stats = scoreById[a.agent_id] || {};
     const entry = modelsByAgent[a.agent_id] || {};
     return `<div class="card">
@@ -740,8 +796,9 @@ function renderAgents() {
       </div>
       <div class="sub">${esc(a.agent_id)} · ${esc(a.product)} ${esc(a.edition)} · v${esc(a.version)}</div>
       <div style="margin:8px 0"><span class="pill info">${esc(a.access_level)}</span><span class="pill">${esc(a.adapter_type)}</span>
+        ${autoPill}
         <span class="pill ${entry.selected_model ? 'ok' : ''}">模型 ${esc(entry.selected_model || '未选配')}</span></div>
-      <div class="sub">模型清单：${(entry.models || []).slice(0, 8).map((m) => esc(m.name)).join(', ') || '未探测'}</div>
+      <div class="sub">模型清单（${(entry.models || []).length}）：${(entry.models || []).map((m) => esc(m.name)).join(', ') || '未探测'}</div>
       <label>选配模型</label>
       <select onchange="setAgentModelFromCard('${esc(a.agent_id)}', this.value)">${modelOptions(a.agent_id, entry.selected_model || '')}</select>
       <div class="sub" style="margin-top:8px">任务 ${a.metrics ? esc(a.metrics.tasks_total) : 0} · 成功率 ${a.metrics ? esc((a.metrics.success_rate * 100).toFixed(1) + '%') : '—'} · 平均成本 ${money(stats.avg_cost)} · 平均耗时 ${fmt(Math.round(stats.avg_duration_ms || 0))}ms</div>
@@ -863,13 +920,35 @@ function ensureChainDraft() {
   if (state.chainDraft && state.chainHydratedFor === projectKey) return;
   let draft = null;
   const server = ((state.overview || {}).chain_draft) || {};
-  if (Array.isArray(server.stages) && server.stages.length
-      && (!server.project_id || server.project_id === projectKey)) {
+  const serverValid = Array.isArray(server.stages) && server.stages.length
+    && (!server.project_id || server.project_id === projectKey);
+  let local = null;
+  try { local = JSON.parse(localStorage.getItem(chainStorageKey()) || 'null'); }
+  catch (e) { local = null; }
+  const serverRev = serverValid ? Number(server.revision || 0) : 0;
+  const localRev = local ? Number(local.revision || 0) : 0;
+  const localBase = local ? Number(local.base_revision || local.revision || 0) : 0;
+  if (local && local.dirty && serverValid && localBase < serverRev) {
+    // Both sides changed since the local draft was based on the server copy.
+    draft = local;
+    state.chainDraftStatus = 'conflict';
+  } else if (local && local.dirty && (!serverValid || localBase >= serverRev)) {
+    // Unsaved local edits on top of the current server revision must win over
+    // the server copy on refresh (same revision number is not "older").
+    draft = local;
+    state.chainDraftStatus = 'dirty';
+  } else if (local && localRev > serverRev) {
+    draft = local;
+    state.chainDraftStatus = 'saved';
+  } else if (serverValid) {
     draft = server;
+    state.chainDraftStatus = 'saved';
+  } else if (local) {
+    draft = local;
+    state.chainDraftStatus = local.dirty ? 'dirty' : 'saved';
   }
   if (!draft) {
-    try { draft = JSON.parse(localStorage.getItem(chainStorageKey()) || 'null'); }
-    catch (e) { draft = null; }
+    state.chainDraftStatus = 'saved';
   }
   if (!draft) {
     const plan = pendingPlan();
@@ -895,13 +974,21 @@ function renderChainPlanInfo() {
   const plan = pendingPlan();
   const bound = state.chainDraft.plan_id || '';
   const count = (state.chainDraft.stages || []).length;
+  const draftState = {
+    saved: '草稿已保存',
+    dirty: '草稿未保存',
+    saving: '草稿保存中…',
+    failed: '草稿保存失败（本地已保留）',
+    conflict: '草稿冲突：服务器已有更新，请确认后另存',
+  }[state.chainDraftStatus || 'saved'];
   if (bound) {
     const target = (state.plans || []).find((p) => p.plan_id === bound);
     box.innerHTML = `绑定计划 <span class="mono">${esc(bound)}</span> · ${count} 个阶段`
       + (target ? ` · <span class="pill ${pillClass(target.status)}">${esc(target.status)}</span>` : '')
-      + (plan && plan.plan_id !== bound ? ' · <b style="color:#b45309">已有更新的待审批计划，请点击“从计划载入阶段”</b>' : '');
+      + (plan && plan.plan_id !== bound ? ' · <b style="color:#b45309">已有更新的待审批计划，请点击“从计划载入阶段”</b>' : '')
+      + ` · <span class="sub">${esc(draftState)}</span>`;
   } else {
-    box.textContent = `独立链路 · ${count} 个阶段（保存后生成待审批计划）`;
+    box.textContent = `独立链路 · ${count} 个阶段（保存后生成待审批计划）· ${draftState}`;
   }
 }
 
@@ -987,10 +1074,39 @@ function chainFieldChanged() {
   state.chainDraft.stages = chainCollect();
   state.chainDraft.goal = $('chainGoal') ? $('chainGoal').value : state.chainDraft.goal;
   state.chainDraft.policy = $('chainPolicy') ? $('chainPolicy').value : state.chainDraft.policy;
+  state.chainDraft.dirty = true;
+  if (state.chainDraft.base_revision === undefined) {
+    state.chainDraft.base_revision = Number(state.chainDraft.revision || 0);
+  }
+  state.chainDraft.local_updated_at = new Date().toISOString();
+  state.chainDraftStatus = 'dirty';
   try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
+  renderChainPlanInfo();
   clearTimeout(state.chainPersistTimer);
+  const editProjectKey = state.chainHydratedFor;
   state.chainPersistTimer = setTimeout(() => {
-    post('/api/chain/draft', { draft: state.chainDraft }).catch(() => { /* draft is also local */ });
+    if (!state.chainDraft || state.chainHydratedFor !== editProjectKey) return;
+    const projectKey = state.chainHydratedFor;
+    const sent = JSON.parse(JSON.stringify(state.chainDraft));
+    sent.base_revision = Number(sent.revision || 0);
+    state.chainDraftStatus = 'saving';
+    renderChainPlanInfo();
+    post('/api/chain/draft', { draft: sent }).then((saved) => {
+      if (state.chainHydratedFor !== projectKey) return;
+      state.chainDraft.revision = Number(saved.revision || sent.base_revision + 1);
+      state.chainDraft.base_revision = state.chainDraft.revision;
+      const unchanged = JSON.stringify(state.chainDraft.stages || [])
+        === JSON.stringify(sent.stages || []);
+      state.chainDraft.dirty = !unchanged;
+      state.chainDraftStatus = unchanged ? 'saved' : 'dirty';
+      try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
+      renderChainPlanInfo();
+    }).catch((err) => {
+      if (state.chainHydratedFor !== projectKey) return;
+      const conflict = /另一处|409|conflict/i.test(err.message || '');
+      state.chainDraftStatus = conflict ? 'conflict' : 'failed';
+      renderChainPlanInfo();
+    });
   }, 700);
 }
 
@@ -1135,6 +1251,13 @@ async function saveChainConfig() {
   let planId = state.chainDraft.plan_id || '';
   const pending = pendingPlan();
   if (planId && (!pending || pending.plan_id !== planId)) {
+    const bound = (state.plans || []).find((p) => p.plan_id === planId);
+    if (bound && bound.status === 'approved') {
+      // Editing an approved plan must be an explicit new revision, never a
+      // silent standalone plan created by this save button.
+      toast('该计划已批准；如需变更请先“生成任务计划”形成新修订并重新审批', true);
+      return;
+    }
     if (pending) {
       toast('当前待审批计划已更新，请先点击“从计划载入阶段”再保存', true);
       return;
@@ -1158,8 +1281,17 @@ async function saveChainConfig() {
     });
     state.chainDraft.plan_id = result.plan_id || planId;
     state.chainDraft.goal = goal;
+    state.chainDraft.base_revision = Number(state.chainDraft.revision || 0);
+    state.chainDraft.dirty = false;
     try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
-    await post('/api/chain/draft', { draft: state.chainDraft }).catch(() => {});
+    try {
+      const savedDraft = await post('/api/chain/draft', { draft: state.chainDraft });
+      state.chainDraft.revision = Number(savedDraft.revision || 0);
+      state.chainDraftStatus = 'saved';
+    } catch (err) {
+      state.chainDraftStatus = /另一处|409|conflict/i.test(err.message || '')
+        ? 'conflict' : 'failed';
+    }
     $('chainStatus').textContent = `已保存 ${result.plan_id} · ${stages.length} 阶段（待审批）`;
     toast('链路配置已保存。请到第 4 步批准计划，再点击“开始执行”。');
     $('chainPlanInfo').textContent = `已保存到 ${result.plan_id}；第 4 步批准后才会开始执行`;
@@ -1168,6 +1300,26 @@ async function saveChainConfig() {
     $('chainStatus').textContent = '保存失败';
     toast('保存链路配置失败：' + e.message, true);
   }
+}
+
+async function reconcileNode(uid, runId) {
+  if (!uid) return;
+  try {
+    const r = await post('/api/tasks/' + encodeURIComponent(uid) + '/reconcile', {});
+    const receipt = r.receipt || {};
+    if (r.status === 'accepted') {
+      toast(r.verified ? '已核对原请求并继续验证' : '已确认送达，仍在等待应用完成');
+    } else if (r.status === 'unsupported') {
+      toast(r.reason || '该 Agent 不支持回执核对', true);
+    } else {
+      toast('仍未找到送达证据；不会自动重发，请人工检查应用', true);
+    }
+    if (runId && receipt.status === 'accepted') {
+      await post('/api/runs/' + encodeURIComponent(runId) + '/resume',
+        { background: true, max_parallel: 1 }).catch(() => {});
+    }
+    refresh();
+  } catch (e) { toast('核对失败：' + e.message, true); }
 }
 
 async function retryNode(uid, runId) {
@@ -1436,7 +1588,9 @@ async function runSolve() {
   const goal = $('solveGoal').value.trim();
   if (!goal) { toast('请先输入需求', true); return; }
   try {
-    const body = Object.assign({ goal, start: true, background: false }, solvePins());
+    // "一键执行" is an explicit batch authorization; the approval service
+    // still records the ticket and its exact plan revision.
+    const body = Object.assign({ goal, start: true, background: false, approve: true }, solvePins());
     $('solveResult').className = 'muted';
     $('solveResult').textContent = '运行中（GUI Agent 可能需要 1–5 分钟）…';
     const out = await post('/api/solve', body);
@@ -1808,7 +1962,9 @@ function connectStream() {
   const run = ($('streamRun') && $('streamRun').value) || '';
   const url = '/api/stream?after_seq=' + state.lastSeq + '&run_id=' + encodeURIComponent(run);
   const es = new EventSource(url);
+  const generation = state.wsGeneration;
   state.stream = es;
+  es.addEventListener('project_changed', () => { disconnectStream(); scheduleRefresh(); });
   $('streamStatus').textContent = '连接中…';
   $('streamStatus').className = 'pill warn';
   es.addEventListener('hello', (e) => {
@@ -1818,6 +1974,7 @@ function connectStream() {
     try { const d = JSON.parse(e.data); appendConsole('sys', '[系统] ' + (d.time || '')); } catch (err) {}
   });
   es.addEventListener('bus', (e) => {
+    if (generation !== state.wsGeneration) return;
     try {
       const ev = JSON.parse(e.data);
       state.lastSeq = Math.max(state.lastSeq, Number(ev.seq || 0));
@@ -1827,9 +1984,11 @@ function connectStream() {
     } catch (err) {}
   });
   es.addEventListener('snapshot', (e) => {
+    if (generation !== state.wsGeneration) return;
     try { renderLiveSnapshot(JSON.parse(e.data)); } catch (err) {}
   });
   es.addEventListener('logs', (e) => {
+    if (generation !== state.wsGeneration) return;
     try {
       const d = JSON.parse(e.data);
       appendConsole('logs', `[日志 ${d.task_id} / ${d.agent_id}]\n${d.chunk}`);
@@ -1893,7 +2052,21 @@ async function initWorkspace() {
     $('wsPath').value = p.root || path;
     $('wsPath').dataset.touched = '1';
     toast('项目已初始化并打开');
-    state.lastSeq = 0; clearConsole(); await refresh(); loadRecentProjects();
+    const wasStreaming = !!state.stream;
+    state.wsGeneration += 1;
+    clearTimeout(state.chainPersistTimer);
+    state.chainPersistTimer = null;
+    clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+    disconnectStream();
+    state.lastSeq = 0;
+    state.overview = null;
+    state.chainDraft = null;
+    state.chainHydratedFor = '';
+    clearConsole();
+    await refresh();
+    if (wasStreaming) connectStream();
+    loadRecentProjects();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1905,7 +2078,21 @@ async function openWorkspace() {
     $('wsPath').value = (r.workspace || {}).root || path;
     $('wsPath').dataset.touched = '1';
     toast('项目已打开');
-    state.lastSeq = 0; clearConsole(); await refresh(); loadRecentProjects();
+    const wasStreaming = !!state.stream;
+    state.wsGeneration += 1;
+    clearTimeout(state.chainPersistTimer);
+    state.chainPersistTimer = null;
+    clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+    disconnectStream();
+    state.lastSeq = 0;
+    state.overview = null;
+    state.plans = []; state.runs = []; state.tasks = []; state.approvals = [];
+    state.chainDraft = null; state.chainHydratedFor = '';
+    clearConsole();
+    await refresh();
+    if (wasStreaming) connectStream();
+    loadRecentProjects();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1930,30 +2117,78 @@ async function requestPlan() {
   if (!goal) { toast('请输入需求 Prompt', true); return; }
   try {
     const body = { goal, async: true, agent_id: $('mainAgent').value || '',
-      model: $('mainModelSelect').value || $('mainModel').value.trim() };
+      model: currentMainModel() };
     const r = await post('/api/plans', body);
-    $('jobStatus').textContent = '规划中… ' + r.job_id;
-    let job;
-    for (let i = 0; i < 400; i++) {
-      await new Promise((res) => setTimeout(res, 1200));
-      job = await api('/api/jobs/' + r.job_id);
-      if (job.status !== 'running') break;
-      $('jobStatus').textContent = '规划中… ' + (i * 1.2).toFixed(0) + 's';
-    }
-    $('jobStatus').textContent = '';
-    if (!job || job.status === 'failed') {
-      toast((job && job.error && job.error.message) || '规划失败', true); return;
-    }
-    const out = job.result || {};
-    if (out.status === 'pending_approval') {
-      toast('计划已生成，待审批；3.5 已载入该计划的阶段');
-      await refresh();
-      loadChainFromPlan(true);
-    }
-    else if (out.status === 'waiting_user') {
-      $('planResult').innerHTML = `<div class="card"><h3>等待主节点 UI 执行</h3><div class="sub">提示词：${esc(out.prompt_path || '')}</div><pre>${esc(out.message || '')}</pre></div>`;
-    } else { toast(out.error || '规划未完成', true); }
+    const jobUrl = new URL(window.location.href);
+    jobUrl.searchParams.set('plan_job', r.job_id);
+    window.history.replaceState({}, '', jobUrl);
+    await watchPlanJob(r.job_id);
   } catch (e) { toast(e.message, true); }
+}
+
+async function watchPlanJob(jobId) {
+  $('jobStatus').textContent = '规划中… ' + jobId;
+  const planTimeout = Number((state.overview && state.overview.config
+    && state.overview.config.plan_timeout_seconds) || 900);
+  const limit = Math.ceil((planTimeout * 1000) / 1200) + 10;
+  let job;
+  for (let i = 0; i < limit; i++) {
+    await new Promise((res) => setTimeout(res, 1200));
+    job = await api('/api/jobs/' + jobId);
+    if (job.status !== 'running') break;
+    $('jobStatus').textContent = `规划中… ${(i * 1.2).toFixed(0)}s · ${job.phase || 'running'}`;
+  }
+  if (!job || job.status === 'running') {
+    $('jobStatus').textContent = `规划仍在运行（job ${jobId}），可刷新页面继续查看`;
+    toast('规划仍在运行，稍后刷新即可恢复查看', false);
+    return;
+  }
+  $('jobStatus').textContent = '';
+  if (job.status === 'failed' || job.status === 'interrupted') {
+    toast((job.error && job.error.message) || '规划失败', true);
+    await refresh();
+    return;
+  }
+  const out = job.result || {};
+  if (job.business_status && job.business_status !== 'pending_approval'
+      && job.business_status !== 'completed') {
+    toast('规划业务状态：' + job.business_status, false);
+  }
+  if (out.status === 'pending_approval') {
+    toast('计划已生成，待审批；3.5 已载入该计划的阶段');
+    await refresh();
+    loadChainFromPlan(true);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('plan_job');
+    window.history.replaceState({}, '', url);
+  } else if (out.status === 'waiting_user') {
+    $('planResult').innerHTML = `<div class="card"><h3>等待主节点 UI 执行</h3><div class="sub">提示词：${esc(out.prompt_path || '')}</div><pre>${esc(out.message || '')}</pre></div>`;
+  } else {
+    toast(out.error || '规划未完成', true);
+  }
+}
+
+async function resumePlanJobFromUrl() {
+  const jobId = new URLSearchParams(window.location.search).get('plan_job');
+  if (!jobId) return;
+  try {
+    const job = await api('/api/jobs/' + jobId);
+    if (job.status === 'running') {
+      await watchPlanJob(jobId);
+    } else {
+      $('jobStatus').textContent = `上次规划 ${job.status}（job ${jobId}）`;
+      const out = job.result || {};
+      if (job.status === 'completed' && out.status === 'pending_approval') {
+        await refresh();
+        loadChainFromPlan(true);
+        const url = new URL(window.location.href);
+        url.searchParams.delete('plan_job');
+        window.history.replaceState({}, '', url);
+      }
+    }
+  } catch (e) {
+    $('jobStatus').textContent = '上次规划任务已不存在：' + jobId;
+  }
 }
 
 async function importPlanPrompt() {
@@ -2319,6 +2554,7 @@ $('budgetTokens').addEventListener('input', () => { $('budgetTokens').dataset.to
 window.addEventListener('hashchange', route);
 route();
 refresh();
+resumePlanJobFromUrl();
 loadRecentProjects();
 setInterval(() => {
   if (state.workspace && state.workspace.open && !state.stream

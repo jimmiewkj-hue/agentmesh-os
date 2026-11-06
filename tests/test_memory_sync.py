@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agentloop_hub.models import ConversationRecord
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def test_project_index_and_code_structure_are_seeded(tmp_path):

@@ -74,11 +74,24 @@ class BudgetManager:
                duration_ms: int, run_id: str = "", status: str = "ok") -> UsageRecord:
         usage.normalized()
         cost = float(usage.cost or 0.0)
+        currency = str(usage.currency or ("credits" if cost > 0 else "USD"))
+        cost_known = bool(usage.cost_known)
         estimated = bool(usage.estimated)
+        record_status = status
         if cost <= 0 and (usage.input_tokens or usage.output_tokens):
             price = self.config.price_for(model)
-            cost = (usage.input_tokens / 1_000_000) * price["input"] + \
-                   (usage.output_tokens / 1_000_000) * price["output"]
+            if price.get("known"):
+                cost = (usage.input_tokens / 1_000_000) * price["input"] + \
+                       (usage.output_tokens / 1_000_000) * price["output"]
+                currency = "USD"
+                cost_known = True
+            else:
+                # No configured price is unknown, not free.
+                cost = 0.0
+                currency = ""
+                cost_known = False
+                if record_status == "ok":
+                    record_status = "unknown_cost"
             estimated = True
         record = UsageRecord(
             record_id=new_id("use"),
@@ -96,8 +109,10 @@ class BudgetManager:
             retries=max(0, task.attempts - 1),
             duration_ms=duration_ms,
             cost=round(cost, 6),
+            currency=currency,
+            cost_known=cost_known,
             estimated=estimated,
-            status=status,
+            status=record_status,
             created_at=now_iso(),
         )
         self.store.add_usage(record)

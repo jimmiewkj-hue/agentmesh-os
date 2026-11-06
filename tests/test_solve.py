@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_project, write_scenario
+from hub_test_support import make_project, write_scenario
 
 from agentloop_hub.hub import Hub
 
@@ -66,7 +66,7 @@ def test_solve_segments_pins_models_runs_and_aggregates(env):
     write_scenario(scenario_path, solve_scenario())
 
     out = hub.solve("修复 calc.py 的加法错误并补充测试", max_parallel=1,
-                    start=True, background=False)
+                    start=True, background=False, approve=True)
     assert out["run_id"]
     assert [b["role"] for b in out["bindings"]] == ["implement", "verify"]
 
@@ -110,7 +110,7 @@ def test_solve_escalates_a_failed_task_to_the_next_ladder_rung(env):
     scenario["tasks"]["S01"]["fail_once_marker"] = "s01.failed"
     write_scenario(scenario_path, scenario)
 
-    out = hub.solve("修复 calc.py 的加法错误并补充测试", start=True, background=False)
+    out = hub.solve("修复 calc.py 的加法错误并补充测试", start=True, background=False, approve=True)
     run_id = out["run_id"]
     task = hub.tasks(run_id=run_id)[0]
     assert task["task_id"] == "S01"
@@ -177,8 +177,12 @@ def test_solve_with_no_start_creates_a_plan_but_does_not_run(env):
     repo, hub, scenario_path = env
     write_scenario(scenario_path, solve_scenario())
     out = hub.solve("修复 calc.py 的加法错误并补充测试", start=False)
-    assert out["status"] == "planned"
-    run = hub.run_status(out["run_id"])
+    assert out["status"] == "pending_approval"
+    assert out["run_id"] == ""
+    assert hub.runs() == []
+    approved = hub.decide_approval(out["approval_id"], approve=True)
+    run_id = approved["outcome"]["run_id"]
+    run = hub.run_status(run_id)
     assert {t["status"] for t in run["tasks"]} == {"queued"}
 
 
@@ -186,12 +190,14 @@ def test_solve_status_returns_the_answer_only_when_the_run_is_settled(env):
     repo, hub, scenario_path = env
     write_scenario(scenario_path, solve_scenario())
     out = hub.solve("修复 calc.py 的加法错误并补充测试", start=False)
-    assert hub.solve_status(out["run_id"])["answer"] is None
+    approved = hub.decide_approval(out["approval_id"], approve=True)
+    run_id = approved["outcome"]["run_id"]
+    assert hub.solve_status(run_id)["answer"] is None
 
-    hub.start_run(out["run_id"], max_parallel=1, background=False)
-    status = hub.solve_status(out["run_id"])
+    hub.start_run(run_id, max_parallel=1, background=False)
+    status = hub.solve_status(run_id)
     assert status["answer"] is not None
-    assert status["answer"]["run_id"] == out["run_id"]
+    assert status["answer"]["run_id"] == run_id
     assert {t["role"] for t in status["tasks"]} == {"implement", "verify"}
 
 
@@ -201,7 +207,7 @@ def test_solve_picks_a_main_node_when_none_is_configured(env):
     hub.db.execute("DELETE FROM main_nodes")
     assert hub.get_main() is None
     out = hub.solve("修复 calc.py 的加法错误并补充测试", start=False)
-    assert out["status"] == "planned"
+    assert out["status"] == "pending_approval"
     assert hub.get_main() is not None
     assert any("自动选择主节点" in note for note in out["notes"])
 

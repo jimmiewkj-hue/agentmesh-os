@@ -239,6 +239,7 @@ def enforce_plan_contract(plan: TaskPlan, contract: dict[str, Any]) -> list[str]
             title="主节点审阅",
             type="review",
             role="review",
+            origin="system",
             model=_model_for(contract, main_id),
             suggested_agent=main_id,
             objective=("主节点只读审阅实现与文档：按严重程度列出缺陷、风险、"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from conftest import make_project
+from hub_test_support import make_project
 
 
 def test_catalog_lists_agent_models_and_selection(tmp_path):
@@ -38,3 +38,19 @@ def test_model_refresh_preserves_user_models(tmp_path, monkeypatch):
     names = {m["name"] for m in catalog["by_agent"]["mock_worker"]["models"]}
     assert {"detected-a", "detected-b", "user-model"}.issubset(names)
     assert catalog["by_agent"]["mock_worker"]["selected_model"] == "user-model"
+
+
+def test_models_with_the_same_display_label_are_not_dropped():
+    from agentloop_hub.control.model_catalog import _dedupe_by_model_name
+
+    rows = [
+        {"name": "deepseek//deepseek-v4-pro", "display_name": "DeepSeek-V4-Pro"},
+        {"name": "deepseek-v4-pro-0813", "display_name": "DeepSeek-V4-Pro"},
+        {"name": "glm-5.3-flash", "display_name": "GLM-5.3-Flash"},
+        {"name": "GLM-5.3-Flash", "display_name": "GLM-5.3-Flash"},
+    ]
+    kept = [item["name"] for item in _dedupe_by_model_name(rows)]
+    assert kept == [
+        "deepseek//deepseek-v4-pro", "deepseek-v4-pro-0813",
+        "glm-5.3-flash", "GLM-5.3-Flash",
+    ]

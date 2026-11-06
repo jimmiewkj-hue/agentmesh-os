@@ -9,7 +9,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 from ..adapters.process import kill_tree
@@ -24,20 +27,16 @@ class CommandResult:
     duration_ms: int
     timed_out: bool = False
     long_running: bool = False
+    # Server readiness is a probe result, never a log-text inference.
+    server_ready: bool = False
+    probe_url: str = ""
+    process_alive_before_stop: bool = False
+    cleaned: bool = True
+    probe_note: str = ""
 
     @property
     def ok(self) -> bool:
         return self.exit_code == 0 and not self.timed_out
-
-    @property
-    def server_ready(self) -> bool:
-        """A dev/static server printed a loopback URL before being stopped."""
-        if not self.long_running:
-            return False
-        text = f"{self.stdout}\n{self.stderr}".lower()
-        return bool(re.search(r"https?://(127\.0\.0\.1|localhost|0\.0\.0\.0):\d+", text)
-                    or "listening" in text or "本地静态服务器" in text
-                    or "ctrl+c" in text or "ctrl-c" in text)
 
 
 _LONG_RUNNING_RE = re.compile(
@@ -71,6 +70,65 @@ def _port_open(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+_SERVER_URL_RE = re.compile(
+    r"https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d+)", re.IGNORECASE)
+
+
+def _probe_http(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str]:
+    target = "127.0.0.1" if host in ("0.0.0.0", "::", "[::]") else host.strip("[]")
+    url = f"http://{target}:{int(port)}/"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return True, f"HTTP {response.status} {url}"
+    except urllib.error.HTTPError as exc:
+        # Any HTTP response below 500 proves the process is serving.
+        return exc.code < 500, f"HTTP {exc.code} {url}"
+    except Exception as exc:  # noqa: BLE001 - network errors are diagnostic
+        return False, f"{type(exc).__name__}: {exc}"[:300]
+
+
+def _wait_for_server(proc: subprocess.Popen, timeout: float):
+    """Wait for a real listening endpoint, not just a log line."""
+    out: list[str] = []
+    err: list[str] = []
+
+    def _pump(stream, sink: list[str]) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                sink.append(line)
+        except Exception:
+            return
+
+    threads = [
+        threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    note = ""
+    url = ""
+    ready = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            note = f"进程在探测前退出（exit {proc.returncode}）"
+            break
+        matches = _SERVER_URL_RE.findall("".join(out) + "".join(err))
+        if matches:
+            host, port = matches[-1]
+            url = f"http://{host}:{int(port)}/"
+            ok, note = _probe_http(host, int(port))
+            if ok:
+                ready = True
+                break
+        time.sleep(0.2)
+    if not note:
+        note = "日志中出现地址但 HTTP 探测未成功" if url else "未探测到监听地址"
+    for thread in threads:
+        thread.join(timeout=1.0)
+    return ready, url, note, out, err
 
 
 def _start_local_server(cwd: str, host: str, port: int) -> tuple[subprocess.Popen | None, str]:
@@ -194,6 +252,26 @@ def run_command(command: str, *, cwd: str, timeout: int = 900,
         return CommandResult(original_command, 126, "", str(exc), 0,
                              long_running=long_running)
     try:
+        if long_running:
+            ready, url, note, out_chunks, err_chunks = _wait_for_server(
+                proc, max(1, timeout))
+            alive = proc.poll() is None
+            if alive:
+                kill_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            stdout = "".join(out_chunks) + (stdout or "")
+            stderr = "".join(err_chunks) + (stderr or "")
+            duration = int((time.monotonic() - start) * 1000)
+            code = proc.returncode if proc.returncode is not None else -9
+            return CommandResult(
+                original_command, code, stdout or "", stderr or "", duration,
+                timed_out=alive, long_running=True, server_ready=ready,
+                probe_url=url, process_alive_before_stop=alive, cleaned=alive,
+                probe_note=note,
+            )
         stdout, stderr = proc.communicate(timeout=max(1, timeout))
         timed_out = False
     except subprocess.TimeoutExpired:

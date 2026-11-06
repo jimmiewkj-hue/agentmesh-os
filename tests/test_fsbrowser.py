@@ -155,7 +155,7 @@ def test_loopback_detection():
 
 @pytest.fixture()
 def server(tmp_path: Path):
-    from conftest import make_project
+    from hub_test_support import make_project
     from agentloop_hub.api.server import JobManager, _make_handler
 
     repo, hub, _ = make_project(tmp_path)
@@ -175,11 +175,17 @@ def _get(port: int, path: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _token(port: int) -> str:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/session", timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))["token"]
+
+
 def _post(port: int, path: str, body: dict) -> dict:
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "X-AgentMesh-Token": _token(port)},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=10) as response:
@@ -209,7 +215,8 @@ def test_http_mkdir_rejects_bad_names(server):
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/fs/mkdir",
         data=json.dumps({"path": str(repo), "name": "../escape"}).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={"Content-Type": "application/json",
+                 "X-AgentMesh-Token": _token(port)}, method="POST",
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(request, timeout=10)

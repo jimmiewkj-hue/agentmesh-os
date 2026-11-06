@@ -87,7 +87,16 @@ def collect_unresolved(tasks: list[Task], summary: dict[str, Any],
     """
     items: list[str] = []
     by_uid = {task.uid: task for task in tasks}
+    # A later completed task explicitly closes the failures it supersedes.
+    # History is retained; only the delivery gate treats them as closed.
+    closed_by: dict[str, str] = {}
     for task in tasks:
+        if task.status in DONE_STATES:
+            for superseded in getattr(task.spec, "supersedes", []) or []:
+                closed_by[str(superseded)] = task.task_id
+    for task in tasks:
+        if task.task_id in closed_by:
+            continue
         if task.status in FAILED_STATES:
             items.append(f"任务 {task.task_id} 状态 {task.status}: {task.error or '未说明'}")
         if task.verification_status == VerificationStatus.FAILED.value:
@@ -106,9 +115,21 @@ def collect_unresolved(tasks: list[Task], summary: dict[str, Any],
         label = task.task_id if task else uid
         for raw in payload.get("unresolved_items") or []:
             if isinstance(raw, dict):
+                if raw.get("blocking") is False:
+                    continue
+                if str(raw.get("severity") or "").lower() in (
+                        "info", "low", "suggestion", "optional"):
+                    continue
                 text = raw.get("summary") or raw.get("description") or raw.get("finding") or raw
             else:
                 text = raw
+            text = str(text or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(marker in lowered for marker in
+                   ("optional", "non-blocking", "nonblocking", "建议", "可选", "非阻塞")):
+                continue
             items.append(f"{label} 未解决: {text}")
     recommendation = str(summary.get("merge_recommendation") or "").lower()
     declared = str(summary.get("goal_status") or "").lower()
@@ -184,9 +205,10 @@ def decide(*, tasks: list[Task], summary: dict[str, Any], round_number: int,
     declared = str(summary.get("goal_status") or "").lower()
 
     if (all_completed and not has_failure and not verification_failed
+            and not unresolved
             and recommendation == "approve" and declared not in ("blocked", "continue")):
         return RoundDecision(
-            action="complete", reason="主节点批准且全部任务完成、无验证失败",
+            action="complete", reason="主节点批准且全部任务完成、无验证失败、无未关闭必需项",
             goal_status="complete", unresolved=[], signature=signature,
             blocked_streak=0, round_number=round_number, max_rounds=max_rounds,
         )
@@ -305,6 +327,7 @@ def fallback_specs(*, plan: TaskPlan, tasks: list[Task], summary: dict[str, Any]
         dependencies=deps,
         scope=_fallback_scope(tasks),
         out_of_scope=[],
+        supersedes=[t.task_id for t in tasks if t.status in FAILED_STATES],
         expected_outputs=["code_patch", "summary"],
         acceptance_criteria=[
             "逐项关闭上一轮未解决项",

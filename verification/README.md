@@ -8,8 +8,9 @@
 ```bash
 cd D:/qoder/agent-hub
 
-# 需求级验证（32 个用例，约 31s）
+# 需求级验证（当前 54 个用例；与 tests 合并后 456 passed / 1 skipped）
 python -m pytest verification -q
+AGENTMESH_TRAE_LIVE=0 python -X utf8 -m pytest tests verification -o addopts='-p no:asyncio' -q
 
 # 真实机能力审计（发现本机 Agent / 模型 / 路由结果，只读，不执行任务）
 python verification/audit_real_machine.py
@@ -20,7 +21,11 @@ python verification/audit_real_machine.py
 | 前缀 | 含义 | 判定 |
 | --- | --- | --- |
 | `test_Rn_...` | 需求第 n 条应当成立 | 通过 = 需求被满足 |
-| `test_GAP_...` | 缺口探针 | **通过 = 缺口被证实**（不是缺陷） |
+| `test_SAFE_...` | 已修复缺陷的安全回归（原 `test_GAP_*`） | 通过 = 缺陷不再存在 |
+| `test_GAP_...` | 仍未修复的缺口探针 | **通过 = 缺口仍被证实**（不是功能通过） |
+
+> 2026-11-06 起，已修复的缺口探针已逐项改为 `test_SAFE_*` 正向安全断言；
+> 不再保留“断言缺陷存在”的通过用例来充当功能验收。
 
 ## 零输入接口与新链路测试（2026-11-04）
 

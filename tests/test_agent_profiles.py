@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_project
+from hub_test_support import make_project
 
 from agentloop_hub.models import TaskSpec
 

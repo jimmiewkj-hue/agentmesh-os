@@ -8,6 +8,7 @@ one contract.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -365,6 +366,12 @@ def normalize_scope_entries(entries: Iterable[str]) -> list[str]:
         text = str(raw or "").strip()
         if not text:
             continue
+        # Planner annotations use full-width or half-width parentheses, e.g.
+        # "docs/建模管线.md（参数与重建说明草稿）".  They describe the entry,
+        # not the path, and previously made the whole token look like prose.
+        text = re.sub(r"[（(][^）)]*[）)]", " ", text).strip()
+        if not text:
+            continue
         tokens: list[str] = []
         for token in _SCOPE_SPLIT_RE.split(text):
             token = token.strip("。.：:-—… \t")
@@ -611,6 +618,12 @@ class TaskSpec:
     model: str = ""
     suggested_agent: str = ""
     parent_task_id: str = ""
+    # "user" for plan nodes, "system" for governance nodes the Controller adds
+    # (e.g. REVIEW).  Chain binding must never overwrite system nodes.
+    origin: str = "user"
+    # A repair task can explicitly close earlier failed/incomplete tasks.
+    # Only a completed superseding task counts as evidence.
+    supersedes: list[str] = field(default_factory=list)
     scope: list[str] = field(default_factory=list)
     out_of_scope: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
@@ -709,7 +722,9 @@ class TaskSpec:
             "task_id": self.task_id, "title": self.title, "objective": self.objective,
             "type": self.type, "role": self.role, "model": self.model,
             "suggested_agent": self.suggested_agent,
-            "parent_task_id": self.parent_task_id, "scope": self.scope,
+            "parent_task_id": self.parent_task_id, "origin": self.origin,
+            "supersedes": self.supersedes,
+            "scope": self.scope,
             "out_of_scope": self.out_of_scope, "dependencies": self.dependencies,
             "required_capabilities": self.required_capabilities,
             "input_artifacts": self.input_artifacts, "expected_outputs": self.expected_outputs,
@@ -755,6 +770,10 @@ class TaskPlan:
     status: str = PlanStatus.DRAFT.value
     created_at: str = field(default_factory=now_iso)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Revision increments whenever executable content changes; approvals are
+    # bound to (revision, content_hash) and cannot approve another revision.
+    revision: int = 1
+    content_hash: str = ""
 
     def validate(self) -> None:
         if not self.goal.strip():
@@ -816,6 +835,8 @@ class TaskPlan:
             "model": self.model,
             "status": self.status,
             "created_at": self.created_at,
+            "revision": int(self.revision),
+            "content_hash": self.content_hash,
             "tasks": [t.to_dict() for t in self.tasks],
         }
 
@@ -823,9 +844,12 @@ class TaskPlan:
     def from_dict(cls, data: dict[str, Any], *, project_id: str = "", plan_id: str = "") -> "TaskPlan":
         if not isinstance(data, dict):
             raise ValidationError("计划必须是 JSON/YAML 对象")
+        # revision/content_hash are server-derived.  Accepting them keeps an
+        # exported plan re-importable without letting the caller set them.
         allowed = {"plan_version", "plan_id", "project_id", "goal", "constraints", "tasks",
                    "requirements", "nonfunctional", "risks", "open_questions",
-                   "main_agent_id", "model", "status", "created_at"}
+                   "main_agent_id", "model", "status", "created_at",
+                   "revision", "content_hash"}
         unknown = set(data) - allowed
         if unknown:
             raise ValidationError(f"计划包含未知字段: {sorted(unknown)}")
@@ -875,6 +899,7 @@ class Task:
     verification_status: str = VerificationStatus.PENDING.value
     error: str = ""
     pid: int = 0
+    active_attempt_id: str = ""
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     started_at: str = ""
@@ -897,10 +922,32 @@ class Task:
             "base_commit": self.base_commit, "patch_path": self.patch_path,
             "result_path": self.result_path, "verification_status": self.verification_status,
             "error": self.error, "pid": self.pid,
+            "active_attempt_id": self.active_attempt_id,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "started_at": self.started_at, "finished_at": self.finished_at,
             "spec": self.spec.to_dict(),
         }
+
+
+def plan_content_hash(plan: TaskPlan) -> str:
+    """Canonical hash of everything that changes what will be executed.
+
+    Display-only fields (status, timestamps, plan id) are excluded.  Every
+    task field that can affect dispatch, permissions, model choice, scope or
+    acceptance is included through ``TaskSpec.to_dict``.
+    """
+    payload = {
+        "goal": plan.goal,
+        "constraints": list(plan.constraints),
+        "requirements": list(plan.requirements),
+        "nonfunctional": list(plan.nonfunctional),
+        "risks": list(plan.risks),
+        "open_questions": list(plan.open_questions),
+        "main_agent_id": plan.main_agent_id,
+        "model": plan.model,
+        "tasks": [task.to_dict() for task in plan.tasks],
+    }
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1217,8 @@ class UsageRecord:
     retries: int = 0
     duration_ms: int = 0
     cost: float = 0.0
+    currency: str = "USD"
+    cost_known: bool = True
     estimated: bool = False
     status: str = "ok"
     created_at: str = field(default_factory=now_iso)
@@ -1183,6 +1232,7 @@ class UsageRecord:
             "reasoning_tokens": self.reasoning_tokens, "total_tokens": self.total_tokens,
             "tool_calls": self.tool_calls, "retries": self.retries,
             "duration_ms": self.duration_ms, "cost": self.cost,
+            "currency": self.currency, "cost_known": self.cost_known,
             "estimated": self.estimated, "status": self.status,
             "created_at": self.created_at,
         }
@@ -1200,6 +1250,7 @@ class ChangeRecord:
     after_hash: str
     files: list[str]
     patch_path: str = ""
+    attempt_id: str = ""
     status: str = ChangeStatus.PROPOSED.value
     created_at: str = field(default_factory=now_iso)
     applied_at: str = ""
@@ -1211,6 +1262,7 @@ class ChangeRecord:
             "base_commit": self.base_commit, "base_hash": self.base_hash,
             "before_hash": self.before_hash, "after_hash": self.after_hash,
             "files": self.files, "patch_path": self.patch_path,
+            "attempt_id": self.attempt_id,
             "status": self.status, "created_at": self.created_at,
             "applied_at": self.applied_at,
         }

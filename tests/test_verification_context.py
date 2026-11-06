@@ -15,7 +15,7 @@ from agentloop_hub.util import new_id
 from agentloop_hub.workspace import create_worktree, detect_repo, generate_patch
 from agentloop_hub.workspace.identity import build_project
 from agentloop_hub.control.paths import WorkspacePaths
-from conftest import git
+from hub_test_support import git
 
 
 def make_task(repo: Path, *, scope=None, commands=None) -> Task:
@@ -103,7 +103,7 @@ def test_combine_ignores_skipped_checks_for_read_only_task(git_repo):
     )
     agent_report = VerificationReport(
         task_id="T1", verifier_agent="verifier", status="passed",
-        checks={"scope_compliance": "passed", "build_tests": "warning",
+        checks={"scope_compliance": "passed", "build_tests": "skipped",
                 "patch_applicable": "skipped"},
     )
     combined = verifier.combine(task, deterministic, agent_report)
@@ -132,7 +132,14 @@ def test_combine_filters_verification_noise(git_repo):
                   "The main workspace remains at the unpatched baseline"],
     )
     combined = verifier.combine(task, deterministic, agent_report)
-    assert combined.warnings == ["真实问题"]
+    # Only harness-artifact noise is dropped.  "defect remains present" /
+    # "main workspace unpatched" style evidence must survive into the report.
+    assert combined.warnings == [
+        "真实问题", "主工作区仍处于基线",
+        "Pre-fix test failure is informational only",
+        "Task made no code changes by design",
+        "The main workspace remains at the unpatched baseline",
+    ]
     assert combined.status == "warning"
 
 
@@ -255,3 +262,135 @@ def test_context_levels_and_cap(tmp_path):
     assert detail["_truncated"] is True
     assert detail["task_id"] == "T"
     assert isinstance(detail, dict)
+
+
+def test_combine_keeps_top_level_agent_failure_with_empty_checks(git_repo):
+    from agentloop_hub.models import VerificationReport
+
+    verifier = build_verifier(git_repo)
+    task = Task(uid="run:T1", project_id="prj", plan_id="plan", run_id="run",
+                spec=TaskSpec(task_id="T1", title="scan", objective="scan", type="analysis"),
+                status="verifying", assigned_agent="executor")
+    deterministic = VerificationReport(
+        task_id="T1", verifier_agent="control-plane", status="passed",
+        checks={"scope_check": "passed"},
+    )
+    agent_report = VerificationReport(
+        task_id="T1", verifier_agent="verifier", status="failed", checks={},
+        warnings=["缺陷仍存在"],
+    )
+    combined = verifier.combine(task, deterministic, agent_report)
+    assert combined.status == "failed"
+    assert combined.checks["agent_report_status"] == "failed"
+    assert "缺陷仍存在" in combined.warnings
+
+
+def test_read_only_task_never_verifies_in_the_user_main_tree(git_repo):
+    verifier = build_verifier(git_repo)
+    task = Task(
+        uid="run:T1", project_id="prj", plan_id="plan", run_id="run",
+        spec=TaskSpec(task_id="T1", title="scan", objective="scan", type="analysis",
+                      verification_commands=[
+                          'python -c "import os; print(os.path.realpath(os.getcwd()))"']),
+        status="verifying", base_commit="HEAD", workdir=str(git_repo),
+        task_dir=str(Path(git_repo) / ".agentloop" / "t"),
+    )
+    result = ResultPackage({
+        "task_id": "T1", "agent_id": "a", "status": "completed", "summary": "scan",
+        "findings": [], "files_read": ["calc.py"], "files_changed": [],
+        "commands_run": [], "tool_calls": [], "tests": [], "evidence": [],
+        "risks": [], "unresolved_items": [], "artifacts": [],
+        "token_usage": {}, "cost_estimate": {}, "recommended_next_action": [],
+    })
+    outcome = verifier.verify(task, result)
+    assert outcome.snapshot_dir
+    assert Path(outcome.snapshot_dir).resolve() != Path(git_repo).resolve()
+    output = "\n".join(str(item.get("output") or "")
+                       for item in outcome.command_results).strip()
+    assert output != str(Path(git_repo).resolve())
+    assert Path(output).resolve() == Path(outcome.snapshot_dir).resolve()
+
+
+def test_warn_policy_reports_out_of_scope_without_killing_the_task(
+        git_repo, tmp_path):
+    verifier = build_verifier(git_repo)
+    wt = tmp_path / "wt_warn"
+    create_worktree(str(git_repo), str(wt), "HEAD")
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (wt / "docs").mkdir()
+    (wt / "docs" / "note.md").write_text("note", encoding="utf-8")
+    patch = tmp_path / "warn.patch"
+    generate_patch(str(wt), str(patch))
+    task = Task(
+        uid="run:T1", project_id="prj", plan_id="plan", run_id="run",
+        spec=TaskSpec(task_id="T1", title="fix", objective="fix",
+                      type="implementation", scope=["calc.py"],
+                      out_of_scope=["docs/"]),
+        status="verifying", base_commit="HEAD", workdir=str(wt),
+        patch_path=str(patch), task_dir=str(tmp_path / "td_warn"),
+    )
+    result = ResultPackage({
+        "task_id": "T1", "agent_id": "a", "status": "completed", "summary": "fixed",
+        "findings": [], "files_read": [], "files_changed": ["calc.py"],
+        "commands_run": [], "tool_calls": [], "tests": [],
+        "evidence": [{"file": "calc.py", "lines": "1-2"}],
+        "risks": [], "unresolved_items": [], "artifacts": [],
+        "token_usage": {}, "cost_estimate": {}, "recommended_next_action": [],
+    })
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["scope_check"] == "warning"
+    assert outcome.report.status == "warning"
+    assert any("docs/note.md" in warning for warning in outcome.report.warnings)
+    verifier.config.scope_violation_policy = "strict"
+    strict = verifier.verify(task, result)
+    assert strict.report.checks["scope_check"] == "failed"
+    assert strict.report.status == "failed"
+
+
+def test_verification_reuses_node_modules_when_lockfile_matches(git_repo, tmp_path):
+    verifier = build_verifier(git_repo)
+    wt = tmp_path / "wt_npm"
+    create_worktree(str(git_repo), str(wt), "HEAD")
+    (wt / "package.json").write_text('{"name":"x","scripts":{"build":"vite build"}}\n',
+                                     encoding="utf-8")
+    (wt / "package-lock.json").write_text('{"lockfileVersion":3}\n', encoding="utf-8")
+    (wt / "node_modules").mkdir()
+    (wt / "node_modules" / "marker.txt").write_text("installed\n", encoding="utf-8")
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    patch = tmp_path / "p_npm.patch"
+    generate_patch(str(wt), str(patch))
+    command = ('python -c "import pathlib,sys; '
+               "sys.exit(0 if pathlib.Path('node_modules/marker.txt').exists() else 9)\"")
+    task = Task(
+        uid="run:T1", project_id="prj", plan_id="plan", run_id="run",
+        spec=TaskSpec(task_id="T1", title="build", objective="build",
+                      type="implementation",
+                      scope=["calc.py", "package.json", "package-lock.json"],
+                      verification_commands=[command]),
+        status="verifying", base_commit="HEAD", workdir=str(wt),
+        patch_path=str(patch), task_dir=str(tmp_path / "td_npm"),
+    )
+    result = ResultPackage({
+        "task_id": "T1", "agent_id": "a", "status": "completed", "summary": "built",
+        "findings": [], "files_read": [],
+        "files_changed": ["calc.py", "package.json", "package-lock.json"],
+        "commands_run": [], "tool_calls": [],
+        "tests": [{"command": command, "result": "passed"}],
+        "evidence": [{"file": "calc.py", "lines": "1-2", "description": "x"}],
+        "risks": [], "unresolved_items": [], "artifacts": [],
+        "token_usage": {}, "cost_estimate": {}, "recommended_next_action": [],
+    })
+    outcome = verifier.verify(task, result)
+    checks = outcome.report.checks
+    assert checks.get("patch_check") == "passed", outcome.report.to_dict()
+    assert checks.get("unit_tests") == "passed", outcome.report.to_dict()
+    assert any("node_modules" in w for w in outcome.report.warnings)
+
+
+def test_blender_is_resolved_from_its_standard_install_location():
+    base = Path("C:/Program Files/Blender Foundation")
+    if not base.exists():
+        pytest.skip("Blender is not installed on this machine")
+    env = Verifier._command_env("blender -b -P tools/blender/build_all.py")
+    assert "Blender" in env.get("PATH", "")
+    assert Verifier._command_env("npm run build") == {}

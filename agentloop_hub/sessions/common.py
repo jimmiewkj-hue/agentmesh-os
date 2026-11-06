@@ -145,11 +145,14 @@ def normalize_cwd(cwd: str) -> str:
 
 
 def project_matches(cwd: str, project_root: str) -> bool:
+    """A session belongs to the project only when its cwd is the project root
+    or a directory inside it.  A parent directory (e.g. ``D:/qoder``) is not
+    project ownership and must not pull unrelated sibling sessions in."""
     if not cwd:
         return False
     a = normalize_cwd(cwd)
     b = normalize_cwd(project_root)
-    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+    return a == b or a.startswith(b + "/")
 
 
 def file_fingerprint(path: Path) -> str:

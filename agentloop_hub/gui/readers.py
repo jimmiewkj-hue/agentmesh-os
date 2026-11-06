@@ -53,6 +53,19 @@ def _text_from_blocks(blocks: Any, types: tuple[str, ...]) -> str:
     return "\n".join(parts)
 
 
+def _transcript_has_marker(root: Path, marker: str, *, started_at: float = 0.0) -> dict[str, Any]:
+    """Read-only receipt: our unique request marker is in a sent transcript."""
+    if not str(marker or "").strip():
+        return {"ok": False, "reason": "EMPTY_MARKER"}
+    for path in _candidate_files(root, started_at):
+        try:
+            if _contains_marker(read_jsonl(path), marker) >= 0:
+                return {"ok": True, "source": "transcript", "path": str(path)}
+        except Exception:
+            continue
+    return {"ok": False, "reason": "MARKER_NOT_FOUND"}
+
+
 class QoderCnReader:
     """Qoder CN: ~/.qoder-cn/projects/**/*.jsonl (main + subagents)."""
 
@@ -158,6 +171,10 @@ class QoderCnReader:
             "GUI_TIMEOUT", f"Qoder CN 在 {timeout:.0f}s 内未完成回复",
             details={"marker": marker},
         )
+
+    def has_marker(self, marker: str, *, started_at: float = 0.0) -> dict[str, Any]:
+        """Read-only submission receipt used for reconcile, never to resend."""
+        return _transcript_has_marker(self.root, marker, started_at=started_at)
 
     @staticmethod
     def _session_id(events: list[dict[str, Any]], path: Path) -> str:
@@ -290,23 +307,24 @@ class WorkBuddyReader:
                     # file is stale and the settle timer restarts.
                     result_ready_since.pop(path, None)
                 if _result_file_ready(self.completion_path):
-                    result_ready_since.setdefault(path, now)
-                    stable_for = now - last_activity.get(path, now)
-                    ready_for = now - result_ready_since.get(path, now)
                     # A transient ``completed`` DB status between agent steps
-                    # is not a final signal.  When the session is still
-                    # working, keep waiting for the application's own final
-                    # status even though result.json already exists.
-                    final_by_db = db_status == "completed"
-                    final_by_quiet = (
-                        db_status not in ("working", "running", "pending")
-                        and stable_for >= self.result_settle_seconds
-                        and ready_for >= self.result_settle_seconds
-                    )
-                    if final_by_db or final_by_quiet:
+                    # is not a final signal.  Unknown/absent DB status is not
+                    # terminal either: a result file that appeared early must
+                    # not complete the turn while the application still says
+                    # working/running/pending or says nothing at all.  Only the
+                    # application's explicit ``completed`` ends this branch.
+                    if db_status == "completed":
                         text = "\n".join(t for t in texts if t).strip() or \
                             "结果文件已写入，详见 result.json"
-                        actual = self._db_model(session_id) or model
+                        db_model = self._db_model(session_id)
+                        if db_model and model and db_model.lower() != model.lower():
+                            raise GuiAutomationError(
+                                "GUI_MODEL_SWITCH_FAILED",
+                                f"数据库模型 {db_model} 与回复模型 {model} 不一致",
+                                details={"db_model": db_model, "response_model": model,
+                                         "transcript": str(path)},
+                            )
+                        actual = db_model or model
                         if expected_model and expected_model.lower() != actual.lower():
                             raise GuiAutomationError(
                                 "GUI_MODEL_SWITCH_FAILED",
@@ -343,7 +361,15 @@ class WorkBuddyReader:
                         if now - last_activity.get(path, now) < self.quiet_seconds:
                             continue
                     text = "\n".join(t for t in texts if t).strip()
-                    actual = self._db_model(session_id) or model
+                    db_model = self._db_model(session_id)
+                    if db_model and model and db_model.lower() != model.lower():
+                        raise GuiAutomationError(
+                            "GUI_MODEL_SWITCH_FAILED",
+                            f"数据库模型 {db_model} 与回复模型 {model} 不一致",
+                            details={"db_model": db_model, "response_model": model,
+                                     "transcript": str(path)},
+                        )
+                    actual = db_model or model
                     if expected_model:
                         if expected_model.lower() != actual.lower():
                             raise GuiAutomationError(
@@ -482,6 +508,10 @@ class WorkBuddyReader:
             return {"model": row[0], "status": row[1]} if row else {}
         except sqlite3.Error:
             return {}
+
+    def has_marker(self, marker: str, *, started_at: float = 0.0) -> dict[str, Any]:
+        """Read-only submission receipt used for reconcile, never to resend."""
+        return _transcript_has_marker(self.root, marker, started_at=started_at)
 
     @staticmethod
     def _session_id(events: list[dict[str, Any]], path: Path) -> str:

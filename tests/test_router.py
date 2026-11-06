@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from conftest import default_plan, make_project
+from hub_test_support import default_plan, make_project
 
 
 def test_route_preview_respects_capabilities_and_excludes_main(tmp_path):

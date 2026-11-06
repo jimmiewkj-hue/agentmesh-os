@@ -100,13 +100,21 @@ def _model_rate(agent_id: str, model: str) -> float | None:
         return None
 
 
-def _dedupe_by_display(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One row per human model name (ids and labels can both be registered)."""
+def _dedupe_by_model_name(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per real model id.
+
+    Human labels are presentation-only.  Two distinct ids can render the same
+    label (``deepseek//deepseek-v4-pro`` vs ``deepseek-v4-pro-0813``) and the
+    agent accepts them as different choices, so collapsing by display name
+    hid real models from the picker.
+    """
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for item in models:
-        key = str(item.get("display_name") or item.get("name") or "").lower()
-        if key in seen:
+        # Model ids are case-sensitive in some products (e.g. two real ids that
+        # differ only by case).  Do not fold them together.
+        key = str(item.get("name") or "").strip()
+        if not key or key in seen:
             continue
         seen.add(key)
         out.append(item)
@@ -180,7 +188,7 @@ class ModelCatalogService:
                     "profile_warning": _profile_warning(saved, source),
                     **source,
                 })
-            models = _dedupe_by_display(models)
+            models = _dedupe_by_model_name(models)
             item = {
                 "agent_id": agent.agent_id, "name": agent.name, "product": agent.product,
                 "status": agent.status, "version": agent.version,

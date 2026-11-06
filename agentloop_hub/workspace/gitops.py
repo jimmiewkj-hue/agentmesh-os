@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import subprocess
@@ -188,11 +189,21 @@ def changed_paths(worktree: str | os.PathLike[str], *, exclude_prefixes: Iterabl
     return out
 
 
+PATCH_EXCLUDE_PREFIXES: tuple[str, ...] = (
+    ".agentloop-task", ".agentloop-task/**",
+    ".agentmesh", ".agentmesh/**",
+    ".workbuddy", ".workbuddy/**",
+    "node_modules", "node_modules/**",
+    "**/node_modules", "**/node_modules/**",
+    "dist", "dist/**", "**/dist", "**/dist/**",
+    ".tmp-pkg", ".tmp-pkg/**", "**/.tmp-pkg", "**/.tmp-pkg/**",
+    ".vite", ".vite/**", "**/.vite", "**/.vite/**",
+    "coverage", "coverage/**", "**/coverage", "**/coverage/**",
+)
+
+
 def generate_patch(worktree: str | os.PathLike[str], dst: str | os.PathLike[str],
-                   *, exclude_prefixes: Iterable[str] = (
-                       ".agentloop-task", ".agentmesh", ".workbuddy",
-                       "**/node_modules", "**/dist", "**/.tmp-pkg", "**/.vite",
-                   )) -> str:
+                   *, exclude_prefixes: Iterable[str] = PATCH_EXCLUDE_PREFIXES) -> str:
     """Generate a binary-safe patch for all worktree changes (including untracked)."""
     wt = str(worktree)
     exclude = [f":!:{p}" for p in exclude_prefixes]
@@ -215,25 +226,77 @@ def patch_hash(path: str | os.PathLike[str]) -> str:
     return sha256_file(p)
 
 
-def patch_files(patch_path: str | os.PathLike[str]) -> list[str]:
+_GIT_QUOTED_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|\S+')
+
+
+def unquote_git_path(token: str) -> str:
+    """Decode git's C-style quoted path (octal UTF-8 bytes included)."""
+    raw = str(token or "").strip()
+    if not (raw.startswith('"') and raw.endswith('"')):
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    index = 0
+    escapes = {"n": 10, "t": 9, "r": 13, '"': 34, "\\": 92}
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            nxt = body[index + 1]
+            if nxt in "01234567":
+                end = index + 1
+                while end < len(body) and end < index + 4 and body[end] in "01234567":
+                    end += 1
+                out.append(int(body[index + 1:end], 8))
+                index = end
+                continue
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                index += 2
+                continue
+        out.extend(char.encode("utf-8"))
+        index += 1
+    return out.decode("utf-8", "replace")
+
+
+def _diff_git_paths(line: str) -> list[str]:
+    tokens = _GIT_QUOTED_TOKEN.findall(line[len("diff --git "):])
+    paths = []
+    for token in tokens[-2:]:
+        path = unquote_git_path(token)
+        if path[:2] in ("a/", "b/"):
+            path = path[2:]
+        paths.append(path)
+    return paths
+
+
+def patch_files(patch_path: str | os.PathLike[str], *,
+                exclude_prefixes: Iterable[str] = ()) -> list[str]:
     """Extract affected paths from a git patch (a/… and b/… headers)."""
     text = Path(patch_path).read_text(encoding="utf-8", errors="replace")
     files: list[str] = []
     for line in text.splitlines():
         if line.startswith("diff --git "):
-            m = re.match(r"diff --git a/(.*?) b/(.*)$", line)
-            if m:
-                files.extend([m.group(1), m.group(2)])
+            files.extend(_diff_git_paths(line))
         elif line.startswith("--- a/") or line.startswith("+++ b/"):
-            files.append(line[6:])
+            path = unquote_git_path(line[4:])
+            files.append(path[2:] if path[:2] in ("a/", "b/") else path)
         elif line.startswith("rename from ") or line.startswith("rename to "):
-            files.append(line.split(" ", 3)[3])
-    return sorted({f for f in files if f and f != "/dev/null"})
+            files.append(unquote_git_path(line.split(" ", 3)[3]))
+    patterns = [str(p).replace("\\", "/").strip("/") for p in exclude_prefixes
+                if str(p).strip()]
+    selected = []
+    for path in sorted({f for f in files if f and f != "/dev/null"}):
+        normalized = path.replace("\\", "/").lstrip("./")
+        if any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns):
+            continue
+        selected.append(path)
+    return selected
 
 
 def apply_patch(root: str | os.PathLike[str], patch_path: str | os.PathLike[str],
                 *, check_only: bool = False, three_way: bool = True,
-                include: str | None = None) -> tuple[bool, str]:
+                include: str | None = None,
+                exclude_prefixes: Iterable[str] = ()) -> tuple[bool, str]:
     args = ["apply", "--whitespace=nowarn"]
     if check_only:
         args.append("--check")
@@ -241,6 +304,8 @@ def apply_patch(root: str | os.PathLike[str], patch_path: str | os.PathLike[str]
         args.append("--3way")
     if include:
         args.append(f"--include={include}")
+    for pattern in exclude_prefixes:
+        args.append(f"--exclude={pattern}")
     args.append(str(patch_path))
     proc = run_git(args, cwd=root, check=False, timeout=120)
     return proc.returncode == 0, (proc.stderr_text or proc.stdout_text).strip()  # type: ignore[attr-defined]

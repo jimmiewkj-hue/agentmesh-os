@@ -165,15 +165,19 @@ class PromptBuilder:
                            runtime_dir: str | Path,
                            extra_context: dict[str, Any] | None = None,
                            bootstrap: dict[str, Any] | None = None,
-                           agent_profile: dict[str, Any] | None = None) -> TaskPackage:
+                           agent_profile: dict[str, Any] | None = None,
+                           attempt_id: str = "") -> TaskPackage:
         task_dir = ensure_dir(self.paths.task_dir(task.uid))
         runtime = ensure_dir(runtime_dir)
         task_json_path = task_dir / "task.json"
         persistent_result = task_dir / "result.json"
 
-        # The agent writes inside its own workdir; the control plane copies the
-        # result back to the persistent task ledger afterwards.
+        # Every attempt gets its own result path.  Without this a retry could
+        # read the previous attempt's result.json from the reused worktree and
+        # present it as the new attempt's output.
         runtime_pkg = ensure_dir(runtime / ".agentloop-task") / task.task_id
+        if attempt_id:
+            runtime_pkg = runtime_pkg / attempt_id
         ensure_dir(runtime_pkg)
         result_path = runtime_pkg / "result.json"
 
@@ -278,6 +282,22 @@ class PromptBuilder:
             (package.get("extra_context") or {}).get("round_context") or {},
             ensure_ascii=False, indent=2,
         )
+        repair = (package.get("extra_context") or {}).get("repair_feedback") or {}
+        repair_block = ""
+        if repair:
+            warnings = "\n".join(
+                f"- {str(w)}" for w in (repair.get("warnings") or [])[:20]
+            ) or "- 无"
+            repair_block = f"""## 上一轮验证修复要求（强制）
+上一轮成果未通过独立验证。先读取当前工作树中已有的文件，**只修复下列问题**，
+不要重做已完成且正确的部分。修复后重新运行验证命令并提交完整成果包。
+
+- 验证摘要：{str(repair.get('summary') or '')[:1500]}
+- 上一轮错误：{str(repair.get('previous_error') or '')[:800]}
+- 需要修复的问题：
+{warnings}
+- 指令：{repair.get('instruction') or '修复上述问题后重新提交'}
+"""
         return f"""# AgentMesh OS 任务包
 
 你正在作为子节点执行任务，Agent：{agent.name}（{agent.agent_id}）。
@@ -332,6 +352,7 @@ class PromptBuilder:
 {round_context}
 ```
 
+{repair_block}
 ## 上游成果摘要（result sync，不是完整上下文）
 只接收依赖任务的压缩摘要；不要假设未列出的细节。
 ```json
@@ -358,7 +379,9 @@ class PromptBuilder:
 - evidence：`[{{"file": "...", "lines": "10-20", "description": "..."}}]`，
   其中 `file` 必须是**本次工作目录内**实际存在的相对文件路径（例如 `calc.py`）；
   命令输出请放在 `tests` 或 `commands_run`，不要把 `git diff`、`git status` 等命令字符串写进 `file`。
-- risks / unresolved_items：剩余风险与未解决项
+- risks / unresolved_items：剩余风险与未解决项。环境限制、人工目视复核、
+  已用等价证据覆盖的验收项写入 risks；只有确实阻塞交付、且本节点无法解决的
+  缺陷才写入 unresolved_items，否则会被控制平面判定为未完成。
 - artifacts：产物路径（补丁、报告、日志）
 - token_usage / cost_estimate：可填你实际知道的值；不知道时如实写 0
 - recommended_next_action：建议的下一步
@@ -552,13 +575,30 @@ class PromptBuilder:
     # -- independent verification -----------------------------------------
     def write_verification_request(self, *, run_id: str, task: Task, verifier: AgentRecord,
                                    model: str, patch_path: str, result_summary: dict[str, Any],
-                                   verification_commands: list[str]) -> tuple[Path, Path]:
-        directory = ensure_dir(self.paths.run_dir(run_id) / "verification" / task.task_id)
+                                   verification_commands: list[str],
+                                   attempt_id: str = "",
+                                   recheck: dict[str, Any] | None = None) -> tuple[Path, Path]:
+        directory = self.paths.run_dir(run_id) / "verification" / task.task_id
+        if attempt_id:
+            directory = directory / attempt_id
+        ensure_dir(directory)
         prompt_path = directory / "verification_request.md"
         report_path = directory / "verification.json"
         write_json(directory / "verification-template.json", VERIFICATION_TEMPLATE)
         write_json(directory / "verification-schema.json", _verification_schema())
         commands = "\n".join(f"- `{c}`" for c in verification_commands) or "- 无（请按验收条件人工检查）"
+        recheck_block = ""
+        if recheck:
+            findings = "\n".join(
+                f"- {str(w)}" for w in (recheck.get("warnings") or [])[:20]
+            ) or "- 无"
+            recheck_block = f"""## 复验重点（上一轮已失败项）
+这是一次修复后的复验。优先确认下列问题已修复且没有引入回归；仍须完成必须检查项，
+但无需重复与这些问题无关的完整取证。
+- 上一轮摘要：{str(recheck.get('summary') or '')[:1200]}
+- 上一轮失败/警告：
+{findings}
+"""
         prompt = f"""# AgentMesh OS 独立验证请求
 
 你是独立验证节点：{verifier.name}（{verifier.agent_id}），模型：{model or "用户指定"}。
@@ -578,12 +618,18 @@ class PromptBuilder:
 {json.dumps(result_summary, ensure_ascii=False, indent=2)}
 ```
 
+{recheck_block}
 ## 建议验证命令
 {commands}
 
 ## 检查边界
 - 只检查任务执行 worktree / 提供的 Patch 与其基线；不要用主工作区当前状态判断（合并前主工作区本来未应用补丁）。
 - 忽略 `__pycache__`、`*.pyc`、`.pytest_cache` 等被 `.gitignore`/excluded 的文件，它们可能是验证命令自身产生的副产物。
+- 忽略 `node_modules/`、`dist/`、`.git/`、`.agentloop*` 目录；禁止遍历、读取或统计其中文件。
+- 独立复验提供的是源码快照（通常不含 node_modules/dist）；构建/测试结果由控制平面在冻结快照执行并记录，缺少依赖目录不是缺陷。
+- 建议命令已由控制平面在冻结快照中执行；复验时不要重复 `npm install`。如确需复跑，只运行一次 `npm run build`。
+- 单条命令输出保留摘要即可（≤120 行 / ≤8KB）；GLB/二进制检查只输出 bbox、mesh/三角面数与构件计数，禁止打印顶点、法线等明细。
+- 请在 10 分钟内完成检查并写出报告；宁可给出有证据的部分结论，也不要因继续取证而不写报告。
 - 只读分析任务如果建议验证命令导致失败，应按“信息性”记录，不要把“修复前测试失败”当成执行缺陷。
 
 ## 必须检查

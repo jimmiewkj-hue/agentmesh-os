@@ -99,7 +99,8 @@ class GuiAutomationAdapter(BaseAdapter):
         before_shot = gui_dir / "before.png"
         after_shot = gui_dir / "after.png"
         started_epoch = time.time() - 1
-        marker = f"{MARKER_PREFIX}_{uuid.uuid4().hex}"
+        marker = str((getattr(request, "metadata", {}) or {}).get("request_marker")
+                     or f"{MARKER_PREFIX}_{uuid.uuid4().hex}")
         screenshots: list[str] = []
         reply: GuiReply | None = None
         driver = self._driver
@@ -107,6 +108,7 @@ class GuiAutomationAdapter(BaseAdapter):
         self.full_control = bool(getattr(request, "full_control", True))
         interface_info: dict[str, Any] = {"method": "gui"}
         sent = False
+        receipt: dict[str, Any] = {}
         manual: dict[str, Any] | None = None
         try:
             profile = self._profile()
@@ -147,13 +149,40 @@ class GuiAutomationAdapter(BaseAdapter):
                         "workbuddy": self.workbuddy_cdp_port,
                         "qoder_cn": self.qoder_cdp_port,
                     }.get(profile.app, 0)
-                    if port:
+                    page_id = str(interface_info.get("trae_page_id")
+                                  or interface_info.get("cdp_target") or "")
+                    if port and not page_id and profile.app == "workbuddy":
+                        try:
+                            from ..gui.cdp import _pick_page, _targets
+                            page = _pick_page(_targets(port))
+                            page_id = str((page or {}).get("id") or "")
+                        except Exception:
+                            page_id = ""
+                    if port and page_id:
                         watcher = PermissionWatcher(
-                            app=profile.app, port=port, log_path=log_path,
+                            app=profile.app, port=port, page_id=page_id,
+                            log_path=log_path,
                         ).start()
                         interface_info["permission_watcher"] = "started"
+                        interface_info["permission_target"] = page_id
+                    else:
+                        # Auto-accepting a dialog without a proven target would
+                        # click whatever page happens to be first.  Wait for
+                        # the user instead.
+                        interface_info["permission_watcher"] = "skipped_no_target"
+                        _log(log_path, "permission_watcher_skipped",
+                             app=profile.app, port=port, page_id=page_id)
             window = self._attach(driver, profile)
-            _log(log_path, "attached", window=window, method=interface_info.get("method"))
+            try:
+                from ..gui.windows import window_process_identity
+                hwnd = int((window or {}).get("hwnd") or 0) if isinstance(window, dict) else 0
+                identity = window_process_identity(hwnd)
+            except Exception:
+                identity = {}
+            interface_info["window"] = window
+            interface_info["process"] = identity
+            _log(log_path, "attached", window=window, process=identity,
+                 method=interface_info.get("method"))
             model_key = interface_info.get("model_key") or \
                 resolve_model_key(request.model, profile.model_aliases)
 
@@ -235,8 +264,13 @@ class GuiAutomationAdapter(BaseAdapter):
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
             cdp_result, manual = self._submit_prompt(
-                request, interface_info, marker, prompt_to_send, log_path, profile)
+                request, interface_info, marker, prompt_to_send, log_path, profile,
+                reader=reader, started_at=started_epoch)
             sent = manual is None
+            receipt = self._submission_receipt(
+                reader, marker, started_epoch, cdp_result, manual, profile)
+            interface_info["submission"] = receipt
+            _log(log_path, "submission_receipt", **receipt)
             initial_sync = interface_info.get("profile_sync") or {}
             if profile.app == "workbuddy" and \
                     (initial_sync.get("evidence") or {}).get("deferred"):
@@ -264,6 +298,10 @@ class GuiAutomationAdapter(BaseAdapter):
                 reader.page_id = str(cdp_result["page_id"])
                 interface_info["trae_page_id"] = reader.page_id
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
+            if manual is not None:
+                # Human submit/permission waits use their own deadline; they
+                # must not consume the ordinary execution timeout.
+                timeout = max(timeout, float(self.manual_wait_seconds))
             # Never stall earlier than the measured profile threshold; the
             # discovery-written adapter_config may still carry an old 90s.
             stall_seconds = max(float(self.config.get("stall_seconds") or 0),
@@ -290,6 +328,9 @@ class GuiAutomationAdapter(BaseAdapter):
             )
             _log(log_path, "reply_received", session_id=reply.session_id,
                  model=reply.model, events=reply.events, chars=len(reply.text))
+            receipt["reply_observed"] = True
+            receipt["session_id"] = reply.session_id
+            interface_info["submission"] = receipt
             if manual is not None:
                 self._end_manual(request, log_path, outcome="resolved",
                                  detail={"session_id": reply.session_id})
@@ -313,7 +354,8 @@ class GuiAutomationAdapter(BaseAdapter):
             return self._finish_success(request, reply, profile, model_key, screenshots,
                                         log_path, started, interface_info)
         except GuiAutomationError as exc:
-            if manual is not None:
+            manual_timeout = manual is not None and exc.code in ("GUI_TIMEOUT", "GUI_STALLED")
+            if manual is not None and not manual_timeout:
                 self._end_manual(request, log_path, outcome="failed",
                                  detail={"error": f"{exc.code}: {exc.message}"})
             if driver:
@@ -377,6 +419,8 @@ class GuiAutomationAdapter(BaseAdapter):
                                 "interface": {k: ("<callable>" if callable(v) else v)
                                               for k, v in interface_info.items()}},
                         result_path=request.result_path,
+                        submission_status=str(receipt.get("status") or ""),
+                        submission_receipt=receipt,
                     )
             blocking_codes = {
                 "APP_RESTART_REQUIRED", "GUI_SEND_FAILED", "GUI_DRIVER_ERROR",
@@ -442,6 +486,40 @@ class GuiAutomationAdapter(BaseAdapter):
                             "interface": {k: ("<callable>" if callable(v) else v)
                                           for k, v in interface_info.items()}},
                     result_path=request.result_path,
+                    submission_status=str(receipt.get("status") or ""),
+                    submission_receipt=receipt,
+                )
+            if manual_timeout:
+                message = (
+                    f"等待人工操作超过 {self.manual_wait_seconds}s，节点保持阻塞；"
+                    "不会自动重试或新建尝试"
+                )
+                manual = self._begin_manual(
+                    request, log_path, kind="manual_wait_timeout", app=app,
+                    message=message,
+                    instructions=(
+                        "请切换到 Agent 应用完成发送/审批；完成后点击“继续运行”，"
+                        "控制平面会先核对原请求再继续。未处理前不会重新发送。"
+                    ),
+                    error_code=exc.code,
+                    extra={"details": exc.details,
+                           "prompt_file": interface_info.get("prompt_file", ""),
+                           "original_manual": manual},
+                )
+                return ExecutionOutcome(
+                    status="waiting_user",
+                    error=f"MANUAL_ACTION_OVERDUE: {message}",
+                    error_code=exc.code,
+                    logs=tail_text(log_path, max_chars=20000),
+                    duration_ms=_duration_ms(started),
+                    extras={"gui_app": app, "screenshots": screenshots,
+                            "error_code": exc.code, "details": exc.details,
+                            "manual_action": manual,
+                            "interface": {k: ("<callable>" if callable(v) else v)
+                                          for k, v in interface_info.items()}},
+                    result_path=request.result_path,
+                    submission_status=str(receipt.get("status") or ""),
+                    submission_receipt=receipt,
                 )
             status = "timeout" if exc.code in ("GUI_TIMEOUT", "GUI_STALLED") else "failed"
             return ExecutionOutcome(
@@ -455,6 +533,8 @@ class GuiAutomationAdapter(BaseAdapter):
                                       for k, v in interface_info.items()}},
                 text=(reply.text if reply else ""),
                 result_payload=None, result_path=request.result_path,
+                submission_status=str(receipt.get("status") or ""),
+                submission_receipt=receipt,
             )
         except Exception as exc:  # unexpected driver/parse failure must stay diagnosable
             _log(log_path, "error", code="GUI_DRIVER_ERROR", message=str(exc))
@@ -463,6 +543,8 @@ class GuiAutomationAdapter(BaseAdapter):
                 logs=tail_text(log_path, max_chars=20000),
                 duration_ms=_duration_ms(started),
                 extras={"screenshots": screenshots},
+                submission_status=str(receipt.get("status") or ""),
+                submission_receipt=receipt,
             )
         finally:
             if watcher is not None:
@@ -536,10 +618,21 @@ class GuiAutomationAdapter(BaseAdapter):
         self._notify(request, "manual_action_resolved" if outcome == "resolved"
                      else "manual_action_failed", payload)
 
+    def _marker_already_sent(self, reader: Any, marker: str,
+                             started_at: float) -> bool:
+        checker = getattr(reader, "has_marker", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool((checker(marker, started_at=started_at) or {}).get("ok"))
+        except Exception:
+            return False
+
     def _submit_prompt(self, request: ExecutionRequest,
                        interface_info: dict[str, Any], marker: str,
                        prompt_to_send: str, log_path: Path,
-                       profile: GuiProfile
+                       profile: GuiProfile, *, reader: Any = None,
+                       started_at: float = 0.0
                        ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Submit through the app interface; on failure, ask the user.
 
@@ -555,6 +648,7 @@ class GuiAutomationAdapter(BaseAdapter):
             session_id = str(interface_info.get("resumed_session_id") or "")
             result = send_workbuddy_conversation_prompt(
                 session_id, prompt_to_send, port=self.workbuddy_cdp_port,
+                page_id=str(interface_info.get("cdp_target") or ""),
                 timeout=30,
             )
             _log(log_path, "prompt_submitted", marker=marker,
@@ -571,6 +665,11 @@ class GuiAutomationAdapter(BaseAdapter):
             from ..gui.cdp import send_visible_prompt_via_cdp, submit_composer_via_cdp
             errors: list[str] = []
             for attempt in (1, 2):
+                if reader is not None and self._marker_already_sent(
+                        reader, marker, started_at):
+                    _log(log_path, "submit_already_delivered", marker=marker,
+                         before="deeplink_attempt", attempt=attempt)
+                    return {"ok": True, "already_delivered": True}, None
                 try:
                     result = submit_composer_via_cdp(
                         port=self.workbuddy_cdp_port,
@@ -582,6 +681,7 @@ class GuiAutomationAdapter(BaseAdapter):
                         ),
                         submit_interval=0.5,
                         expect_contains=marker,
+                        page_id=str(interface_info.get("cdp_target") or ""),
                     )
                     _log(log_path, "prompt_submitted", marker=marker,
                          chars=len(prompt_to_send), method="deeplink+cdp-dom",
@@ -605,11 +705,17 @@ class GuiAutomationAdapter(BaseAdapter):
                         time.sleep(float(
                             self.config.get("workbuddy_deeplink_settle_seconds") or 3.0
                         ))
+            if reader is not None and self._marker_already_sent(
+                    reader, marker, started_at):
+                _log(log_path, "submit_already_delivered", marker=marker,
+                     before="visible_composer")
+                return {"ok": True, "already_delivered": True}, None
             try:
                 result = send_visible_prompt_via_cdp(
                     prompt_to_send, port=self.workbuddy_cdp_port, timeout=15,
                     submit_retries=int(self.config.get("workbuddy_submit_retries") or 30),
                     submit_interval=0.5,
+                    page_id=str(interface_info.get("cdp_target") or ""),
                 )
                 _log(log_path, "prompt_submitted", marker=marker,
                      chars=len(prompt_to_send), method="cdp-visible-composer",
@@ -636,7 +742,9 @@ class GuiAutomationAdapter(BaseAdapter):
         if method == "qoder_db_transcript":
             from ..gui.cdp import send_prompt_via_cdp
             try:
-                result = send_prompt_via_cdp(prompt_to_send, port=self.qoder_cdp_port)
+                result = send_prompt_via_cdp(
+                    prompt_to_send, port=self.qoder_cdp_port,
+                    page_id=str(interface_info.get("cdp_target") or ""))
             except GuiAutomationError as exc:
                 manual = self._begin_manual(
                     request, log_path, kind="manual_submit",
@@ -686,6 +794,75 @@ class GuiAutomationAdapter(BaseAdapter):
              method=method, input="diagnostic-gui")
         return {}, None
 
+    def _submission_receipt(self, reader: Any, marker: str, started_at: float,
+                            cdp_result: dict[str, Any] | None,
+                            manual: dict[str, Any] | None,
+                            profile: GuiProfile) -> dict[str, Any]:
+        """Observe acceptance separately from clicking a send button."""
+        base = {"marker": marker, "method": "gui", "at": now_iso()}
+        if manual is not None:
+            return {**base, "status": "not_sent",
+                    "reason": "manual_action_required"}
+        if not isinstance(cdp_result, dict) or not cdp_result.get("ok"):
+            return {**base, "status": "not_sent",
+                    "reason": str((cdp_result or {}).get("reason") or "submit_failed")}
+        checker = getattr(reader, "has_marker", None)
+        if not callable(checker):
+            return {**base, "status": "acceptance_unknown",
+                    "reason": "NO_TRANSCRIPT_RECEIPT"}
+        deadline = time.monotonic() + float(
+            self.config.get("submission_receipt_timeout_seconds") or 6)
+        last: dict[str, Any] = {"ok": False, "reason": "MARKER_NOT_FOUND"}
+        while time.monotonic() < deadline:
+            try:
+                last = checker(marker, started_at=started_at) or last
+            except Exception as exc:
+                last = {"ok": False, "reason": str(exc)[:200]}
+            if last.get("ok"):
+                return {**base, "status": "accepted",
+                        "reason": "marker_in_transcript",
+                        "evidence": last}
+            time.sleep(0.5)
+        return {**base, "status": "acceptance_unknown",
+                "reason": str(last.get("reason") or "MARKER_NOT_FOUND"),
+                "evidence": last}
+
+    def reconcile_submission(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        """Re-read only the original request marker; never resend the prompt."""
+        binding = dict(attempt.get("binding") or {})
+        submission = binding.get("submission") if isinstance(
+            binding.get("submission"), dict) else {}
+        marker = str(binding.get("marker") or submission.get("marker") or "")
+        if not marker:
+            return {"status": "acceptance_unknown", "reason": "NO_REQUEST_MARKER",
+                    "reconciled_at": now_iso()}
+        profile = self._profile()
+        reader = self._reader or create_reader(profile, self.config)
+        checker = getattr(reader, "has_marker", None)
+        if not callable(checker):
+            return {"status": "acceptance_unknown", "reason": "NO_TRANSCRIPT_RECEIPT",
+                    "marker": marker, "reconciled_at": now_iso()}
+        try:
+            found = checker(marker, started_at=0)
+        except Exception as exc:
+            return {"status": "acceptance_unknown", "reason": str(exc)[:300],
+                    "marker": marker, "reconciled_at": now_iso()}
+        receipt = {"marker": marker, "reconciled_at": now_iso(),
+                   "evidence": found,
+                   "status": "accepted" if found.get("ok") else "acceptance_unknown"}
+        if not found.get("ok"):
+            receipt["reason"] = str(found.get("reason") or "MARKER_NOT_FOUND")
+        package = None
+        result_path = str(attempt.get("result_path") or "")
+        if result_path:
+            loaded = read_json(result_path)
+            if isinstance(loaded, dict) and loaded:
+                package = loaded
+                receipt["result_path"] = result_path
+        if package is not None:
+            receipt["package"] = package
+        return receipt
+
     # -- programmatic interface -------------------------------------------
     def _prepare_interface(self, profile: GuiProfile, request: ExecutionRequest,
                            prompt_with_marker: str, marker: str,
@@ -707,6 +884,11 @@ class GuiAutomationAdapter(BaseAdapter):
             model_key = workbuddy_model_key(request.model)
             welcome = str(self.config.get("workbuddy_welcome_mode") or "code")
             permission = str(self.config.get("workbuddy_permission_mode") or "fullAccess")
+            if not self.full_control:
+                # "完全控制" is off: never request fullAccess for this session.
+                # If the app's own default is still broader, the post-run
+                # readback blocks the task instead of silently accepting it.
+                permission = ""
             prompt_dir = ensure_dir(Path(workspace) / ".agentmesh")
             prompt_copy = prompt_dir / "interface-prompt.md"
             atomic_write_text(prompt_copy, prompt_with_marker)
@@ -725,6 +907,19 @@ class GuiAutomationAdapter(BaseAdapter):
                         self.config.get("workbuddy_active_idle_seconds") or 900
                     )
                 )
+                executable = str(self.config.get("executable") or "")
+                if active and executable:
+                    from ..control.apps import process_running
+                    if not process_running(Path(executable).name):
+                        # The app was killed mid-task; its DB still says
+                        # "working".  That row is not a live task and must not
+                        # block the session's own resume.
+                        _log(log_path, "workbuddy_stale_session_ignored",
+                             executable=executable,
+                             sessions=[{k: item.get(k) for k in
+                                        ("id", "cwd", "status", "last_activity_at")}
+                                       for item in active[:5]])
+                        active = []
                 if active:
                     wait_seconds = float(
                         self.config.get("workbuddy_active_wait_seconds") or 120
@@ -836,9 +1031,17 @@ class GuiAutomationAdapter(BaseAdapter):
                     )
                     _log(log_path, "profile_sync", app=app,
                          **profile_sync.to_dict())
+                    resume_target = ""
+                    try:
+                        from ..gui.cdp import _pick_page, _targets
+                        _page = _pick_page(_targets(self.workbuddy_cdp_port))
+                        resume_target = str((_page or {}).get("id") or "")
+                    except Exception:
+                        resume_target = ""
                     return {
                         "method": "workbuddy_resume_chat",
                         "model_key": model_key,
+                        "cdp_target": resume_target,
                         "short_prompt": short_prompt,
                         "prepare": {
                             "ok": True,
@@ -860,10 +1063,23 @@ class GuiAutomationAdapter(BaseAdapter):
                             config=self.config,
                         ),
                     }
+                fallback_reason = (verify_resume.reason if verify_resume else
+                                   switched.get("reason", ""))
                 _log(log_path, "session_resume_fallback", app=app,
-                     session_id=session_id,
-                     reason=(verify_resume.reason if verify_resume else
-                             switched.get("reason", "")))
+                     session_id=session_id, reason=fallback_reason)
+                if not bool(self.config.get("allow_session_fallback", False)):
+                    # Do not silently start a new session and call it a
+                    # continuation.  The user (or an explicit policy) decides.
+                    raise GuiAutomationError(
+                        "SESSION_BINDING_UNCONFIRMED",
+                        f"无法切回本运行的原 WorkBuddy 会话 {session_id}："
+                        f"{fallback_reason or '会话归属无法确认'}",
+                        details={"session_id": session_id,
+                                 "reason": fallback_reason,
+                                 "switched": switched,
+                                 "verify": (verify_resume.to_dict()
+                                            if verify_resume else {})},
+                    )
             profile_ctx = int(getattr(request, "context_length", 0) or 0)
             profile_cap = str(getattr(request, "capability_level", "") or "")
             selection_sync: dict[str, Any] = {}
@@ -922,8 +1138,16 @@ class GuiAutomationAdapter(BaseAdapter):
                     profile_sync.reason or "WorkBuddy 上下文/能力等级写入失败",
                     details=profile_sync.to_dict(),
                 )
+            cdp_target = ""
+            try:
+                from ..gui.cdp import _pick_page, _targets
+                _page = _pick_page(_targets(self.workbuddy_cdp_port))
+                cdp_target = str((_page or {}).get("id") or "")
+            except Exception:
+                cdp_target = ""
             return {
                 "method": "workbuddy_deeplink", "model_key": model_key,
+                "cdp_target": cdp_target,
                 "short_prompt": short_prompt, "prepare": outcome.to_dict(),
                 "prompt_file": str(prompt_copy), "workspace": workspace,
                 "welcome_mode": welcome, "permission_mode": permission,
@@ -1185,7 +1409,10 @@ class GuiAutomationAdapter(BaseAdapter):
                 outcome = prepare_workbuddy_task(
                     workspace=target, model=model_key, prompt=probe,
                     welcome_mode=str(self.config.get("workbuddy_welcome_mode") or "code"),
-                    permission_mode=str(self.config.get("workbuddy_permission_mode") or "fullAccess"),
+                    permission_mode=(
+                        str(self.config.get("workbuddy_permission_mode") or "fullAccess")
+                        if self.full_control else ""
+                    ),
                     config=self.config,
                 )
                 evidence.update({"path": "deeplink", "actual": key,
@@ -1301,6 +1528,7 @@ class GuiAutomationAdapter(BaseAdapter):
         usage = self._usage(reply, request, profile)
         purpose = str(request.purpose or "task")
         payload = read_json(request.result_path)
+        result_path = Path(request.result_path)
         if payload is None:
             if purpose in ("plan", "plan_repair", "verify", "summary"):
                 payload = self._extract_json(reply.text)
@@ -1315,11 +1543,44 @@ class GuiAutomationAdapter(BaseAdapter):
                 _log(log_path, "structured_written", path=str(request.result_path),
                      purpose=purpose)
             else:
-                payload = self._build_task_result(request, reply, profile, model_key,
-                                                  screenshots, usage)
-                write_json(request.result_path, payload)
-                _log(log_path, "result_built", path=str(request.result_path))
-        if purpose == "task":
+                # A task must bring its own structured result.  The raw reply
+                # is evidence/diagnostics; it is never turned into a synthetic
+                # "completed" package with invented tests or empty risks.
+                candidate = self._extract_json(reply.text)
+                if candidate is None:
+                    raise GuiAutomationError(
+                        "GUI_RESULT_MISSING",
+                        "任务回复没有写成果包，回复中也没有可解析的结果 JSON",
+                        details={"result_path": str(request.result_path),
+                                 "transcript": reply.transcript_path,
+                                 "chars": len(reply.text)},
+                    )
+                try:
+                    normalized, changed = ResultPackage.normalize(candidate)
+                    ResultPackage.validate(
+                        normalized, expected_task_id=request.task.task_id,
+                        expected_agent_id=self.agent.agent_id,
+                    )
+                except Exception as exc:
+                    raise GuiAutomationError(
+                        "GUI_RESULT_INVALID",
+                        f"回复中的成果候选不合法: {exc}",
+                        details={"result_path": str(request.result_path),
+                                 "candidate": candidate},
+                    ) from exc
+                result_path = Path(str(request.result_path) + ".reply-candidate.json")
+                write_json(result_path, normalized)
+                payload = normalized
+                _log(log_path, "result_candidate_from_reply", path=str(result_path),
+                     normalized=changed)
+        elif purpose == "task":
+            if not isinstance(payload, dict):
+                raise GuiAutomationError(
+                    "GUI_RESULT_INVALID",
+                    "成果包必须是 JSON 对象",
+                    details={"result_path": str(request.result_path),
+                             "type": type(payload).__name__},
+                )
             normalized, changed = ResultPackage.normalize(payload)
             try:
                 ResultPackage.validate(
@@ -1327,10 +1588,16 @@ class GuiAutomationAdapter(BaseAdapter):
                     expected_agent_id=self.agent.agent_id,
                 )
             except Exception as exc:
-                _log(log_path, "result_invalid", error=str(exc), normalized=changed)
-                payload = self._build_task_result(request, reply, profile, model_key,
-                                                  screenshots, usage)
-                write_json(request.result_path, payload)
+                # The raw, invalid package stays untouched for diagnosis.
+                _log(log_path, "result_invalid", error=str(exc), normalized=changed,
+                     path=str(request.result_path))
+                raise GuiAutomationError(
+                    "GUI_RESULT_INVALID",
+                    f"成果包不合法: {exc}",
+                    details={"result_path": str(request.result_path),
+                             "normalized": changed},
+                ) from exc
+            payload = normalized
         interface_info = interface_info or {"method": "gui"}
         if payload is not None:
             evidence = payload.get("evidence")
@@ -1339,62 +1606,33 @@ class GuiAutomationAdapter(BaseAdapter):
                     f"interface: {interface_info.get('method')} "
                     f"workspace={interface_info.get('prepare', {}).get('expected', {}).get('workspace', '')}"
                 )
+        prepare = interface_info.get("prepare") if isinstance(interface_info, dict) else {}
+        visible = interface_info.get("visible_model") or ""
+        if not visible and isinstance(prepare, dict):
+            actual = prepare.get("actual") or prepare.get("model") or {}
+            if isinstance(actual, dict):
+                visible = str(actual.get("visible_model") or actual.get("display_name") or "")
+        model_evidence = {
+            "requested_model": request.model,
+            "selected_model_id": interface_info.get("model_key") or "",
+            "visible_model_label": visible,
+            "observed_response_model": reply.model or "",
+            "observed_source": (reply.usage or {}).get("source", ""),
+            "observed_known": bool(reply.model),
+        }
         return ExecutionOutcome(
             status="completed", text=reply.text[-20000:], usage=usage,
             tool_calls=reply.tool_calls, result_payload=payload,
-            result_path=request.result_path, logs=tail_text(log_path, max_chars=30000),
+            result_path=str(result_path), logs=tail_text(log_path, max_chars=30000),
             session_id=reply.session_id, duration_ms=_duration_ms(started),
             extras={"gui_app": profile.app, "window_title": profile.window_title,
                     "model": reply.model, "model_key": model_key,
+                    "model_evidence": model_evidence,
                     "transcript": reply.transcript_path, "screenshots": screenshots,
                     "events": reply.events, "interface": interface_info},
+            submission_status=str((interface_info.get("submission") or {}).get("status") or ""),
+            submission_receipt=dict(interface_info.get("submission") or {}),
         )
-
-    def _build_task_result(self, request: ExecutionRequest, reply: GuiReply,
-                           profile: GuiProfile, model_key: str, screenshots: list[str],
-                           usage: ExecutionUsage) -> dict[str, Any]:
-        summary = _clean_summary(reply.text) or f"{profile.product} 已完成任务"
-        files_changed = _git_changed(request.workdir)
-        commands: list[dict[str, Any]] = []
-        for call in reply.tool_calls:
-            name = str(call.get("name") or "")
-            data = call.get("input") if isinstance(call.get("input"), dict) else {}
-            if name in ("Bash", "PowerShell"):
-                commands.append({"tool": name, "command": str(
-                    data.get("command") or data.get("cmd") or data.get("commandLine") or ""
-                )})
-        evidence = [
-            f"GUI window: {profile.window_title}",
-            f"GUI model: {reply.model or profile.display_model}",
-            f"GUI session: {reply.session_id}",
-            f"GUI transcript: {reply.transcript_path}",
-        ] + [f"GUI screenshot: {s}" for s in screenshots if s]
-        return {
-            "task_id": request.task.task_id,
-            "agent_id": self.agent.agent_id,
-            "status": "completed",
-            "summary": summary,
-            "findings": [],
-            "files_read": [],
-            "files_changed": files_changed,
-            "commands_run": commands,
-            "tool_calls": reply.tool_calls,
-            "tests": _tests_from_text(reply.text),
-            "evidence": evidence,
-            "risks": [],
-            "unresolved_items": [],
-            "artifacts": [reply.transcript_path] if reply.transcript_path else [],
-            "token_usage": {
-                "input": usage.input_tokens, "output": usage.output_tokens,
-                "cached": usage.cached_tokens, "reasoning": usage.reasoning_tokens,
-                "total": usage.total_tokens, "estimated": usage.estimated,
-            },
-            "cost_estimate": {
-                "amount": round(float(usage.cost), 4), "currency": "credits",
-                "estimated": True,
-            },
-            "recommended_next_action": [],
-        }
 
     def _usage(self, reply: GuiReply, request: ExecutionRequest, profile: GuiProfile) -> ExecutionUsage:
         raw = reply.usage or {}
@@ -1413,7 +1651,10 @@ class GuiAutomationAdapter(BaseAdapter):
             input_tokens=input_tokens, output_tokens=output_tokens,
             cached_tokens=int(raw.get("cached_tokens", 0) or 0),
             reasoning_tokens=int(raw.get("reasoning_tokens", 0) or 0),
-            total_tokens=total, cost=credits, tool_calls=len(reply.tool_calls),
+            total_tokens=total, cost=credits,
+            currency=("credits" if credits > 0 else ""),
+            cost_known=bool(credits > 0) if not estimated else False,
+            tool_calls=len(reply.tool_calls),
             estimated=estimated,
         ).normalized()
 
