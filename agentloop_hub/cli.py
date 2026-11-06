@@ -65,6 +65,36 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--agent", default="")
     ask.add_argument("--model", default="")
 
+    solve = sub.add_parser("solve", help="单入口闭环：切分 → 角色选型 → 运行 → 汇总答案")
+    solve.add_argument("goal")
+    solve.add_argument("--executor", default="", help="执行模型 agent:model（走免费额度）")
+    solve.add_argument("--commander", default="", help="统帅模型 agent:model（只做决策与汇总）")
+    solve.add_argument("--max-tasks", type=int, default=4)
+    solve.add_argument("--max-parallel", type=int, default=1)
+    solve.add_argument("--no-start", action="store_true", help="只生成计划与绑定，不运行")
+    solve.add_argument("--polish", action="store_true", help="用汇总角色润色最终答案")
+    solve.add_argument("--block", action="store_true", help="前台等待运行结束后输出答案")
+
+    segment = sub.add_parser("segment", help="只看任务切分与角色选型（不运行）")
+    segment.add_argument("goal")
+    segment.add_argument("--executor", default="")
+    segment.add_argument("--commander", default="")
+    segment.add_argument("--max-tasks", type=int, default=4)
+
+    roles = sub.add_parser("roles", help="角色策略：列出/解析/导入/保存")
+    roles_sub = roles.add_subparsers(dest="roles_command", required=True)
+    roles_sub.add_parser("list", help="列出所有角色在当前真实模型目录下的候选阶梯")
+    rresolve = roles_sub.add_parser("resolve", help="解析单个角色的候选")
+    rresolve.add_argument("role")
+    rresolve.add_argument("--executor", default="")
+    rresolve.add_argument("--commander", default="")
+    rresolve.add_argument("--limit", type=int, default=6)
+    rimport = roles_sub.add_parser("import", help="从 opencode 配置或 AGENTS.md 导入角色偏好")
+    rimport.add_argument("path")
+    rimport.add_argument("--save", action="store_true", help="写入 <项目>/.agentloop/roles.json")
+    rsave = roles_sub.add_parser("save", help="把当前策略写入 .agentloop/roles.json")
+    rsave.add_argument("--path", default="")
+
     # agents
     sub.add_parser("agents", help="列出已注册 Agent")
     agent = sub.add_parser("agent", help="Agent 管理")
@@ -399,6 +429,17 @@ def _dispatch(hub: Hub, args: argparse.Namespace) -> Any:
         return hub.agent_version_status() if args.status else hub.agent_versions(args.agent)
     if cmd == "ask":
         return hub.ask(args.goal, main_agent_id=args.agent, model=args.model)
+    if cmd == "segment":
+        executor_agent, executor_model = _split_pin(args.executor)
+        commander_agent, commander_model = _split_pin(args.commander)
+        return hub.segment_goal(
+            args.goal, max_tasks=args.max_tasks,
+            executor_agent=executor_agent, executor_model=executor_model,
+            commander_agent=commander_agent, commander_model=commander_model)
+    if cmd == "solve":
+        return _solve_command(hub, args)
+    if cmd == "roles":
+        return _roles_command(hub, args)
     if cmd == "route":
         return _route_command(hub, args)
     if cmd == "bus":
@@ -465,6 +506,67 @@ def _dispatch(hub: Hub, args: argparse.Namespace) -> Any:
     if cmd == "costs":
         return hub.costs(run_id=args.run)
     raise ValueError(f"未知命令 {cmd}")
+
+
+def _split_pin(value: str) -> tuple[str, str]:
+    """``agent:model`` -> (agent, model). Empty input -> ("", "")."""
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    agent, sep, model = text.partition(":")
+    if not sep or not model:
+        raise HubError(f"模型绑定格式应为 agent:model，收到 {text!r}")
+    return agent.strip(), model.strip()
+
+
+def _solve_command(hub: Hub, args: argparse.Namespace) -> Any:
+    import time
+
+    executor_agent, executor_model = _split_pin(args.executor)
+    commander_agent, commander_model = _split_pin(args.commander)
+    result = hub.solve(
+        args.goal,
+        executor_agent=executor_agent, executor_model=executor_model,
+        commander_agent=commander_agent, commander_model=commander_model,
+        max_tasks=args.max_tasks, max_parallel=args.max_parallel,
+        start=not args.no_start,
+        background=False if (args.block or not args.no_start) else True,
+        polish=args.polish,
+    )
+    if args.no_start or not result.get("run_id"):
+        return result
+    run_id = result["run_id"]
+    if not args.block:
+        result["answer"] = hub.aggregate_run(run_id).get("conclusion", "")
+        return result
+    deadline = time.time() + 60 * 30
+    settled = {"completed", "failed", "pending_acceptance", "pending_merge",
+               "released", "canceled", "paused"}
+    while time.time() < deadline:
+        status = hub.run_status(run_id)
+        if (status.get("run") or {}).get("status") in settled:
+            break
+        time.sleep(2)
+    result["run"] = hub.run_status(run_id)
+    result["answer"] = hub.aggregate_run(run_id, polish=args.polish)
+    return result
+
+
+def _roles_command(hub: Hub, args: argparse.Namespace) -> Any:
+    if args.roles_command == "list":
+        return hub.role_policy()
+    if args.roles_command == "resolve":
+        executor_agent, executor_model = _split_pin(args.executor)
+        commander_agent, commander_model = _split_pin(args.commander)
+        return hub.resolve_role(
+            args.role, limit=args.limit,
+            executor_agent=executor_agent, executor_model=executor_model,
+            commander_agent=commander_agent, commander_model=commander_model)
+    if args.roles_command == "import":
+        return hub.import_role_policy(args.path, save=args.save)
+    if args.roles_command == "save":
+        return hub.save_role_policy(args.path)
+    raise HubError(f"未知 roles 子命令: {args.roles_command}")
 
 
 def _route_command(hub: Hub, args: argparse.Namespace) -> Any:

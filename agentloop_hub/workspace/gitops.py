@@ -189,10 +189,16 @@ def changed_paths(worktree: str | os.PathLike[str], *, exclude_prefixes: Iterabl
 
 
 def generate_patch(worktree: str | os.PathLike[str], dst: str | os.PathLike[str],
-                   *, exclude_prefixes: Iterable[str] = (".agentloop-task",)) -> str:
+                   *, exclude_prefixes: Iterable[str] = (
+                       ".agentloop-task", ".agentmesh", ".workbuddy",
+                       "**/node_modules", "**/dist", "**/.tmp-pkg", "**/.vite",
+                   )) -> str:
     """Generate a binary-safe patch for all worktree changes (including untracked)."""
     wt = str(worktree)
     exclude = [f":!:{p}" for p in exclude_prefixes]
+    # Clear stale intent-to-add entries so previously staged node_modules or
+    # build output cannot sneak back into the patch through the index.
+    run_git(["reset"], cwd=wt, check=False, timeout=60)
     # Intent-to-add so new files appear in the diff. Ignore failure on empty matches.
     run_git(["add", "-N", "--", ".", *exclude], cwd=wt, check=False, timeout=120)
     proc = run_git(["diff", "--binary", "HEAD", "--", ".", *exclude], cwd=wt, check=False, timeout=120)

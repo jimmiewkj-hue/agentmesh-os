@@ -17,8 +17,10 @@ from typing import Any
 from ..adapters.discovery import DiscoveryContext, detect_models_for_agent
 from ..config import HubConfig
 from .interfaces import list_qoder_models, list_workbuddy_models
+from .model_profile import (agent_app, read_source_models, resolve_profile,
+                            source_meta_from_rows)
 from ..errors import NotFoundError, ValidationError
-from ..models import AgentRecord, Project
+from ..models import AgentRecord, Project, normalize_capability_level
 from ..util import now_iso
 from ..storage.repo import Store
 
@@ -30,6 +32,21 @@ SOURCE_LABELS: dict[str, str] = {
     "registered": "Agent 登记",
     "user": "用户登记",
 }
+
+
+def _profile_warning(saved: dict[str, Any], source: dict[str, Any]) -> str:
+    notes: list[str] = []
+    context = int(saved.get("context_length") or 0)
+    options = [int(value) for value in (source.get("context_options") or [])]
+    if context and options and context not in options:
+        notes.append(f"上下文 {context} 不在真实选项 {options}")
+    raw_level = str(saved.get("capability_level") or "")
+    level = normalize_capability_level(
+        raw_level, source.get("capability_labels") or {})
+    efforts = [str(value) for value in (source.get("capability_options") or [])]
+    if level and efforts and level not in efforts:
+        notes.append(f"能力等级 {raw_level} 不在真实选项 {efforts}")
+    return "；".join(notes)
 
 
 def _display_name(agent_id: str, model: str) -> str:
@@ -103,6 +120,15 @@ class ModelCatalogService:
         self.project = project
         self.config = config
         self.discovery_ctx = discovery_ctx
+        self._source_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def _source_meta(self, agent: AgentRecord, model: str) -> dict[str, Any]:
+        """Real context/effort options read from the agent's own catalog."""
+        app = agent_app(agent)
+        if app not in self._source_cache:
+            self._source_cache[app] = read_source_models(
+                agent, self.config.to_dict())
+        return source_meta_from_rows(self._source_cache[app], model, app)
 
     # ------------------------------------------------------------------
     # Read
@@ -127,26 +153,50 @@ class ModelCatalogService:
                     for name in agent.models
                 ]
             extra = agent.extra or {}
+            profiles = extra.get("model_profiles") if isinstance(
+                extra.get("model_profiles"), dict) else {}
             selected = str(extra.get("selected_model") or "")
             if not selected and main_id == agent.agent_id and main:
                 selected = str(main.get("model") or "")
-            models = [
-                {
+            selected_profile = profiles.get(selected) if isinstance(
+                profiles.get(selected), dict) else {}
+            selected_source = self._source_meta(agent, selected) if selected else {}
+            models = []
+            for entry in sorted(entries, key=lambda e: (e.get("source", ""), e["model"])):
+                source = self._source_meta(agent, entry["model"])
+                saved = profiles.get(entry["model"]) if isinstance(
+                    profiles.get(entry["model"]), dict) else {}
+                models.append({
                     "name": entry["model"],
                     "display_name": _display_name(agent.agent_id, entry["model"]),
                     "rate": _model_rate(agent.agent_id, entry["model"]),
                     "source": entry["source"],
                     "source_label": SOURCE_LABELS.get(entry["source"], entry["source"]),
                     "note": entry.get("note", ""),
-                }
-                for entry in sorted(entries, key=lambda e: (e.get("source", ""), e["model"]))
-            ]
+                    "context_length": int(saved.get("context_length") or 0),
+                    "capability_level": str(
+                        saved.get("capability_level")
+                        or source.get("capability_default") or ""),
+                    "profile_warning": _profile_warning(saved, source),
+                    **source,
+                })
             models = _dedupe_by_display(models)
             item = {
                 "agent_id": agent.agent_id, "name": agent.name, "product": agent.product,
                 "status": agent.status, "version": agent.version,
                 "adapter_type": agent.adapter_type, "access_level": agent.access_level,
                 "selected_model": selected, "models": models,
+                "context_length": int(selected_profile.get("context_length")
+                                       or selected_source.get("context_default") or 0),
+                "capability_level": str(selected_profile.get("capability_level")
+                                        or selected_source.get("capability_default") or ""),
+                "context_options": selected_source.get("context_options", []),
+                "context_max": selected_source.get("context_max", 0),
+                "capability_options": selected_source.get("capability_options", []),
+                "capability_labels": selected_source.get("capability_labels", {}),
+                "profile_warning": _profile_warning(
+                    selected_profile, selected_source),
+                "model_profiles": profiles,
                 "is_main": main_id == agent.agent_id,
             }
             out_agents.append(item)
@@ -233,7 +283,9 @@ class ModelCatalogService:
         return {"agent_id": agent.agent_id, "added": added,
                 "models": self.agent_models(agent.agent_id)}
 
-    def select(self, agent_id: str, model: str) -> dict[str, Any]:
+    def select(self, agent_id: str, model: str, *,
+               context_length: int | None = None,
+               capability_level: str | None = None) -> dict[str, Any]:
         agent = self._agent(agent_id)
         name = str(model or "").strip()
         if name:
@@ -244,12 +296,32 @@ class ModelCatalogService:
                     self.project.project_id, agent.agent_id, name,
                     source="user", note="控制台选配模型",
                 )
+        validated = resolve_profile(
+            agent, name, self.config.to_dict(),
+            context_length=int(context_length or 0),
+            capability_level=str(capability_level or ""),
+        ) if name else {"context_length": 0, "capability_level": ""}
         extra = dict(agent.extra or {})
         extra["selected_model"] = name
+        if context_length is not None or capability_level is not None:
+            profiles = dict(extra.get("model_profiles") or {})
+            profile = dict(profiles.get(name) or {})
+            if context_length is not None:
+                profile["context_length"] = int(validated["context_length"])
+            if capability_level is not None:
+                profile["capability_level"] = str(
+                    validated["capability_level"])
+            profiles[name] = profile
+            extra["model_profiles"] = profiles
+            # Keep effective convenience fields for older WebUI/CLI readers.
+            extra["context_length"] = int(profile.get("context_length") or 0)
+            extra["capability_level"] = str(profile.get("capability_level") or "")
         self.store.update_agent_extra(agent.agent_id, extra)
         self._sync_agent_models(agent)
         return {
             "agent_id": agent.agent_id, "selected_model": name,
+            "context_length": int(extra.get("context_length") or 0),
+            "capability_level": str(extra.get("capability_level") or ""),
             "models": self.agent_models(agent.agent_id),
         }
 

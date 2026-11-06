@@ -240,6 +240,19 @@ def list_trae_models(app: str = "trae_cn",
             name = str(row.get("name") or "").strip()
             if not name or row.get("selectable") is False or row.get("status") is False:
                 continue
+            context = row.get("context_window_size") if isinstance(
+                row.get("context_window_size"), dict) else {}
+            context_default = int(context.get("default") or 0)
+            context_values = context.get("max") if isinstance(
+                context.get("max"), list) else []
+            context_options = sorted({
+                int(value) for value in context_values
+                if isinstance(value, (int, float)) and int(value) > 0
+            }) or ([context_default] if context_default else [])
+            effort = row.get("reasoning_effort_config") if isinstance(
+                row.get("reasoning_effort_config"), dict) else {}
+            efforts = [str(value) for value in (effort.get("options") or [])
+                       if str(value or "").strip()]
             out.append({
                 "id": name,
                 "name": name,
@@ -249,6 +262,12 @@ def list_trae_models(app: str = "trae_cn",
                 "model_id": f"{label}_{int(row.get('config_source') or 1)}__{name}",
                 "rate": model_rate(row),
                 "fee_level": int(row.get("fee_model_level") or 0),
+                "context_default": context_default,
+                "context_options": context_options,
+                "context_max": max(context_options or [context_default, 0]),
+                "capability_options": efforts,
+                "capability_default": str(effort.get("default_level") or ""),
+                "supports_thinking": bool(effort.get("support_thinking")),
                 "source": "state.vscdb:AI.agent.model.model_list_map",
                 "evidence": str(db),
             })
@@ -304,7 +323,8 @@ def read_state(app: str = "trae_cn", config: dict[str, Any] | None = None) -> Tr
 
 def set_trae_model(*, model: str, app: str = "trae_cn",
                    config: dict[str, Any] | None = None,
-                   session_id: str = "", cdp_port: int = 0) -> InterfaceOutcome:
+                   session_id: str = "", cdp_port: int = 0,
+                   page_id: str = "") -> InterfaceOutcome:
     """Set the model: composer menu first (authoritative), store as persistence.
 
     Trae's SOLO preference is server-synced, so the store write alone does not
@@ -313,7 +333,8 @@ def set_trae_model(*, model: str, app: str = "trae_cn",
     the choice for the next launch.
     """
     if cdp_port:
-        ui = select_trae_model_via_cdp(model, port=int(cdp_port), app=app, config=config)
+        ui = select_trae_model_via_cdp(model, port=int(cdp_port), app=app,
+                                           config=config, page_id=page_id)
         if not ui.ok:
             return ui
         store = _write_trae_model_store(model=model, app=app, config=config,
@@ -493,9 +514,9 @@ def set_trae_workspace(*, workspace: str, app: str = "trae_cn",
     )
 
 
-def _page_transport(port: int, timeout: float = 15.0):
-    from ..gui.cdp import WebSocketTransport, _pick_page, _targets
-    page = _pick_page(_targets(port))
+def _page_transport(port: int, timeout: float = 15.0, *, page_id: str = ""):
+    from ..gui.cdp import WebSocketTransport
+    page = pick_trae_page(port, page_id=page_id)
     if not page:
         return None, None
     return page, WebSocketTransport(page["webSocketDebuggerUrl"],
@@ -511,7 +532,8 @@ def _click_xy(transport, x: float, y: float) -> None:
         time.sleep(0.12)
 
 
-def open_trae_model_menu(port: int = CDP_DEFAULT_PORT) -> dict[str, Any]:
+def open_trae_model_menu(port: int = CDP_DEFAULT_PORT, *,
+                         page_id: str = "") -> dict[str, Any]:
     """Open the composer model menu with page-level mouse events.
 
     ``Input.dispatchMouseEvent`` is delivered to the renderer's own event loop;
@@ -519,7 +541,7 @@ def open_trae_model_menu(port: int = CDP_DEFAULT_PORT) -> dict[str, Any]:
     composer component ignores synthetic ``click``/``PointerEvent`` objects,
     which is why the DOM-only path cannot open this menu.
     """
-    page, transport = _page_transport(port)
+    page, transport = _page_transport(port, page_id=page_id)
     if not transport:
         return {"ok": False, "reason": "NO_PAGE"}
     try:
@@ -542,9 +564,9 @@ def open_trae_model_menu(port: int = CDP_DEFAULT_PORT) -> dict[str, Any]:
 
 
 def list_trae_model_items(port: int = CDP_DEFAULT_PORT,
-                          limit: int = 60) -> list[dict[str, Any]]:
+                          limit: int = 60, *, page_id: str = "") -> list[dict[str, Any]]:
     """Visible model rows in the open menu (text + clickable centre)."""
-    page, transport = _page_transport(port)
+    page, transport = _page_transport(port, page_id=page_id)
     if not transport:
         return []
     try:
@@ -584,7 +606,8 @@ def list_trae_model_items(port: int = CDP_DEFAULT_PORT,
 
 def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
                               app: str = "trae_cn",
-                              config: dict[str, Any] | None = None) -> InterfaceOutcome:
+                              config: dict[str, Any] | None = None,
+                              page_id: str = "") -> InterfaceOutcome:
     """Choose a model in Trae's own composer menu, then verify the visible name."""
     resolved = resolve_trae_model(model, app=app, config=config)
     if not resolved:
@@ -593,24 +616,39 @@ def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
                                 error_code="MODEL_UNAVAILABLE")
     display = resolved["display_name"]
     opened: dict[str, Any] = {}
-    for attempt in range(10):
-        opened = open_trae_model_menu(port)
-        if opened.get("ok"):
-            break
-        time.sleep(1.5)
+    items: list[dict[str, Any]] = []
+    for attempt in range(12):
+        opened = open_trae_model_menu(port, page_id=page_id)
+        if opened.get("ok") and opened.get("menu_visible", True):
+            # The menu can render before its model rows arrive; poll instead
+            # of treating an empty list as "model missing" (observed on a
+            # freshly launched Trae CN on 2026-11-05).
+            for _ in range(8):
+                items = list_trae_model_items(port, page_id=page_id)
+                if items:
+                    break
+                time.sleep(0.8)
+            if items:
+                break
+        time.sleep(1.0)
     if not opened.get("ok"):
         return InterfaceOutcome(False, "cdp-input", {"model": display}, opened,
                                 reason=f"无法打开模型菜单: {opened.get('reason')}",
                                 error_code="MODEL_SWITCH_UNSUPPORTED")
-    items = list_trae_model_items(port)
     target = next((item for item in items if item["text"].lower() == display.lower()), None)
     if not target:
+        if not items and trae_login_required(port, page_id=page_id):
+            return InterfaceOutcome(
+                False, "cdp-input", {"model": display}, {"items": []},
+                reason="Trae CN 未登录，模型/AI 功能不可用",
+                error_code="APP_LOGIN_REQUIRED",
+            )
         return InterfaceOutcome(
             False, "cdp-input", {"model": display}, {"items": [i["text"] for i in items]},
-            reason=f"菜单中没有 {display}",
+            reason=f"菜单中没有 {display}（菜单项 {len(items)} 个）",
             error_code="MODEL_UNAVAILABLE",
         )
-    page, transport = _page_transport(port)
+    page, transport = _page_transport(port, page_id=page_id)
     if not transport:
         return InterfaceOutcome(False, "cdp-input", {"model": display}, {},
                                 reason="CDP page 不可用", error_code="GUI_SEND_FAILED")
@@ -619,7 +657,7 @@ def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
         time.sleep(1.0)
     finally:
         transport.close()
-    visible = trae_visible_model(port)
+    visible = trae_visible_model(port, page_id=page_id)
     ok = visible.lower() == display.lower()
     return InterfaceOutcome(
         ok, "cdp-input", {"model": display},
@@ -631,10 +669,11 @@ def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
     )
 
 
-def trae_visible_model(port: int = CDP_DEFAULT_PORT) -> str:
+def trae_visible_model(port: int = CDP_DEFAULT_PORT, *,
+                       page_id: str = "") -> str:
     """Read the model name the composer actually displays (CDP DOM)."""
-    from ..gui.cdp import WebSocketTransport, _evaluate, _pick_page, _targets
-    page = _pick_page(_targets(port))
+    from ..gui.cdp import WebSocketTransport, _evaluate
+    page = pick_trae_page(port, page_id=page_id)
     if not page:
         return ""
     transport = WebSocketTransport(page["webSocketDebuggerUrl"],
@@ -654,7 +693,7 @@ def trae_visible_model(port: int = CDP_DEFAULT_PORT) -> str:
 def verify_trae_session(*, workspace: str, model: str, dev_mode: str = "code",
                         app: str = "trae_cn",
                         config: dict[str, Any] | None = None,
-                        cdp_port: int = 0) -> InterfaceOutcome:
+                        cdp_port: int = 0, page_id: str = "") -> InterfaceOutcome:
     """Read back the workspace / model / mode from the app's own state store."""
     expected = {"workspace": str(Path(workspace).expanduser().resolve()).lower(),
                 "model": model_key(app, model, config), "dev_mode": dev_mode}
@@ -694,7 +733,7 @@ def verify_trae_session(*, workspace: str, model: str, dev_mode: str = "code",
         # The store can say one thing while the composer renders another (Trae
         # keeps a server-synced preference).  Only the visible name proves the
         # runtime model actually switched.
-        visible = trae_visible_model(int(cdp_port))
+        visible = trae_visible_model(int(cdp_port), page_id=page_id)
         expected_display = resolved["display_name"] if resolved else model
         actual["visible_model"] = visible
         evidence["visible_model"] = visible
@@ -753,13 +792,141 @@ def _cdp_alive(port: int) -> bool:
 
 
 def _process_running(image: str) -> bool:
+    from .apps import process_running
+    return process_running(image)
+
+
+def current_trae_workspace(app: str = "trae_cn",
+                           config: dict[str, Any] | None = None) -> str:
     try:
-        proc = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
-                              capture_output=True, text=True, timeout=20,
-                              encoding="utf-8", errors="replace")
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return image.lower() in (proc.stdout or "").lower()
+        state = read_state(app, config)
+    except Exception:
+        return ""
+    modes = state.get(f"solo-lite-mode-state-map-{state.uid}", {})
+    if not isinstance(modes, dict):
+        return ""
+    for mode in DEV_MODES:
+        entry = modes.get(mode)
+        session = entry.get("session") if isinstance(entry, dict) else None
+        if isinstance(session, dict) and session.get("sessionId"):
+            return str(session.get("workspacePath")
+                       or session.get("mainFolder") or "")
+    return ""
+
+
+def open_trae_workspace(*, app: str = "trae_cn", workspace: str,
+                        executable: str = "", config: dict[str, Any] | None = None,
+                        timeout_seconds: float = 20.0) -> InterfaceOutcome:
+    """Ask an already-running Trae to open a folder through its CLI protocol.
+
+    This is the reuse path: no process is killed and the user's other windows
+    stay open.  Trae (Electron/VS Code) forwards the arguments to the running
+    instance when one exists.
+    """
+    root = Path(workspace).expanduser().resolve()
+    current = current_trae_workspace(app, config)
+    try:
+        same = bool(current) and os.path.normcase(os.path.normpath(current)) == \
+            os.path.normcase(os.path.normpath(str(root)))
+    except Exception:
+        same = False
+    if same:
+        return InterfaceOutcome(True, "cli_folder", {"workspace": str(root)},
+                                {"workspace": current, "already_open": True},
+                                evidence={"source": "state.vscdb", "reused": True})
+    exe = Path(executable) if executable else trae_executable(app, config)
+    if not exe.exists():
+        return InterfaceOutcome(False, "cli_folder", {"workspace": str(root)}, {},
+                                reason=f"Trae 可执行文件不存在: {exe}",
+                                error_code="GUI_DRIVER_ERROR")
+    uri = root.as_uri()
+    from .apps import launch_detached
+    pid = launch_detached(
+        [str(exe), "--new-window", f"--folder-uri={uri}"],
+        env=clean_launch_env(),
+    )
+    deadline = time.time() + float(timeout_seconds)
+    folder_id = hashlib.sha256(str(root).lower().encode("utf-8")).hexdigest()[:24]
+    while time.time() < deadline:
+        try:
+            state = read_state(app, config)
+            folders = state.get("solo-lite.project-workspace-cache", {})
+            item = folders.get(folder_id) if isinstance(folders, dict) else None
+            if isinstance(item, dict) and str(item.get("identity", "")).lower() == str(root).lower():
+                return InterfaceOutcome(
+                    True, "cli_folder", {"workspace": str(root)},
+                    {"workspace": str(root), "folder_registered": True},
+                    evidence={"source": "state.vscdb", "pid": pid,
+                              "folder_uri": uri, "reused": True},
+                )
+        except Exception:
+            pass
+        time.sleep(0.8)
+    return InterfaceOutcome(
+        False, "cli_folder", {"workspace": str(root)},
+        {"workspace": current, "folder_registered": False},
+        reason=f"Trae 未在 {timeout_seconds:.0f}s 内登记工作区 {root}",
+        error_code="WORKSPACE_MISMATCH",
+        evidence={"source": "state.vscdb", "pid": pid, "folder_uri": uri},
+    )
+
+
+def set_trae_reasoning_effort(*, model: str, effort: str,
+                               app: str = "trae_cn",
+                               config: dict[str, Any] | None = None) -> InterfaceOutcome:
+    """Persist Trae's real reasoning-effort selection in state.vscdb.
+
+    Trae's catalog exposes ``reasoning_effort_config.options`` (light/high/
+    extra_high) and keeps the user's choice in
+    ``<uid>:AI.agent.model.reasoning_effort_level_by_agent_model_v2``.
+    """
+    level = str(effort or "").strip().lower()
+    if not level:
+        return InterfaceOutcome(True, "state_write", {}, {}, evidence={"skipped": "empty"})
+    row = resolve_trae_model(model, app=app, config=config)
+    if not row:
+        return InterfaceOutcome(False, "state_write", {"model": model}, {},
+                                reason=f"Trae 真实模型清单中没有 {model}",
+                                error_code="MODEL_UNAVAILABLE")
+    catalog_rows = [item for item in list_trae_models(app, config)
+                    if item.get("id") == row.get("id")]
+    options = list((catalog_rows[0] if catalog_rows else {}).get("capability_options") or [])
+    if options and level not in options:
+        return InterfaceOutcome(
+            False, "state_write", {"model": model, "effort": level},
+            {"options": options},
+            reason=f"{row.get('display_name') or model} 支持的能力等级只有 {options}",
+            error_code="MODEL_UNAVAILABLE",
+        )
+    state = read_state(app, config)
+    key = state.prefixed("AI.agent.model.reasoning_effort_level_by_agent_model_v2")
+    mapping = state.get(key, {})
+    if not isinstance(mapping, dict):
+        mapping = {}
+    model_id = str(row.get("model_id") or "")
+    model_name = str(row.get("id") or model)
+    variants = {
+        model_id,
+        model_id.replace("__", "_-_"),
+    }
+    variants |= {f"{item}_null" for item in list(variants) if item}
+    for existing in list(mapping):
+        if model_name and model_name in existing:
+            variants.add(existing)
+    for variant in variants:
+        if variant:
+            mapping[variant] = level
+    try:
+        written = _write_items(state.db, {key: json.dumps(mapping, ensure_ascii=False)})
+    except Exception as exc:
+        return InterfaceOutcome(False, "state_write", {"model": model}, {},
+                                reason=f"写入 Trae 思考等级失败: {exc}",
+                                error_code="INTERFACE_WRITE_FAILED")
+    return InterfaceOutcome(
+        True, "state_write", {"model": model, "effort": level},
+        {"effort": level, "keys": sorted(variants)},
+        evidence={**written, "source": "state.vscdb ItemTable"},
+    )
 
 
 def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
@@ -771,45 +938,59 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
                     before_launch: Any = None) -> InterfaceOutcome:
     """Ensure a Trae renderer exposes DevTools without any OS input.
 
-    A restart is only performed when the caller explicitly allows it (env
-    ``AGENTMESH_ALLOW_APP_RESTART=1`` or ``allow_restart=True``); the state DB
-    is backed up first.  The user's running editor is never killed implicitly.
+    Restart policy (root cause of the 2026-11-04 "Trae 闪退"):
+    * CDP already live -> reuse the user's editor and switch folders through
+      Trae's own CLI protocol;
+    * Trae not running -> launch it with the flag (nothing was lost);
+    * Trae running without CDP -> restart only when the caller explicitly asks
+      (WebUI restart button or preflight); otherwise return
+      ``APP_RESTART_REQUIRED`` and let the WebUI block + ask the user.
     """
     port = int(port)
     if _cdp_alive(port) and not force_restart:
-        return InterfaceOutcome(True, "cdp", {"port": port, "reused": True},
-                                {"source": f"http://127.0.0.1:{port}/json/version"},
-                                evidence={"port": port, "reused": True})
+        opened: dict[str, Any] = {}
+        if workspace:
+            outcome = open_trae_workspace(app=app, workspace=workspace,
+                                          executable=executable, config=config)
+            opened = outcome.to_dict()
+        return InterfaceOutcome(True, "cdp", {"port": port, "reused": True,
+                                              "workspace": workspace},
+                                {"source": f"http://127.0.0.1:{port}/json/version",
+                                 "workspace_open": opened},
+                                evidence={"port": port, "reused": True,
+                                          "workspace_open": opened})
     if allow_restart is None:
         allow_restart = str(os.environ.get("AGENTMESH_ALLOW_APP_RESTART") or "").strip().lower() \
             in ("1", "true", "yes", "on")
-    if not allow_restart:
-        return InterfaceOutcome(
-            False, "cdp", {"port": port}, {},
-            reason="CDP 未就绪；未获授权重启 Trae（设置 AGENTMESH_ALLOW_APP_RESTART=1）",
-            error_code="GUI_SEND_FAILED",
-        )
     exe = Path(executable) if executable else trae_executable(app, config)
     if not exe.exists():
         return InterfaceOutcome(False, "cdp", {"port": port}, {},
                                 reason=f"Trae 可执行文件不存在: {exe}",
                                 error_code="GUI_DRIVER_ERROR")
     image = variant(app)["image"]
+    running = _process_running(image)
+    if running and not (allow_restart or force_restart):
+        return InterfaceOutcome(
+            False, "cdp", {"port": port, "running": True}, {},
+            reason="Trae 正在运行但未开启程序接口；需要用户确认重启",
+            error_code="APP_RESTART_REQUIRED",
+            evidence={"port": port, "process_running": True,
+                      "required": "explicit restart"},
+        )
     backup = ""
-    try:
-        db = trae_state_db(app, config)
-        if db.exists():
-            backup = str(backup_state_db(db))
-    except Exception as exc:
-        return InterfaceOutcome(False, "cdp", {"port": port}, {},
-                                reason=f"备份 Trae 状态库失败: {exc}",
-                                error_code="INTERFACE_WRITE_FAILED")
-    if _process_running(image):
-        subprocess.run(["taskkill", "/F", "/IM", image, "/T"],
-                       capture_output=True, timeout=30, check=False)
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline and _process_running(image):
-            time.sleep(0.5)
+    if running:
+        try:
+            db = trae_state_db(app, config)
+            if db.exists():
+                backup = str(backup_state_db(db))
+        except Exception as exc:
+            return InterfaceOutcome(False, "cdp", {"port": port}, {},
+                                    reason=f"备份 Trae 状态库失败: {exc}",
+                                    error_code="INTERFACE_WRITE_FAILED")
+        from .apps import graceful_close
+        close_info = graceful_close(image)
+    else:
+        close_info = {"method": "not_running"}
     # The desktop restores workspace/model from its own store at startup, so
     # the caller may write the store here, after the old process is gone and
     # before the new one reads it.
@@ -821,8 +1002,8 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
         args.append(f"--folder-uri={Path(workspace).resolve().as_uri()}")
     # DETACHED_PROCESS keeps the editor alive after the caller's console exits;
     # without it Windows tears the child down with the parent shell.
-    subprocess.Popen(args, close_fds=True, env=clean_launch_env(),
-                     creationflags=0x00000008)
+    from .apps import launch_detached
+    pid = launch_detached(args, env=clean_launch_env())
     deadline = time.time() + float(timeout_seconds)
     while time.time() < deadline:
         if _cdp_alive(port):
@@ -840,13 +1021,16 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
                 True, "cdp", {"port": port, "reused": False, "workspace": workspace},
                 {"source": f"http://127.0.0.1:{port}/json/version"},
                 evidence={"port": port, "reused": False, "executable": str(exe),
-                          "backup": backup, "folder_uri": args[-1] if workspace else ""},
+                          "backup": backup, "pid": pid,
+                          "close": close_info,
+                          "folder_uri": args[-1] if workspace else ""},
             )
         time.sleep(1.0)
     return InterfaceOutcome(False, "cdp", {"port": port}, {},
                             reason=f"Trae CDP 端口 {port} 在 {timeout_seconds}s 内未就绪",
                             error_code="GUI_SEND_FAILED",
-                            )
+                            evidence={"port": port, "pid": pid,
+                                      "close": close_info, "backup": backup})
 
 
 TRAE_SUBMIT_JS = r"""(() => {
@@ -872,25 +1056,129 @@ TRAE_SUBMIT_JS = r"""(() => {
 })()"""
 
 
+def pick_trae_page(port: int = CDP_DEFAULT_PORT, *,
+                   page_id: str = "") -> dict[str, Any] | None:
+    """Pick the Trae renderer that actually owns a chat composer.
+
+    Trae can have several windows/pages (the folder-open CLI creates one).  A
+    naive first-page pick can insert the prompt in one window and read the
+    reply from another, or poll a page that never changes.  Prefer an explicit
+    page id; otherwise probe for a composer and fall back to the first page.
+    """
+    from ..gui.cdp import WebSocketTransport, _evaluate, _pick_page, _targets
+    try:
+        targets = _targets(port)
+    except Exception:
+        return None
+    pages = [item for item in targets if item.get("type") == "page"]
+    if page_id:
+        chosen = next((item for item in pages if item.get("id") == page_id), None)
+        if chosen:
+            return chosen
+    best: dict[str, Any] | None = None
+    best_score = 0
+    for page in pages:
+        try:
+            transport = WebSocketTransport(
+                page["webSocketDebuggerUrl"],
+                origin=f"http://127.0.0.1:{int(port)}", timeout=5)
+            try:
+                probe = _evaluate(transport, (
+                    "(() => ({selector: !!document.querySelector('.model-select-area'),"
+                    " composer: !!document.querySelector('.chat-input-v2-send-button,"
+                    ".chat-input-v2-editor,[contenteditable=\"true\"]')}))()"
+                ), 5) or {}
+            finally:
+                transport.close()
+            score = 2 if probe.get("selector") else (1 if probe.get("composer") else 0)
+            if score > best_score:
+                best, best_score = page, score
+            if score == 2:
+                return page
+        except Exception:
+            continue
+    return best or _pick_page(targets)
+
+
+def trae_login_required(port: int = CDP_DEFAULT_PORT, *,
+                        page_id: str = "") -> bool:
+    """Detect the app's own login wall instead of blaming a missing model."""
+    from ..gui.cdp import WebSocketTransport, _evaluate
+    page = pick_trae_page(port, page_id=page_id)
+    if not page:
+        return False
+    try:
+        transport = WebSocketTransport(page["webSocketDebuggerUrl"],
+                                       origin=f"http://127.0.0.1:{int(port)}",
+                                       timeout=6)
+    except Exception:
+        return False
+    try:
+        text = str(_evaluate(
+            transport, "(() => (document.body.innerText||''))()", 6) or "")
+    except Exception:
+        return False
+    finally:
+        transport.close()
+    markers = (
+        "Sign in to use AI Features", "Continue with GitHub", "Continue with Google",
+        "Continue with Apple", "登录以使用 AI",
+    )
+    return any(marker in text for marker in markers)
+
+
+def wait_for_trae_chat(port: int = CDP_DEFAULT_PORT, *,
+                       timeout_seconds: float = 30.0,
+                       page_id: str = "") -> dict[str, Any] | None:
+    """Wait until the Trae workbench page exposes its model selector.
+
+    A freshly launched Electron window answers CDP before the workbench React
+    tree is ready.  Selecting a model too early returns an empty menu; retry
+    until the composer/model area is actually mounted.
+    """
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    last: dict[str, Any] | None = None
+    while time.time() < deadline:
+        page = pick_trae_page(port, page_id=page_id)
+        if page:
+            last = page
+            try:
+                from ..gui.cdp import WebSocketTransport, _evaluate
+                transport = WebSocketTransport(
+                    page["webSocketDebuggerUrl"],
+                    origin=f"http://127.0.0.1:{int(port)}", timeout=5)
+                try:
+                    ready = _evaluate(transport, (
+                        "(() => !!document.querySelector('.model-select-area'))()"
+                    ), 5)
+                finally:
+                    transport.close()
+                if ready:
+                    return page
+            except Exception:
+                pass
+        time.sleep(1.0)
+    return last
+
+
 def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
                      timeout: float = 15.0,
-                     submit_retries: int = 20) -> dict[str, Any]:
+                     submit_retries: int = 20,
+                     page_id: str = "") -> dict[str, Any]:
     """Insert the prompt and click Trae's own send control through CDP DOM.
 
-    Trae's send affordance is an icon-only ``div`` with class
-    ``icube-chat-input-action-btn-send`` (source:
-    ``workbench.desktop.main.js:3777``) and therefore has no aria-label for the
-    generic submit helper to match.  We insert via the shared helper and then
-    click the verified class selector.
+    The page is chosen once and reused for both insertion and submission, and
+    its id is returned so the reader polls the same renderer.
     """
     import time as _time
 
-    from ..gui.cdp import WebSocketTransport, _evaluate, _pick_page, _targets, send_prompt_via_cdp
-    inserted = send_prompt_via_cdp(text, port=port, timeout=timeout, submit=False)
-    page = _pick_page(_targets(port))
+    from ..gui.cdp import WebSocketTransport, _evaluate, send_prompt_via_cdp
+    page = pick_trae_page(port, page_id=page_id)
     if not page:
         from ..gui.base import GuiAutomationError
         raise GuiAutomationError("GUI_SEND_FAILED", "CDP 没有可用的 page 目标")
+    inserted = send_prompt_via_cdp(text, port=port, timeout=timeout,
+                                   submit=False, page_id=str(page["id"]))
     transport = WebSocketTransport(page["webSocketDebuggerUrl"],
                                    origin=f"http://127.0.0.1:{int(port)}", timeout=timeout)
     try:
@@ -899,7 +1187,8 @@ def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
             _time.sleep(0.4 if attempt == 0 else 0.6)
             last = _evaluate(transport, TRAE_SUBMIT_JS, timeout) or {}
             if last.get("ok"):
-                return {"insert": inserted, "submit": {**last, "attempts": attempt + 1}}
+                return {"insert": inserted, "page_id": str(page["id"]),
+                        "submit": {**last, "attempts": attempt + 1}}
             if last.get("reason") not in ("SEND_DISABLED", "NO_SEND_BUTTON"):
                 break
         from ..gui.base import GuiAutomationError
@@ -910,23 +1199,55 @@ def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
 
 
 def trae_conversation_text(*, port: int = CDP_DEFAULT_PORT,
-                           limit: int = 12000) -> dict[str, Any]:
-    """Read the visible conversation text through CDP (no private DB access)."""
+                           limit: int = 12000,
+                           page_id: str = "") -> dict[str, Any]:
+    """Read the visible conversation text through CDP (no private DB access).
+
+    ``page_id`` pins the window used to send the prompt.  If that page became
+    stale, fall back to the other page targets and report the page that
+    actually answered.
+    """
     from ..gui.cdp import WebSocketTransport, _evaluate, _pick_page, _targets
-    targets = _targets(port)
-    page = _pick_page(targets)
-    if not page:
-        return {"ok": False, "reason": "NO_PAGE"}
-    transport = WebSocketTransport(page["webSocketDebuggerUrl"],
-                                   origin=f"http://127.0.0.1:{int(port)}", timeout=10)
     try:
-        value = _evaluate(transport, (
-            "(() => { const t = (document.body && document.body.innerText) || ''; "
-            f"return {{ok: true, text: t.slice(-{int(limit)}), chars: t.length}}; }})()"
-        ), 10)
-        return value or {"ok": False, "reason": "EMPTY"}
-    finally:
-        transport.close()
+        targets = _targets(port)
+    except Exception as exc:
+        from ..gui.base import GuiAutomationError
+        raise GuiAutomationError("GUI_DRIVER_ERROR",
+                                 f"Trae CDP 读取失败: {exc}") from exc
+    pages = [item for item in targets if item.get("type") == "page"]
+    if page_id:
+        pinned = next((item for item in pages if item.get("id") == page_id), None)
+        if pinned:
+            pages = [pinned] + [item for item in pages if item.get("id") != page_id]
+    elif pages:
+        preferred = _pick_page(targets)
+        if preferred:
+            pages = [preferred] + [item for item in pages if item.get("id") != preferred.get("id")]
+    last_error = ""
+    for page in pages:
+        try:
+            transport = WebSocketTransport(
+                page["webSocketDebuggerUrl"],
+                origin=f"http://127.0.0.1:{int(port)}", timeout=8)
+            try:
+                value = _evaluate(transport, (
+                    "(() => { const t = (document.body && document.body.innerText) || ''; "
+                    f"return {{ok: true, text: t.slice(-{int(limit)}), chars: t.length}}; }})()"
+                ), 8)
+            finally:
+                transport.close()
+            if value:
+                return {**value, "page_id": str(page.get("id") or "")}
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    from ..gui.base import GuiAutomationError
+    raise GuiAutomationError(
+        "GUI_DRIVER_ERROR",
+        f"Trae CDP 读取失败: {last_error or 'no page answered'}",
+        details={"port": int(port), "page_id": page_id,
+                 "targets": len(pages)},
+    )
 
 
 def probe(app: str = "trae_cn", config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -974,7 +1295,10 @@ __all__ = [
     "backup_state_db", "read_state", "account_uid", "list_trae_models",
     "resolve_trae_model", "model_key", "set_trae_model", "set_trae_workspace",
     "verify_trae_session", "build_trae_chat_uri", "clean_launch_env",
-    "ensure_trae_cdp", "send_trae_prompt", "trae_conversation_text",
+    "ensure_trae_cdp", "open_trae_workspace", "current_trae_workspace",
+    "pick_trae_page", "wait_for_trae_chat", "trae_login_required",
+    "set_trae_reasoning_effort",
+    "send_trae_prompt", "trae_conversation_text",
     "trae_visible_model", "open_trae_model_menu", "list_trae_model_items",
     "select_trae_model_via_cdp", "trae_executable", "trae_state_db", "trae_home",
     "variant", "probe",

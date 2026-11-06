@@ -7,8 +7,10 @@ import threading
 import time
 from pathlib import Path
 
-from agentloop_hub.gui.profiles import qoder_cn_profile, workbuddy_profile
+from agentloop_hub.control import trae_interface as trae
+from agentloop_hub.gui.profiles import qoder_cn_profile, trae_cn_profile, workbuddy_profile
 from agentloop_hub.gui.readers import QoderCnReader, WorkBuddyReader
+from agentloop_hub.gui.trae_reader import TraeReader
 
 
 def _event(kind: str, **payload) -> str:
@@ -168,3 +170,73 @@ def test_qoder_reader_uses_answering_model_not_trailing_config(tmp_path):
     assert reply.session_id == "sess"
     assert reply.model == "dfmodel"
     assert reply.text == "QODER_DF_OK"
+
+
+def test_trae_reader_ignores_echoed_prompt_and_waits_finished(tmp_path):
+    marker = "AGENTMESH_GUI_MARKER_TRAE_TEST"
+
+    def make_state(messages: int, status: str) -> trae.TraeState:
+        session = {"sessionId": "s1", "assistant_task_status": status,
+                   "messageIds": [f"m{i}" for i in range(messages)]}
+        items = {
+            "solo-lite-mode-state-map-u1": json.dumps({"code": {"session": session}}),
+            "u1:AI.agent.model.recent_user_selection_by_agent_label": json.dumps(
+                {"SOLO": {"modelId": "solo_agent_1__deepseek-v4.1-flash"}}
+            ),
+        }
+        return trae.TraeState(app="trae_cn", uid="u1",
+                              db=tmp_path / "state.vscdb", items=items)
+
+    states = [make_state(2, "working"), make_state(4, "working"),
+              make_state(4, "finished"), make_state(4, "finished"),
+              make_state(4, "finished")]
+    progress = (f"user prompt {marker}\n展示更多\n21:43\nTRAE\n"
+                "已读取 1 个文件，执行 1 条命令，正在创建文件…")
+    final = (f"user prompt {marker}\n展示更多\nTRAE\n"
+             "```json\n{\"plan_version\": 1, \"goal\": \"g\", \"tasks\": []}\n```")
+    texts = [f"user prompt {marker}", progress, final, final, final]
+
+    def seq(values):
+        box = {"i": 0}
+
+        def next_value():
+            value = values[min(box["i"], len(values) - 1)]
+            box["i"] += 1
+            return value
+        return next_value
+
+    reader = TraeReader(
+        trae_cn_profile(),
+        {"trae_poll_seconds": 0.01, "trae_stable_seconds": 0.01},
+        state_reader=seq(states), text_reader=lambda: {"ok": True, "text": seq_texts()},
+    )
+    seq_texts = seq(texts)  # bound before the reader polls
+    reply = reader.wait_reply(marker, started_at=time.time(), timeout=2,
+                              stall_seconds=5, expected_model="deepseek-v4.1-flash")
+    assert '"plan_version"' in reply.text
+    assert "正在创建文件" not in reply.text
+    assert reply.session_id == "s1"
+    assert reply.events == 2
+
+
+def test_workbuddy_active_sessions_use_latest_timestamp(tmp_path):
+    db = tmp_path / "workbuddy.db"
+    now_ms = int(time.time() * 1000)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, "
+        "status TEXT, model TEXT, created_at INTEGER, updated_at INTEGER, "
+        "last_activity_at INTEGER)")
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
+        ("sess-active", "D:/work", "task", "working", "glm-5.3-flash",
+         now_ms - 4 * 3600_000, now_ms, now_ms - 4 * 3600_000),
+    )
+    conn.commit()
+    conn.close()
+    reader = WorkBuddyReader(
+        workbuddy_profile(),
+        {"session_db": str(db), "data_path": str(tmp_path / "projects")},
+    )
+    active = reader.active_sessions(max_idle_seconds=900)
+    assert [item["id"] for item in active] == ["sess-active"]

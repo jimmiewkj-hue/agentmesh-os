@@ -12,9 +12,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from ..errors import ConfigError, HubError, NotFoundError, ValidationError
+from ..errors import (
+    ConfigError, HubError, NotFoundError, PermissionDeniedError, ValidationError,
+)
+from ..control.fsbrowser import (
+    create_directory as fs_create_directory,
+    is_loopback_address,
+    list_level as fs_list_level,
+    recent_projects as fs_recent_projects,
+    remember_project as fs_remember_project,
+)
 from ..hub import Hub
 from ..util import new_id, now_iso, tail_text
 from ..workspace.manager import WorkspaceManager
@@ -211,6 +220,23 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                            {"error": {"code": "internal_error", "message": str(exc),
                                       "traceback": traceback.format_exc()[-3000:]}})
 
+        def _require_loopback(self) -> None:
+            """Filesystem browsing is a local-only capability.
+
+            The console binds 127.0.0.1 by default, but a user can pass
+            ``--host 0.0.0.0`` to share it on a LAN. Directory listing must not
+            follow that flag: it would expose the whole disk to the network.
+            """
+            peer = ""
+            try:
+                peer = str(self.client_address[0] or "")
+            except (AttributeError, IndexError, TypeError):
+                peer = ""
+            if is_loopback_address(peer):
+                return
+            raise PermissionDeniedError(
+                f"文件浏览仅允许本机访问（请求来自 {peer or '未知地址'}）")
+
         def _static(self, path: str) -> bool:
             rel = "index.html" if path in ("", "/") else path.lstrip("/")
             target = (static_dir / rel).resolve()
@@ -230,7 +256,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
         # -- routing ---------------------------------------------------
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            path = parsed.path
+            path = unquote(parsed.path)
             query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
             try:
                 if path == "/api/stream":
@@ -246,7 +272,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
-                self._route_post(parsed.path, self._body())
+                self._route_post(unquote(parsed.path), self._body())
             except Exception as exc:
                 self._error(exc)
 
@@ -254,7 +280,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             parsed = urlparse(self.path)
             try:
                 hub = current_hub()
-                parts = parsed.path.strip("/").split("/")
+                parts = unquote(parsed.path).strip("/").split("/")
                 if parts[:2] == ["api", "agents"] and len(parts) == 3:
                     hub.remove_agent(parts[2])
                     self._json(200, {"status": "removed", "agent_id": parts[2]})
@@ -380,7 +406,20 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             if path == "/api/workspace":
                 self._json(200, provider.info())  # type: ignore[union-attr]
                 return
+            # Directory browsing is served before a workspace exists: the
+            # picker is exactly how the user creates/opens their first project.
+            if path == "/api/fs/list":
+                self._require_loopback()
+                self._json(200, fs_list_level(query.get("path", "")))
+                return
+            if path == "/api/workspaces/recent":
+                self._require_loopback()
+                self._json(200, {"projects": fs_recent_projects()})
+                return
             hub = current_hub()
+            if path == "/api/settings":
+                self._json(200, hub.settings())
+                return
             if path == "/api/overview":
                 self._json(200, hub.overview())
                 return
@@ -440,6 +479,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             if path == "/api/chain":
                 self._json(200, hub.chain_status(query.get("run_id", "")))
                 return
+            if path == "/api/chain/draft":
+                self._json(200, {"draft": hub.chain_draft()})
+                return
             if path == "/api/models/recommend":
                 self._json(200, hub.recommend_models(
                     task_type=query.get("task_type", "analysis"),
@@ -448,6 +490,15 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "bindings":
                 self._json(200, hub.run_bindings(parts[2]))
+                return
+            if path == "/api/roles":
+                self._json(200, hub.role_policy())
+                return
+            if path == "/api/solve":
+                self._json(200, hub.solve_status(query.get("run_id", "")))
+                return
+            if len(parts) == 3 and parts[1] == "roles":
+                self._json(200, hub.resolve_role(parts[2]))
                 return
             if path == "/api/plans":
                 self._json(200, {"plans": hub.plans(limit=int(query.get("limit", "50")))})
@@ -572,6 +623,11 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
 
         def _route_post(self, path: str, body: dict[str, Any]) -> None:
             parts = [p for p in path.strip("/").split("/") if p]
+            if path == "/api/fs/mkdir":
+                self._require_loopback()
+                self._json(200, fs_create_directory(
+                    str(body.get("path", "")), str(body.get("name", ""))))
+                return
             if path in ("/api/workspace/init", "/api/workspace/open"):
                 target = str(body.get("path", "")).strip()
                 if not target:
@@ -587,8 +643,12 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 # opening the console does not wait on model probing.
                 threading.Thread(target=_sync_models_if_stale, args=(hub,),
                                  daemon=True).start()
+                info = provider.info()  # type: ignore[union-attr]
+                if info.get("open") and info.get("root"):
+                    fs_remember_project(str(info["root"]),
+                                        str(body.get("name", "") or ""))
                 self._json(200, {
-                    "workspace": provider.info(),  # type: ignore[union-attr]
+                    "workspace": info,
                     "result": result,
                     "agents": len(hub.list_agents()),
                     "pending_approvals": len(hub.approvals_pending()),
@@ -611,11 +671,67 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                                             main_agent_id=str(body.get("agent_id", "")),
                                             model=str(body.get("model", ""))))
                 return
+            if path == "/api/solve":
+                goal = str(body.get("goal", ""))
+                common = {
+                    "executor_agent": str(body.get("executor_agent", "")),
+                    "executor_model": str(body.get("executor_model", "")),
+                    "commander_agent": str(body.get("commander_agent", "")),
+                    "commander_model": str(body.get("commander_model", "")),
+                }
+                if body.get("async"):
+                    job_id = jobs.submit("solve", lambda: hub.solve(
+                        goal, max_tasks=int(body.get("max_tasks", 4) or 4),
+                        max_parallel=int(body.get("max_parallel", 1) or 1),
+                        start=bool(body.get("start", True)),
+                        background=bool(body.get("background", True)),
+                        polish=bool(body.get("polish", False)), **common))
+                    self._json(202, {"job_id": job_id})
+                else:
+                    self._json(200, hub.solve(
+                        goal, max_tasks=int(body.get("max_tasks", 4) or 4),
+                        max_parallel=int(body.get("max_parallel", 1) or 1),
+                        start=bool(body.get("start", True)),
+                        background=bool(body.get("background", True)),
+                        polish=bool(body.get("polish", False)), **common))
+                return
+            if path == "/api/segment":
+                self._json(200, hub.segment_goal(
+                    str(body.get("goal", "")),
+                    max_tasks=int(body.get("max_tasks", 4) or 4),
+                    executor_agent=str(body.get("executor_agent", "")),
+                    executor_model=str(body.get("executor_model", "")),
+                    commander_agent=str(body.get("commander_agent", "")),
+                    commander_model=str(body.get("commander_model", "")),
+                ))
+                return
+            if path == "/api/roles/resolve":
+                self._json(200, hub.resolve_role(
+                    str(body.get("role", "")),
+                    limit=int(body.get("limit", 6) or 6),
+                    executor_agent=str(body.get("executor_agent", "")),
+                    executor_model=str(body.get("executor_model", "")),
+                    commander_agent=str(body.get("commander_agent", "")),
+                    commander_model=str(body.get("commander_model", "")),
+                ))
+                return
+            if path == "/api/roles/import":
+                self._json(200, hub.import_role_policy(
+                    str(body.get("path", "")), save=bool(body.get("save", False))))
+                return
+            if path == "/api/roles/save":
+                self._json(200, hub.save_role_policy(str(body.get("path", ""))))
+                return
+            if path == "/api/aggregate":
+                self._json(200, hub.aggregate_run(
+                    str(body.get("run_id", "")), polish=bool(body.get("polish", False))))
+                return
             if path == "/api/preflight":
                 result = hub.preflight_agents(
                     list(body.get("stages") or []),
                     workspace=str(body.get("workspace", "")),
                     open_apps=bool(body.get("open_apps", True)),
+                    full_control=bool(body.get("full_control", True)),
                     config=dict(body.get("config") or {}),
                 )
                 self._json(200, result)
@@ -628,11 +744,20 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                     start=bool(body.get("start", False)),
                     background=bool(body.get("background", True)),
                     max_parallel=int(body.get("max_parallel", 1) or 1),
-                    approve=bool(body.get("approve", True)),
+                    approve=bool(body.get("approve", False)),
+                    plan_id=str(body.get("plan_id", "")),
+                    save_only=bool(body.get("save_only", False)),
                 )
                 if result.get("status") == "started" and body.get("wait"):
                     result["run"] = hub.run_status(result["run_id"])
                 self._json(200, result)
+                return
+            if path == "/api/chain/draft":
+                self._json(200, hub.save_chain_draft(dict(body.get("draft") or body)))
+                return
+            if len(parts) == 5 and parts[1] == "agents" and parts[3] == "interface" \
+                    and parts[4] == "restart":
+                self._json(200, hub.restart_agent_interface(parts[2]))
                 return
             if path == "/api/bus/publish":
                 self._json(200, hub.bus_publish(
@@ -677,7 +802,13 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.sync_models(str(body.get("agent_id", ""))))
                 return
             if len(parts) == 4 and parts[1] == "agents" and parts[3] == "model":
-                self._json(200, hub.set_agent_model(parts[2], str(body.get("model", ""))))
+                self._json(200, hub.set_agent_model(
+                    parts[2], str(body.get("model", "")),
+                    context_length=(int(body["context_length"])
+                                    if body.get("context_length") is not None else None),
+                    capability_level=(str(body.get("capability_level"))
+                                      if body.get("capability_level") is not None else None),
+                ))
                 return
             if len(parts) == 5 and parts[1] == "agents" and parts[3] == "model" \
                     and parts[4] == "remove":
@@ -705,13 +836,27 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 )
                 self._json(200, result)
                 return
+            if path == "/api/settings/full_control":
+                self._json(200, hub.set_full_control(bool(body.get("enabled", True))))
+                return
+            if path == "/api/settings/multi_round":
+                self._json(200, hub.set_multi_round(
+                    bool(body.get("enabled", True)),
+                    max_rounds=body.get("max_rounds"),
+                ))
+                return
             if path == "/api/budget":
                 self._json(200, hub.set_project_budget(int(body.get("tokens", 0) or 0)))
                 return
             if path == "/api/main":
-                result = hub.set_main(str(body.get("agent_id", "")), str(body.get("model", "")),
-                                      budget_tokens=int(body.get("budget_tokens", 0) or 0),
-                                      note=str(body.get("note", "")))
+                result = hub.set_main(
+                    str(body.get("agent_id", "")), str(body.get("model", "")),
+                    budget_tokens=int(body.get("budget_tokens", 0) or 0),
+                    note=str(body.get("note", "")),
+                    context_length=(int(body["context_length"])
+                                    if body.get("context_length") is not None else None),
+                    capability_level=(str(body.get("capability_level"))
+                                      if body.get("capability_level") is not None else None))
                 self._json(200, {"main": result})
                 return
             if path == "/api/plans":
@@ -742,6 +887,10 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.pause_run(parts[2],
                                               str(body.get("reason", "用户暂停"))))
                 return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "cancel":
+                self._json(200, hub.cancel_run(parts[2],
+                                               str(body.get("reason", "用户停止运行"))))
+                return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] in ("start", "resume"):
                 parallel = body.get("max_parallel")
                 fn = hub.start_run if parts[3] == "start" else hub.resume_run
@@ -756,6 +905,20 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "retry":
                 self._json(200, hub.retry_task(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "reverify":
+                self._json(200, hub.reverify_task(parts[2]))
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "binding":
+                self._json(200, hub.update_task_binding(
+                    parts[2],
+                    agent_id=str(body.get("agent_id", "")),
+                    model=str(body.get("model", "")),
+                    context_length=(int(body["context_length"])
+                                    if body.get("context_length") is not None else None),
+                    capability_level=(str(body.get("capability_level"))
+                                      if body.get("capability_level") is not None else None),
+                ))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "cancel":
                 self._json(200, hub.cancel_task(parts[2]))

@@ -189,7 +189,12 @@ class MergeService:
                                   check=False).stdout_text or "").strip()  # type: ignore[attr-defined]
         if run.get("base_branch") and current_branch != run["base_branch"]:
             raise ConflictError(f"当前分支 {current_branch} 与计划基线 {run['base_branch']} 不一致")
-        # Deterministic cross-task file overlap check.
+        # Deterministic cross-task file overlap check. A later round legitimately
+        # edits the same file as the round it repairs; allow overlap only when
+        # one task is an ancestor of the other, because patches were composed
+        # in that order. Unrelated tasks still conflict.
+        all_tasks = self.store.list_tasks(run["run_id"])
+        deps = {t.task_id: list(t.spec.dependencies) for t in all_tasks}
         patches = []
         for task in tasks:
             if task.patch_path and Path(task.patch_path).exists():
@@ -197,11 +202,51 @@ class MergeService:
         for i in range(len(patches)):
             for j in range(i + 1, len(patches)):
                 overlap = patches[i][1] & patches[j][1]
-                if overlap:
-                    raise ConflictError(
-                        f"任务 {patches[i][0].task_id} 与 {patches[j][0].task_id} 修改了相同文件",
-                        details={"files": sorted(overlap)},
-                    )
+                if not overlap:
+                    continue
+                left, right = patches[i][0].task_id, patches[j][0].task_id
+                if self._continuation_overlap(deps, left, right):
+                    continue
+                raise ConflictError(
+                    f"任务 {patches[i][0].task_id} 与 {patches[j][0].task_id} 修改了相同文件",
+                    details={"files": sorted(overlap)},
+                )
+
+    @staticmethod
+    def _round_of(task_id: str) -> int:
+        import re
+        match = re.match(r"^R(\d+)_", str(task_id))
+        return int(match.group(1)) if match else 0
+
+    @classmethod
+    def _continuation_overlap(cls, deps: dict[str, list[str]],
+                              left: str, right: str) -> bool:
+        """Allow a later round to edit a file it is repairing.
+
+        Same-round tasks and ordinary plan tasks keep the strict no-overlap
+        rule; only an ``R<n>_`` task that depends on an earlier round may
+        compose patches on the same file.
+        """
+        for child, parent in ((left, right), (right, left)):
+            child_round = cls._round_of(child)
+            if child_round and cls._round_of(parent) != child_round \
+                    and cls._depends_on(deps, child, parent):
+                return True
+        return False
+
+    @staticmethod
+    def _depends_on(deps: dict[str, list[str]], task_id: str, target: str) -> bool:
+        seen: set[str] = set()
+        stack = list(deps.get(task_id, []))
+        while stack:
+            current = stack.pop()
+            if current == target:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(deps.get(current, []))
+        return False
 
     def _post_merge_verification(self, tasks: list[Task]) -> list[dict[str, Any]]:
         out = []

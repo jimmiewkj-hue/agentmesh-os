@@ -38,10 +38,12 @@ def initialize_project(path: str | Path, *, name: str = "", git_init: bool = Tru
         _git_init(root)
         git_created = True
     initial_commit = False
-    if not detect_repo(root).get("commit") and (was_empty or readme_created):
-        # A brand-new project needs at least one commit before worktrees can be
-        # created. Existing user content is never committed implicitly.
-        initial_commit = _initial_commit(root)
+    if not detect_repo(root).get("commit"):
+        # Worktrees need a base commit even when the directory already holds
+        # unrelated user files. A brand-new/empty project gets its generated
+        # files committed; an existing directory only gets an empty commit so
+        # no user content is ever staged implicitly.
+        initial_commit = _initial_commit(root, stage_content=was_empty or readme_created)
     return {
         "root": str(root), "created": created, "git_initialized": git_created,
         "initial_commit": initial_commit,
@@ -57,10 +59,11 @@ def _git_init(root: Path) -> None:
         run_git(["init"], cwd=root, timeout=60)
 
 
-def _initial_commit(root: Path) -> bool:
+def _initial_commit(root: Path, *, stage_content: bool = True) -> bool:
     identity = ["-c", "user.name=AgentMesh", "-c", "user.email=agentmesh@localhost"]
     try:
-        run_git([*identity, "add", "-A"], cwd=root, timeout=60, check=False)
+        if stage_content:
+            run_git([*identity, "add", "-A"], cwd=root, timeout=60, check=False)
         proc = run_git([*identity, "commit", "--allow-empty", "-m",
                         "chore: initialize AgentMesh workspace"],
                        cwd=root, timeout=60, check=False)

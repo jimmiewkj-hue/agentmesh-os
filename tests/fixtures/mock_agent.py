@@ -63,6 +63,8 @@ def main() -> int:
             attempt = int(marker.read_text(encoding="utf-8")) if marker.exists() else 0
             marker.write_text(str(attempt + 1), encoding="utf-8")
             plan = sequence[min(attempt, len(sequence) - 1)]
+        elif "多轮续跑上下文" in prompt and scenario.get("round_plan"):
+            plan = scenario["round_plan"]
         else:
             plan = scenario.get("plan")
         if not plan:
@@ -80,11 +82,23 @@ def main() -> int:
         return 0
 
     if basename == "summary.json":
-        summary = scenario.get("summary") or {
-            "summary_version": 1, "completion": "mock completed", "changes": [],
-            "verification": "passed", "risks": [], "merge_recommendation": "approve",
-            "next_actions": [],
-        }
+        if scenario.get("summary_missing"):
+            print("mock summary missing")
+            return 0
+        sequence = scenario.get("summary_sequence")
+        if sequence:
+            marker_dir = Path(os.environ.get("AGENTLOOP_TASK_DIR", workdir))
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            marker = marker_dir / ".summary_attempt"
+            attempt = int(marker.read_text(encoding="utf-8")) if marker.exists() else 0
+            marker.write_text(str(attempt + 1), encoding="utf-8")
+            summary = sequence[min(attempt, len(sequence) - 1)]
+        else:
+            summary = scenario.get("summary") or {
+                "summary_version": 1, "completion": "mock completed", "changes": [],
+                "verification": "passed", "risks": [], "merge_recommendation": "approve",
+                "next_actions": [],
+            }
         result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print("mock summary written")
         return 0
@@ -152,6 +166,13 @@ def main() -> int:
     })
     payload.update({k: v for k, v in action.get("result", {}).items()})
     result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Record the model the control plane actually dispatched with, so tests can
+    # prove per-task model routing without depending on stdout parsing.
+    model = os.environ.get("AGENTLOOP_MODEL", "")
+    if model:
+        marker_dir = Path(os.environ.get("AGENTLOOP_TASK_DIR", workdir))
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / "dispatched-model.txt").write_text(model, encoding="utf-8")
     print(f"mock completed {task_id}")
     return 0
 

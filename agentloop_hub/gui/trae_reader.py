@@ -16,6 +16,7 @@ message list has grown).  No mouse, keyboard or clipboard event is synthesised.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,17 @@ def _active_session(state: trae.TraeState) -> tuple[str, dict[str, Any]]:
     return "", {}
 
 
+def _json_file_ready(path: str) -> bool:
+    """A GUI plan/task is done when its result file is complete valid JSON."""
+    if not path:
+        return False
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(data, (dict, list))
+
+
 class TraeReader:
     def __init__(self, profile: GuiProfile, config: dict[str, Any] | None = None, *,
                  state_reader: Callable[[], trae.TraeState] | None = None,
@@ -48,8 +60,12 @@ class TraeReader:
         self.stable_seconds = float(self.config.get("trae_stable_seconds") or 4.0)
         self._state_reader = state_reader or (
             lambda: trae.read_state(self.app, self.config))
+        self.page_id = ""
         self._text_reader = text_reader or (
-            lambda: trae.trae_conversation_text(port=self.port))
+            lambda: trae.trae_conversation_text(port=self.port,
+                                                page_id=self.page_id))
+        self.completion_path = ""
+        self.cancel_event = None
 
     def wait_reply(self, marker: str, *, started_at: float, timeout: float,
                    stall_seconds: float, expected_model: str = "") -> GuiReply:
@@ -67,6 +83,8 @@ class TraeReader:
         last_change = time.monotonic()
         saw_reply = False
         while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise GuiAutomationError("GUI_CANCELED", "用户停止运行")
             time.sleep(self.poll_interval)
             try:
                 state = self._state_reader()
@@ -74,6 +92,8 @@ class TraeReader:
             except Exception as exc:
                 raise GuiAutomationError("GUI_DRIVER_ERROR",
                                          f"Trae 轮询失败: {exc}") from exc
+            if text_result.get("page_id"):
+                self.page_id = str(text_result["page_id"])
             text = str(text_result.get("text") or "")
             _, session = _active_session(state)
             messages = len(session.get("messageIds") or [])
@@ -87,11 +107,29 @@ class TraeReader:
                 last_change = time.monotonic()
             stable = time.monotonic() - last_change >= self.stable_seconds
             grew = messages > baseline_messages
-            if marker_seen and saw_reply and stable and (finished or grew):
-                recent = state.get(
-                    state.prefixed("AI.agent.model.recent_user_selection_by_agent_label"), {})
-                selection = recent.get(trae.AGENT_LABEL, {}) if isinstance(recent, dict) else {}
-                model = str(selection.get("modelId", "")) if isinstance(selection, dict) else ""
+            recent = state.get(
+                state.prefixed("AI.agent.model.recent_user_selection_by_agent_label"), {})
+            selection = recent.get(trae.AGENT_LABEL, {}) if isinstance(recent, dict) else {}
+            model = str(selection.get("modelId", "")) if isinstance(selection, dict) else ""
+            if _json_file_ready(self.completion_path):
+                # The agent wrote a complete structured result.  This is a
+                # stronger and faster completion signal than DOM stability.
+                return GuiReply(
+                    session_id=str(session.get("sessionId") or ""),
+                    text=(reply or text)[-60000:],
+                    model=model or expected_model,
+                    transcript_path=str(state.db),
+                    events=max(0, messages - baseline_messages),
+                    usage={"source": "cdp-dom+state.vscdb+result-file",
+                           "message_ids": messages,
+                           "result_path": self.completion_path},
+                    finished_at=now_iso(),
+                )
+            # ``grew`` alone is not a completion signal: Trae appends a user
+            # message before the assistant starts, and a plan/task may expose a
+            # progress line while still working. Only the application's own
+            # assistant_task_status=finished plus a new message pair is final.
+            if marker_seen and saw_reply and stable and finished and grew:
                 return GuiReply(
                     session_id=str(session.get("sessionId") or ""),
                     text=reply[-60000:],

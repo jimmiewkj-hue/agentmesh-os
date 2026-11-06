@@ -55,7 +55,8 @@ class HubConfig:
     cli_timeout_seconds: int = 3600
     plan_timeout_seconds: int = 900
     summary_timeout_seconds: int = 600
-    verify_timeout_seconds: int = 900
+    verify_timeout_seconds: int = 180
+    verify_server_probe_seconds: int = 15
 
     default_task_token_budget: int = 30000
     default_project_token_budget: int = 0
@@ -109,6 +110,10 @@ class HubConfig:
     require_independent_verifier: bool = True
     verify_build: bool = True
     verifier_agent_id: str | None = None
+    # Plans sometimes omit an entry file (e.g. src/main.js) that the task
+    # objective requires.  "warn" keeps the task completed with a visible
+    # warning; "strict" fails on any out-of-scope file.
+    scope_violation_policy: str = "warn"
 
     # Programmatic GUI-agent interface. WorkBuddy's task deeplink uses
     # welcomeMode code/work/design; "code" is the development mode and maps
@@ -116,6 +121,18 @@ class HubConfig:
     workbuddy_welcome_mode: str = "code"
     workbuddy_permission_mode: str = "fullAccess"
     workbuddy_agent_mode: str = "craft"
+    # User-facing "完全控制": when enabled, GUI agents are switched to their
+    # own full-access mode and any residual permission dialog is accepted via
+    # the agent's renderer interface (CDP DOM), never via OS input.
+    full_control: bool = True
+    # Multi-round continuation: when a round ends without satisfying the goal,
+    # the main node plans the next minimal round instead of stopping. The cap
+    # counts total rounds including the first one; repeated identical blockers
+    # stop early. Modelled on DSH goal rounds and opencode's turn loop.
+    multi_round: bool = True
+    max_rounds: int = 3
+    blocked_after_rounds: int = 2
+    round_replan: bool = True
     workspace_verify: bool = True
     interface_restart_timeout_seconds: int = 60
 
@@ -143,6 +160,7 @@ class HubConfig:
             "plan_timeout_seconds": self.plan_timeout_seconds,
             "summary_timeout_seconds": self.summary_timeout_seconds,
             "verify_timeout_seconds": self.verify_timeout_seconds,
+            "verify_server_probe_seconds": self.verify_server_probe_seconds,
             "default_task_token_budget": self.default_task_token_budget,
             "default_project_token_budget": self.default_project_token_budget,
             "default_plan_token_budget": self.default_plan_token_budget,
@@ -177,6 +195,11 @@ class HubConfig:
             "workbuddy_welcome_mode": self.workbuddy_welcome_mode,
             "workbuddy_permission_mode": self.workbuddy_permission_mode,
             "workbuddy_agent_mode": self.workbuddy_agent_mode,
+            "full_control": self.full_control,
+            "multi_round": self.multi_round,
+            "max_rounds": self.max_rounds,
+            "blocked_after_rounds": self.blocked_after_rounds,
+            "round_replan": self.round_replan,
             "workspace_verify": self.workspace_verify,
             "interface_restart_timeout_seconds": self.interface_restart_timeout_seconds,
             "dangerous_command_patterns": self.dangerous_command_patterns,

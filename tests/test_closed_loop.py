@@ -113,6 +113,7 @@ def test_scope_violation_fails_task(tmp_path):
                     "merge_recommendation": "reject", "next_actions": []},
     }
     repo, hub, _ = make_project(tmp_path, scenario=scenario)
+    hub.config.multi_round = False
     run_id = run_plan(hub)
     result = hub.start_run(run_id, max_parallel=2)
     assert result["status"] == "failed"
@@ -149,6 +150,7 @@ def test_high_risk_task_waits_for_approval_then_resumes(tmp_path):
     high = [a for a in pending if a["kind"] == "high_risk" and a["task_uid"].endswith(":T003")]
     assert high
     hub.decide_approval(high[0]["approval_id"], approve=True)
+    assert hub.store.get_task(high[0]["task_uid"]).status == "queued"
     result2 = hub.resume_run(run_id, max_parallel=2)
     assert result2["status"] == "pending_acceptance"
     hub.close()
@@ -275,4 +277,80 @@ def test_relay_result_submission_and_resume(tmp_path):
     # After submitting the result the control plane can finish verification.
     result2 = hub.start_run(run_id, max_parallel=2)
     assert result2["status"] in ("pending_acceptance", "waiting_user"), result2
+    hub.close()
+
+
+def test_paused_run_marks_queued_tasks_paused(tmp_path):
+    repo, hub, _ = make_project(tmp_path, scenario={
+        "tasks": {
+            "T001": {"sleep": 0.5, "summary": "one"},
+            "T002": {"sleep": 0.5, "summary": "two"},
+            "T003": {"write_files": [{"path": "calc.py",
+                                      "content": "def add(a, b):\n    return a + b\n"}],
+                     "summary": "three"},
+        },
+    })
+    run_id = run_plan(hub)
+    hub.start_run(run_id, max_parallel=1, background=True)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        status = hub.run_status(run_id)
+        if any(t["status"] == "running" for t in status["tasks"]):
+            break
+        time.sleep(0.05)
+    hub.pause_run(run_id, "test pause")
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        status = hub.run_status(run_id)
+        if any(t["status"] == "paused" for t in status["tasks"]):
+            break
+        time.sleep(0.1)
+    status = hub.run_status(run_id)
+    assert status["run"]["status"] == "paused", status
+    assert any(t["status"] == "paused" for t in status["tasks"])
+    hub.close()
+
+
+def test_downstream_task_sees_upstream_patch_in_worktree(tmp_path):
+    plan = {
+        "plan_version": 1, "goal": "two-step build", "constraints": [],
+        "tasks": [
+            {"task_id": "T001", "title": "create base", "type": "implementation",
+             "objective": "create a.txt", "suggested_agent": "mock_worker",
+             "dependencies": [], "scope": ["a.txt"], "out_of_scope": [],
+             "expected_outputs": ["code_patch"], "acceptance_criteria": ["a exists"],
+             "verification_commands": [], "token_budget": 5000,
+             "time_limit_minutes": 5, "retry_limit": 0, "risk_level": "low",
+             "priority": 5, "approval_policy": "auto"},
+            {"task_id": "T002", "title": "extend base", "type": "implementation",
+             "objective": "read a.txt and create b.txt", "suggested_agent": "mock_worker",
+             "dependencies": ["T001"], "scope": ["b.txt"], "out_of_scope": [],
+             "expected_outputs": ["code_patch"], "acceptance_criteria": ["a is visible"],
+             "verification_commands": ["python -c \"print(open('a.txt').read())\""],
+             "token_budget": 5000, "time_limit_minutes": 5, "retry_limit": 0,
+             "risk_level": "low", "priority": 4, "approval_policy": "auto"},
+        ],
+    }
+    scenario = {
+        "plan": plan,
+        "tasks": {
+            "T001": {"write_files": [{"path": "a.txt", "content": "base\n"}],
+                     "summary": "base created"},
+            "T002": {"write_files": [{"path": "b.txt", "content": "extended\n"}],
+                     "summary": "extension created"},
+        },
+        "verification": {"checks": {"scope_check": "passed"}},
+        "summary": {"summary_version": 1, "completion": "done", "changes": [],
+                    "verification": "passed", "risks": [],
+                    "merge_recommendation": "approve", "next_actions": []},
+    }
+    repo, hub, _ = make_project(tmp_path, scenario=scenario)
+    plan_result = hub.import_plan(plan)
+    approved = hub.decide_approval(plan_result["approval_id"], approve=True)
+    run_id = approved["outcome"]["run_id"]
+    outcome = hub.start_run(run_id, max_parallel=1)
+    assert outcome["status"] == "pending_acceptance", outcome
+    tasks = {t["task_id"]: t for t in hub.run_status(run_id)["tasks"]}
+    assert tasks["T001"]["status"] == "completed"
+    assert tasks["T002"]["status"] == "completed", tasks["T002"]
     hub.close()

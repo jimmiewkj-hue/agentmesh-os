@@ -14,13 +14,16 @@ from ..models import (
     AgentRecord, Project, Task, TaskPlan, TaskSpec, TaskStatus,
 )
 from ..storage.repo import Store
-from ..util import estimate_tokens, new_id, now_iso, read_json, read_text
+from ..util import atomic_write_text, estimate_tokens, new_id, now_iso, read_json, read_text, write_json
 from .approvals import ApprovalService
 from .audit import AuditService
 from .budget import BudgetManager
 from .bus import ContextBus
 from .checkpoints import CheckpointService
 from ..config import HubConfig
+from .collaboration import (
+    build_contract, enforce_plan_contract, normalize_plan_payload,
+)
 from .context import ContextBuilder
 from .cost import CostOptimizer
 from .governance import GovernanceService
@@ -52,11 +55,13 @@ class PlanningService:
         self.prompts = PromptBuilder(paths, project)
 
     # -- request ----------------------------------------------------------
-    def request_plan(self, goal: str, *, main_agent_id: str = "", model: str = "") -> dict[str, Any]:
+    def request_plan(self, goal: str, *, main_agent_id: str = "", model: str = "",
+                     persist: bool = True, plan_id: str = "",
+                     round_context: dict[str, Any] | None = None) -> dict[str, Any]:
         if not goal.strip():
             raise ValidationError("需求目标不能为空")
         main = self._resolve_main(main_agent_id, model)
-        plan_id = new_id("plan")
+        plan_id = plan_id or new_id("plan")
         agents = [self._agent_brief(a) for a in self.store.list_agents()]
         memories = self.memory.injectable()
         conversations = self.store.list_conversations(self.project.project_id, limit=5)
@@ -69,13 +74,23 @@ class PlanningService:
             agents=agents,
         )
         ctx["bootstrap"] = self.memory.bootstrap(agent_id=main.agent_id)
+        contract = build_contract(self.store, self.project, main.agent_id,
+                                  model or self._main_model())
+        ctx["collaboration"] = contract
+        if round_context:
+            ctx["round_context"] = round_context
         if self.cost:
             ctx = self.cost.compress_context(
                 ctx, self.config.context_summary_tokens, kind="context_compression",
             )
         workspace = self._plan_workspace(plan_id)
+        canonical_plan_path = self.paths.planning / plan_id / "plan.json"
+        gui_mode = str(main.adapter_type) == "gui_automation"
+        agent_plan_path = (Path(workspace) / "plan.json") if gui_mode else canonical_plan_path
         prompt_path, plan_path = self.prompts.write_plan_request(
             plan_id=plan_id, goal=goal, main_agent=main, model=model, context=ctx,
+            output_path=agent_plan_path, workspace=workspace, gui_mode=gui_mode,
+            round_context=round_context,
         )
         if self.bus:
             self.bus.publish("prompt", {
@@ -94,15 +109,31 @@ class PlanningService:
         request = ExecutionRequest(
             project_id=self.project.project_id, project_root=self.project.root,
             task=synthetic, workdir=workspace, task_dir=str(prompt_path.parent),
-            prompt_path=str(prompt_path), result_path=str(plan_path),
+            prompt_path=str(prompt_path), result_path=str(agent_plan_path),
             model=model or (self._main_model() or ""),
             timeout_seconds=self.config.plan_timeout_seconds, purpose="plan",
+            full_control=bool(self.config.full_control),
         )
         self.audit.log("control-plane", "workspace.created", subject=plan_id,
                        payload={"expected": workspace, "kind": "plan",
                                 "base_commit": self.project.commit})
+        activity_path = self.paths.planning / plan_id / "activity.json"
+        activity = {
+            "phase": "round_plan" if round_context else "plan",
+            "round": int((round_context or {}).get("round") or 0),
+            "plan_id": plan_id, "agent_id": main.agent_id, "agent_name": main.name,
+            "model": request.model, "status": "running",
+            "started_at": now_iso(), "prompt_path": str(prompt_path),
+            "workspace": workspace,
+        }
+        write_json(activity_path, activity)
         adapter = create_adapter(main)
         outcome = adapter.execute(request)
+        activity.update({
+            "status": outcome.status, "error": outcome.error[:500],
+            "finished_at": now_iso(), "duration_ms": outcome.duration_ms,
+        })
+        write_json(activity_path, activity)
         self.budget.record(
             synthetic, main.agent_id, request.model, outcome.usage,
             duration_ms=outcome.duration_ms, run_id="", status=outcome.status,
@@ -127,12 +158,17 @@ class PlanningService:
                 "status": "failed", "plan_id": "", "error": outcome.error,
                 "prompt_path": str(prompt_path), "plan_path": str(plan_path),
             }
-        data = read_json(plan_path)
-        if data is None:
+        data = read_json(agent_plan_path)
+        if not isinstance(data, dict):
+            data = outcome.result_payload if isinstance(outcome.result_payload, dict) else None
+        if isinstance(data, dict):
+            write_json(plan_path, data)
+        else:
             return {"status": "failed", "plan_id": "", "error": "主节点没有写出计划文件",
                     "prompt_path": str(prompt_path), "plan_path": str(plan_path)}
         try:
-            plan = TaskPlan.from_dict(data, project_id=self.project.project_id, plan_id=plan_id)
+            plan = TaskPlan.from_dict(normalize_plan_payload(data),
+                                      project_id=self.project.project_id, plan_id=plan_id)
         except ValidationError as exc:
             repaired = self._repair_plan_with_agent(
                 adapter, main, request, synthetic, prompt_path, plan_path, exc.message
@@ -143,8 +179,26 @@ class PlanningService:
             plan = repaired
         plan.main_agent_id = main.agent_id
         plan.model = request.model
+        contract_notes = enforce_plan_contract(plan, contract)
+        plan.validate()
+        if not persist:
+            plan.status = "draft"
+            self.audit.log("control-plane", "plan.round_delta_generated",
+                           subject=plan_id,
+                           payload={"tasks": [t.task_id for t in plan.tasks],
+                                    "round": (round_context or {}).get("round", 0),
+                                    "contract_notes": contract_notes})
+            return {
+                "status": "completed", "plan_id": plan_id,
+                "plan": plan.to_dict(), "tasks": [t.to_dict() for t in plan.tasks],
+                "contract_notes": contract_notes,
+                "prompt_path": str(prompt_path), "plan_path": str(plan_path),
+            }
         plan.status = "pending_approval"
         self.store.save_plan(plan)
+        self.audit.log("control-plane", "plan.collaboration_enforced",
+                       subject=plan.plan_id,
+                       payload={"contract": contract, "notes": contract_notes})
         architecture = self.governance.ensure_architecture_approval(plan) if self.governance else None
         approval = self.approvals.ensure_plan_approval(plan)
         self.checkpoints.create("plan_generated", extra={"plan_id": plan.plan_id})
@@ -166,6 +220,34 @@ class PlanningService:
             "prompt_path": str(prompt_path), "plan_path": str(plan_path),
         }
 
+    def request_round_plan(self, *, goal: str, base_plan: TaskPlan, round_number: int,
+                           round_context: dict[str, Any]) -> dict[str, Any]:
+        """Ask the main node for the next minimal round without persisting a plan."""
+        result = self.request_plan(
+            goal,
+            main_agent_id=base_plan.main_agent_id,
+            model=base_plan.model,
+            persist=False,
+            plan_id=new_id(f"round{round_number}"),
+            round_context=round_context,
+        )
+        if result.get("status") != "completed":
+            return result
+        try:
+            plan = TaskPlan.from_dict(
+                result["plan"], project_id=self.project.project_id,
+                plan_id=str(result["plan_id"]),
+            )
+        except ValidationError as exc:
+            return {"status": "failed", "error": f"增量计划校验失败: {exc.message}",
+                    "prompt_path": result.get("prompt_path", "")}
+        return {
+            "status": "completed", "plan": plan,
+            "tasks": [t.to_dict() for t in plan.tasks],
+            "contract_notes": result.get("contract_notes", []),
+            "prompt_path": result.get("prompt_path", ""),
+        }
+
     def _repair_plan_with_agent(self, adapter, main, request, synthetic,
                                 prompt_path: Path, plan_path: Path, error: str) -> TaskPlan | None:
         """Ask the main agent once to rewrite the invalid plan file."""
@@ -184,7 +266,7 @@ class PlanningService:
             task=request.task, workdir=request.workdir, task_dir=request.task_dir,
             prompt_path=request.prompt_path, result_path=request.result_path,
             model=request.model, timeout_seconds=request.timeout_seconds,
-            purpose="plan_repair",
+            purpose="plan_repair", full_control=bool(self.config.full_control),
         )
         outcome = adapter.execute(repair_request)
         self.budget.record(
@@ -196,11 +278,16 @@ class PlanningService:
         })
         if outcome.status != "completed":
             return None
-        data = read_json(plan_path)
+        data = read_json(request.result_path)
+        if not isinstance(data, dict) and isinstance(outcome.result_payload, dict):
+            data = outcome.result_payload
         if not isinstance(data, dict):
             return None
+        if isinstance(data, dict):
+            write_json(plan_path, data)
         try:
-            return TaskPlan.from_dict(data, project_id=self.project.project_id,
+            return TaskPlan.from_dict(normalize_plan_payload(data),
+                                      project_id=self.project.project_id,
                                       plan_id=synthetic.plan_id or new_id("plan"))
         except ValidationError:
             return None
@@ -272,10 +359,14 @@ class PlanningService:
         if raw is None:
             raise ValidationError(f"无法读取计划文件: {data}")
         plan_id = new_id("plan")
-        plan = TaskPlan.from_dict(raw, project_id=self.project.project_id, plan_id=plan_id)
+        plan = TaskPlan.from_dict(normalize_plan_payload(raw),
+                                  project_id=self.project.project_id, plan_id=plan_id)
         main = self._resolve_main(main_agent_id, model)
         plan.main_agent_id = main.agent_id
         plan.model = model or self._main_model()
+        contract = build_contract(self.store, self.project, main.agent_id, plan.model)
+        contract_notes = enforce_plan_contract(plan, contract)
+        plan.validate()
         plan.status = "pending_approval"
         self.store.save_plan(plan)
         architecture = self.governance.ensure_architecture_approval(plan) if self.governance else None
@@ -283,6 +374,9 @@ class PlanningService:
         self.checkpoints.create("plan_generated", extra={"plan_id": plan.plan_id})
         self.audit.log("user", "plan.imported", subject=plan.plan_id,
                        payload={"tasks": len(plan.tasks), "approval_id": approval.approval_id})
+        self.audit.log("control-plane", "plan.collaboration_enforced",
+                       subject=plan.plan_id,
+                       payload={"contract": contract, "notes": contract_notes})
         return {"status": "pending_approval", "plan_id": plan.plan_id,
                 "approval_id": approval.approval_id,
                 "architecture_approval_id": architecture.approval_id if architecture else "",
@@ -314,7 +408,8 @@ class PlanningService:
         run_id = self.store.create_run(
             self.project.project_id, plan_id, main_agent=plan.main_agent_id,
             model=plan.model, base_commit=base_commit, base_branch=self.project.branch,
-            status="ready",
+            status="ready", round_number=1,
+            max_rounds=int(self.config.max_rounds),
         )
         tasks = self.store.create_tasks(run_id, plan, base_commit)
         self.checkpoints.create("plan_approved", run_id=run_id,

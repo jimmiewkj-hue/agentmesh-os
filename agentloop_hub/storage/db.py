@@ -12,7 +12,7 @@ from ..errors import HubError
 from ..util import ensure_dir
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT NOT NULL DEFAULT '',
     acceptance_status TEXT NOT NULL DEFAULT 'pending',
     release_status TEXT NOT NULL DEFAULT 'not_requested',
+    round_number INTEGER NOT NULL DEFAULT 1,
+    max_rounds INTEGER NOT NULL DEFAULT 0,
+    goal_status TEXT NOT NULL DEFAULT 'active',
+    blocked_reason TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT '',
@@ -125,6 +129,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     objective TEXT NOT NULL,
     type TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
     suggested_agent TEXT NOT NULL DEFAULT '',
     scope TEXT NOT NULL DEFAULT '[]',
     out_of_scope TEXT NOT NULL DEFAULT '[]',
@@ -140,6 +146,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     risk_level TEXT NOT NULL DEFAULT 'low',
     approval_policy TEXT NOT NULL DEFAULT 'auto',
     priority INTEGER NOT NULL DEFAULT 5,
+    context_length INTEGER NOT NULL DEFAULT 0,
+    capability_level TEXT NOT NULL DEFAULT '',
     assigned_agent TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -555,6 +563,14 @@ class Database:
             conn.execute("ALTER TABLE tasks ADD COLUMN suggested_agent TEXT NOT NULL DEFAULT ''")
         if "priority" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 5")
+        if "role" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN role TEXT NOT NULL DEFAULT ''")
+        if "model" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+        if "context_length" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN context_length INTEGER NOT NULL DEFAULT 0")
+        if "capability_level" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN capability_level TEXT NOT NULL DEFAULT ''")
         agent_columns = columns("agents")
         if "extra" not in agent_columns:
             conn.execute("ALTER TABLE agents ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
@@ -567,6 +583,14 @@ class Database:
             conn.execute("ALTER TABLE runs ADD COLUMN acceptance_at TEXT NOT NULL DEFAULT ''")
         if "release_at" not in run_columns:
             conn.execute("ALTER TABLE runs ADD COLUMN release_at TEXT NOT NULL DEFAULT ''")
+        if "round_number" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN round_number INTEGER NOT NULL DEFAULT 1")
+        if "max_rounds" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN max_rounds INTEGER NOT NULL DEFAULT 0")
+        if "goal_status" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN goal_status TEXT NOT NULL DEFAULT 'active'")
+        if "blocked_reason" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''")
 
     # -- primitives -------------------------------------------------------
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> sqlite3.Cursor:

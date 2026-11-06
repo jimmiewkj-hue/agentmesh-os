@@ -39,6 +39,7 @@ BUS_KINDS: dict[str, str] = {
     "message": "历史会话摘要",
     "agent_status": "Agent 在线/健康状态",
     "project_index": "项目索引",
+    "manual_action": "节点需要人工提交/审批（链路阻塞）",
 }
 
 DEFAULT_TOPIC: dict[str, str] = {
@@ -56,6 +57,7 @@ DEFAULT_TOPIC: dict[str, str] = {
     "message": "sync.message",
     "agent_status": "agent.status",
     "project_index": "project.index",
+    "manual_action": "workflow.manual_action",
 }
 
 SYNC_LEVEL_BY_KIND: dict[str, int] = {
@@ -65,6 +67,7 @@ SYNC_LEVEL_BY_KIND: dict[str, int] = {
     "knowledge": 4,
     "decision": 4,
     "workflow": 5,
+    "manual_action": 5,
 }
 
 

@@ -50,10 +50,21 @@ class ExecutionRequest:
     prompt_path: str
     result_path: str
     model: str = ""
+    context_length: int = 0
+    capability_level: str = ""
     timeout_seconds: int = 1800
     purpose: str = "task"
+    # When true, GUI adapters switch the target app to its own full-access
+    # mode and auto-accept residual permission dialogs via the renderer DOM.
+    full_control: bool = True
     env: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Runner-supplied callback.  GUI adapters call it when a node needs a
+    # human (manual submit / app restart) so the WebUI can block the chain and
+    # show instructions before the task returns.
+    notify: Any = None
+    # Set by Runner.cancel(): adapters/readers must stop waiting promptly.
+    cancel_event: Any = None
 
 
 @dataclass

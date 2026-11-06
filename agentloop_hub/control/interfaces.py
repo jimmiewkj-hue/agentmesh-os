@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..models import normalize_capability_level
 from ..util import ensure_dir, now_iso, read_json
 
 
@@ -131,6 +132,24 @@ def workbuddy_db_path(config: dict[str, Any] | None = None) -> Path:
     return Path(configured) if configured else _home() / ".workbuddy" / "workbuddy.db"
 
 
+def workbuddy_user_id(config: dict[str, Any] | None = None) -> str:
+    """The signed-in WorkBuddy uid used as a suffix in localStorage keys."""
+    db = workbuddy_db_path(config)
+    if not db.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "select user_id from sessions where user_id is not null "
+                "and user_id != '' order by created_at desc limit 1").fetchone()
+            return str(row[0]) if row and row[0] else ""
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+
+
 def qoder_db_path(config: dict[str, Any] | None = None) -> Path:
     configured = str((config or {}).get("qoder_db") or "").strip()
     if configured:
@@ -205,10 +224,35 @@ def list_workbuddy_models(config: dict[str, Any] | None = None) -> list[dict[str
                         rate = float(credits[1:])
                     except ValueError:
                         rate = None
+                context = item.get("contextWindow")
+                context_default = 0
+                context_options: list[int] = []
+                if isinstance(context, dict):
+                    context_default = int(context.get("defaultLength") or 0)
+                    context_options = sorted({
+                        int(value) for value in (context.get("supportedLengths") or [])
+                        if isinstance(value, (int, float)) and int(value) > 0
+                    })
+                    if not context_default and context_options:
+                        context_default = context_options[0]
+                elif isinstance(context, (int, float)):
+                    context_default = int(context)
+                    context_options = [context_default]
+                max_allowed = int(item.get("maxAllowedSize") or 0)
+                reasoning = item.get("reasoning") if isinstance(
+                    item.get("reasoning"), dict) else {}
+                efforts = [str(value) for value in (reasoning.get("supportedEfforts") or [])
+                           if str(value or "").strip()]
                 found.setdefault(model_id, {
                     "id": model_id, "name": str(item.get("name") or model_id),
                     "rate": rate,
                     "source": "product_manifest", "evidence": str(path),
+                    "context_default": context_default,
+                    "context_options": context_options,
+                    "context_max": max(context_options or [context_default, max_allowed]),
+                    "capability_options": efforts,
+                    "capability_default": str(reasoning.get("defaultEffort") or ""),
+                    "can_disable_thinking": bool(reasoning.get("canDisableThinking")),
                 })
     if found:
         return sorted(found.values(), key=lambda r: r["id"])
@@ -218,7 +262,7 @@ def list_workbuddy_models(config: dict[str, Any] | None = None) -> list[dict[str
 
 
 def list_qoder_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Read Qoder model keys from ``chat_model_preferences`` + session history."""
+    """Read Qoder model keys and their real context/effort preferences."""
     db = qoder_db_path(config)
     if not db.exists():
         return []
@@ -226,31 +270,59 @@ def list_qoder_models(config: dict[str, Any] | None = None) -> list[dict[str, An
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     except sqlite3.Error:
         return []
-    keys: set[str] = set()
+    prefs: dict[str, dict[str, Any]] = {}
     try:
-        for row in conn.execute("select model_key from chat_model_preferences"):
+        for row in conn.execute(
+                "select model_key, context_window, reasoning_effort "
+                "from chat_model_preferences"):
             if row and row[0]:
-                keys.add(str(row[0]))
-        for row in conn.execute("select distinct model from chat_sessions where model is not null"):
+                prefs[str(row[0])] = {
+                    "context_window": int(row[1]) if row[1] else 0,
+                    "reasoning_effort": str(row[2] or ""),
+                }
+        for row in conn.execute(
+                "select distinct model from chat_sessions where model is not null"):
             if row and row[0]:
-                keys.add(str(row[0]))
+                prefs.setdefault(str(row[0]), {"context_window": 0,
+                                               "reasoning_effort": ""})
     except sqlite3.Error:
         pass
     finally:
         conn.close()
+    observed_max = max((int(item.get("context_window") or 0)
+                        for item in prefs.values()), default=0)
     out = []
-    for key in sorted(keys):
+    for key in sorted(prefs):
+        profile = prefs[key]
+        context = int(profile.get("context_window") or 0)
         out.append({
             "id": key, "name": QODER_MODEL_LABELS.get(key, key),
             "source": "chat_model_preferences", "evidence": str(db),
+            "context_default": context,
+            # Qoder persists the selected value but does not publish a
+            # supportedLengths list in its local store, so no hard upper
+            # bound is invented here.  The largest value observed across the
+            # installed model preferences is reported as evidence only.
+            "context_options": [],
+            "context_max": 0,
+            "context_observed_max": observed_max,
+            "capability_options": list(QODER_EFFORT_OPTIONS),
+            "capability_default": str(profile.get("reasoning_effort") or ""),
+            "current_context_length": context,
+            "current_capability_level": str(profile.get("reasoning_effort") or ""),
         })
     return out
-
 
 # ---------------------------------------------------------------------------
 # WorkBuddy: task deeplink
 # ---------------------------------------------------------------------------
 WORKBUDDY_MODE_TO_SOURCE = {"code": "craft", "work": "working", "design": "design"}
+
+QODER_EFFORT_OPTIONS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+QODER_EFFORT_LABELS = {
+    "none": "关闭思考", "minimal": "最小", "low": "低", "medium": "中",
+    "high": "高", "xhigh": "极高", "max": "最大",
+}
 
 
 def build_workbuddy_deeplink(*, workspace: str, model_key: str, prompt: str,
@@ -304,16 +376,26 @@ def _norm_path(value: str | Path) -> str:
 
 
 def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
-                         timeout_seconds: float = 40.0) -> InterfaceOutcome:
+                         timeout_seconds: float = 40.0,
+                         force_restart: bool = False,
+                         allow_restart: bool = False) -> InterfaceOutcome:
     """Make sure WorkBuddy's renderer exposes DevTools.
 
     WorkBuddy's task deeplink only calls ``prepareInput``; it does not send.
     The zero-input path submits by clicking the composer's own send button via
     CDP, which requires the Electron process to be launched with
-    ``--remote-debugging-port``.  If the port is already live the running
-    instance is reused; otherwise all WorkBuddy processes are stopped (process
-    control, not input synthesis) and one instance is relaunched with the flag.
+    ``--remote-debugging-port``.
+
+    Restart policy (root cause of the 2026-11-04 "WorkBuddy 闪退"):
+    * CDP already live -> reuse, never kill the app;
+    * app not running -> launch it with the flag (no process was lost);
+    * app running without CDP -> only restart when the caller explicitly asks
+      (``allow_restart``/``force_restart``); otherwise return
+      ``APP_RESTART_REQUIRED`` so the WebUI can ask the user and block the
+      chain instead of silently killing a working app.
     """
+    from .apps import graceful_close, launch_detached, process_running
+
     def _probe() -> bool:
         try:
             with _local_urlopen(f"http://127.0.0.1:{int(port)}/json/list", timeout=3) as response:
@@ -322,7 +404,7 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
         except Exception:
             return False
 
-    if _probe():
+    if _probe() and not force_restart:
         return InterfaceOutcome(True, "cdp", {"port": int(port), "reused": True},
                                 {"source": f"http://127.0.0.1:{port}/json/list"},
                                 evidence={"port": int(port), "reused": True})
@@ -330,13 +412,23 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
         return InterfaceOutcome(False, "cdp", {"port": int(port)}, {},
                                 reason=f"WorkBuddy 可执行文件不存在: {executable}",
                                 error_code="GUI_DRIVER_ERROR")
-    subprocess.run(["taskkill", "/IM", "WorkBuddy.exe", "/F"],
-                   capture_output=True, text=True, timeout=15)
-    time.sleep(1.5)
-    subprocess.Popen(
+    running = process_running("WorkBuddy.exe")
+    if running and not (allow_restart or force_restart):
+        return InterfaceOutcome(
+            False, "cdp", {"port": int(port), "running": True}, {},
+            reason="WorkBuddy 正在运行但未开启程序接口；需要用户确认重启",
+            error_code="APP_RESTART_REQUIRED",
+            evidence={"port": int(port), "process_running": True,
+                      "required": "explicit restart"},
+        )
+    close_info: dict[str, Any] = {"method": "not_running"}
+    if running:
+        close_info = graceful_close("WorkBuddy.exe")
+        time.sleep(1.0)
+    pid = launch_detached(
         [executable, f"--remote-debugging-port={int(port)}",
          "--remote-allow-origins=*"],
-        close_fds=True, creationflags=0x00000008, env=electron_env(),
+        env=electron_env(),
     )
     deadline = time.time() + float(timeout_seconds)
     while time.time() < deadline:
@@ -345,12 +437,15 @@ def ensure_workbuddy_cdp(*, executable: str, port: int = 9223,
                 True, "cdp", {"port": int(port), "reused": False},
                 {"source": f"http://127.0.0.1:{port}/json/list"},
                 evidence={"port": int(port), "reused": False,
-                          "executable": executable},
+                          "executable": executable, "pid": pid,
+                          "close": close_info},
             )
         time.sleep(1.0)
     return InterfaceOutcome(False, "cdp", {"port": int(port)}, {},
                             reason=f"WorkBuddy CDP 端口 {port} 在 {timeout_seconds}s 内未就绪",
-                            error_code="GUI_SEND_FAILED")
+                            error_code="GUI_SEND_FAILED",
+                            evidence={"port": int(port), "pid": pid,
+                                      "close": close_info})
 
 
 def prepare_workbuddy_task(*, workspace: str, model: str, prompt: str,
@@ -398,6 +493,120 @@ def prepare_workbuddy_task(*, workspace: str, model: str, prompt: str,
         {},
         evidence={"uri": uri, "started_at": started,
                   "source": "workbuddy task deeplink (action=start)"},
+    )
+
+
+def _workbuddy_model_row(model: str,
+                         config: dict[str, Any] | None = None) -> dict[str, Any]:
+    key = str(model or "").strip().lower()
+    if not key:
+        return {}
+    for row in list_workbuddy_models(config):
+        for field in ("id", "name", "display_name"):
+            if str(row.get(field) or "").strip().lower() == key:
+                return row
+    return {}
+
+
+def sync_workbuddy_session_profile(*, workspace: str, started_at: float,
+                                    model: str = "",
+                                    context_length: int = 0,
+                                    capability_level: str = "",
+                                    config: dict[str, Any] | None = None,
+                                    timeout_seconds: float = 5.0) -> InterfaceOutcome:
+    """Write the real context_window/thought_level into WorkBuddy's session store.
+
+    WorkBuddy's own session row carries ``context_window`` (300k/600k/1M) and
+    ``thought_level`` (low/high/max).  The deeplink creates the session; we
+    update that row before the prompt is submitted so the app's runtime reads
+    the user's selected values.
+    """
+    db = workbuddy_db_path(config)
+    session = None
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    while time.time() < deadline:
+        session = _newest_workbuddy_session(db, started_at=started_at,
+                                            workspace=workspace)
+        if session:
+            break
+        time.sleep(0.5)
+    if not session:
+        # WorkBuddy persists the session row when the first prompt is sent,
+        # not when the deeplink is accepted.  The adapter writes again right
+        # after submission instead of blocking the task here.
+        return InterfaceOutcome(
+            True, "db_write", {"workspace": workspace},
+            {"deferred": True},
+            evidence={"deferred": True, "workspace": workspace,
+                      "reason": "WorkBuddy 会话尚未落库，提交后补写"},
+        )
+    context = int(context_length or 0)
+    row = _workbuddy_model_row(model, config)
+    labels = {"low": "低", "high": "高", "max": "极高"}
+    level = normalize_capability_level(capability_level, labels)
+    if not context and not level:
+        return InterfaceOutcome(True, "db_write", {}, {"session_id": session["session_id"]},
+                                evidence={"source": str(db), "skipped": "no profile"})
+    options = [int(value) for value in (row.get("context_options") or [])
+               if isinstance(value, (int, float)) and int(value) > 0]
+    efforts = [str(value) for value in (row.get("capability_options") or [])
+               if str(value or "").strip()]
+    if context and options and context not in options:
+        return InterfaceOutcome(
+            False, "db_write", {"context_length": context}, {"options": options},
+            reason=f"WorkBuddy {model or '默认模型'} 支持的上下文长度只有 {options}",
+            error_code="INTERFACE_WRITE_FAILED")
+    if level and efforts and level not in efforts:
+        return InterfaceOutcome(
+            False, "db_write", {"thought_level": level}, {"options": efforts},
+            reason=f"WorkBuddy {model or '默认模型'} 支持的思考等级只有 {efforts}",
+            error_code="INTERFACE_WRITE_FAILED")
+    import sqlite3
+    try:
+        backup = db.with_name(f"{db.name}.agentmesh-{time.strftime('%Y%m%d-%H%M%S')}.bak")
+        source = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            target = sqlite3.connect(str(backup))
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+        conn = sqlite3.connect(str(db), timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            fields = []
+            values: list[Any] = []
+            if context:
+                fields.append("context_window=?")
+                values.append(int(context))
+            if level:
+                fields.append("thought_level=?")
+                values.append(level)
+            fields.append("updated_at=?")
+            values.append(int(time.time() * 1000))
+            values.append(session["session_id"])
+            conn.execute(f"UPDATE sessions SET {', '.join(fields)} WHERE id=?", values)
+            conn.commit()
+        finally:
+            conn.close()
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "select context_window, thought_level from sessions where id=?",
+                (session["session_id"],)).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return InterfaceOutcome(False, "db_write", {}, {},
+                                reason=f"写入 WorkBuddy 会话配置失败: {exc}",
+                                error_code="INTERFACE_WRITE_FAILED")
+    return InterfaceOutcome(
+        True, "db_write", {"context_length": context, "capability_level": level},
+        {"context_length": int(row[0] or 0), "capability_level": str(row[1] or ""),
+         "session_id": session["session_id"]},
+        evidence={"source": str(db), "session_id": session["session_id"]},
     )
 
 
@@ -575,8 +784,81 @@ def _start_app(exe: str) -> None:
                      creationflags=0x00000008)
 
 
+def sync_qoder_model_profile(*, model_key: str, context_length: int = 0,
+                              capability_level: str = "",
+                              config: dict[str, Any] | None = None) -> InterfaceOutcome:
+    """Write Qoder's own model preference row (context_window/effort)."""
+    db = qoder_db_path(config)
+    key = str(model_key or "").strip()
+    level = normalize_capability_level(capability_level, QODER_EFFORT_LABELS)
+    if not key:
+        return InterfaceOutcome(False, "db_write", {}, {},
+                                reason="Qoder 模型 key 为空",
+                                error_code="MODEL_UNAVAILABLE")
+    if level and level not in QODER_EFFORT_OPTIONS:
+        return InterfaceOutcome(
+            False, "db_write", {"model_key": key, "capability_level": level},
+            {"options": QODER_EFFORT_OPTIONS},
+            reason=f"Qoder 不支持思考强度 {level}",
+            error_code="INTERFACE_WRITE_FAILED")
+    if not context_length and not level:
+        return InterfaceOutcome(True, "db_write", {}, {},
+                                evidence={"skipped": "no profile"})
+    try:
+        conn = sqlite3.connect(str(db), timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            row = conn.execute(
+                "select 1 from chat_model_preferences where model_key=?", (key,)
+            ).fetchone()
+            if row:
+                fields = []
+                values: list[Any] = []
+                if context_length:
+                    fields.append("context_window=?")
+                    values.append(int(context_length))
+                if level:
+                    fields.append("reasoning_effort=?")
+                    values.append(level)
+                fields.append("updated_at=?")
+                values.append(int(time.time() * 1000))
+                values.append(key)
+                conn.execute(
+                    f"UPDATE chat_model_preferences SET {', '.join(fields)} "
+                    "WHERE model_key=?", values)
+            else:
+                conn.execute(
+                    "INSERT INTO chat_model_preferences"
+                    "(model_key, visible, context_window, reasoning_effort, updated_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (key, 1, int(context_length) if context_length else None,
+                     level or None, int(time.time() * 1000)))
+            conn.commit()
+        finally:
+            conn.close()
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            current = conn.execute(
+                "select context_window, reasoning_effort from chat_model_preferences "
+                "where model_key=?", (key,)).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return InterfaceOutcome(False, "db_write", {"model_key": key}, {},
+                                reason=f"写入 Qoder 模型偏好失败: {exc}",
+                                error_code="INTERFACE_WRITE_FAILED")
+    return InterfaceOutcome(
+        True, "db_write", {"model_key": key, "context_length": int(context_length),
+                           "capability_level": level},
+        {"context_length": int(current[0] or 0) if current else 0,
+         "capability_level": str(current[1] or "") if current else ""},
+        evidence={"source": str(db), "model_key": key},
+    )
+
+
 def prepare_qoder_session(*, workspace: str, model: str,
                           config: dict[str, Any] | None = None,
+                          permission_mode: str = "",
                           stop_process: Any = None,
                           start_app: Any = None,
                           timeout_seconds: float = 30.0) -> InterfaceOutcome:
@@ -688,12 +970,23 @@ def prepare_qoder_session(*, workspace: str, model: str,
             ws["id"] = workspace_id
             ws["path"] = workspace
             target_json["workspace"] = ws
-        conn.execute(
-            "update chat_sessions set cwd=?, workspace_id=?, model=?, "
-            "execution_target_json=?, updated_at=? where session_id=?",
-            (workspace, workspace_id, key, json.dumps(target_json, ensure_ascii=False),
-             int(time.time() * 1000), current["session_id"]),
-        )
+        if permission_mode:
+            conn.execute(
+                "update chat_sessions set cwd=?, workspace_id=?, model=?, "
+                "permission_mode=?, execution_target_json=?, updated_at=? "
+                "where session_id=?",
+                (workspace, workspace_id, key, permission_mode,
+                 json.dumps(target_json, ensure_ascii=False),
+                 int(time.time() * 1000), current["session_id"]),
+            )
+            evidence["permission_mode"] = permission_mode
+        else:
+            conn.execute(
+                "update chat_sessions set cwd=?, workspace_id=?, model=?, "
+                "execution_target_json=?, updated_at=? where session_id=?",
+                (workspace, workspace_id, key, json.dumps(target_json, ensure_ascii=False),
+                 int(time.time() * 1000), current["session_id"]),
+            )
         conn.commit()
     finally:
         conn.close()

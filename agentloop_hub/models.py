@@ -17,6 +17,54 @@ from .errors import ValidationError
 from .util import new_id, now_iso, sha1_hex, stable_json
 
 
+# Union of the reasoning-effort IDs the local agents really expose:
+# WorkBuddy low/high/max, Trae light/high/extra_high, Qoder
+# none/minimal/low/medium/high/xhigh/max.  "medium" and "ultra" stay valid for
+# user-registered/CLI agents that do not publish their own option list.
+CAPABILITY_LEVELS: tuple[str, ...] = (
+    "none", "minimal", "light", "low", "medium", "high",
+    "xhigh", "extra_high", "max", "ultra",
+)
+CAPABILITY_LEVEL_ALIASES: dict[str, str] = {
+    "关闭思考": "none", "关闭": "none", "off": "none", "disabled": "none",
+    "最小": "minimal", "minimum": "minimal", "min": "minimal",
+    "轻": "light", "lightweight": "light",
+    "低": "low",
+    "中": "medium", "middle": "medium",
+    "高": "high",
+    "极高": "xhigh", "x-high": "xhigh", "x_high": "xhigh",
+    "extra-high": "extra_high", "extrahigh": "extra_high", "超高": "extra_high",
+    "最大": "max", "maximum": "max",
+    "ultra": "ultra",
+}
+CAPABILITY_RANK: dict[str, float] = {
+    "none": -0.20, "minimal": -0.18, "light": -0.15, "low": -0.15,
+    "medium": 0.0, "high": 0.08, "xhigh": 0.18, "extra_high": 0.18,
+    "max": 0.18, "ultra": 0.18,
+}
+
+
+def normalize_capability_level(value: Any, labels: dict[str, str] | None = None) -> str:
+    """Map app labels and common spellings onto the canonical option ID."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if labels:
+        for key, label in labels.items():
+            if text == str(label).strip() or text.lower() == str(label).lower():
+                return str(key)
+    mapped = CAPABILITY_LEVEL_ALIASES.get(text) or \
+        CAPABILITY_LEVEL_ALIASES.get(text.lower())
+    if mapped:
+        return mapped
+    token = re.sub(r"[\s-]+", "_", text.lower())
+    return CAPABILITY_LEVEL_ALIASES.get(token, token)
+
+
+def is_known_capability_level(value: Any) -> bool:
+    return normalize_capability_level(value) in CAPABILITY_LEVELS
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -284,6 +332,121 @@ def normalize_scope_path(path: str) -> str:
     return p
 
 
+_SCOPE_SPLIT_RE = re.compile(r"[\s、，,;；:：()（）\[\]【】「」“”\"'`]+")
+_SCOPE_EXT_RE = re.compile(
+    r"\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md|mdx|css|scss|html?|ya?ml|toml|txt|sh|ps1|"
+    r"go|rs|java|kt|kts|c|cc|cpp|h|hpp|vue|svelte|sql|lock)$",
+    re.IGNORECASE,
+)
+_CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
+
+
+def _scope_token_looks_like_path(token: str) -> bool:
+    if not token or _CHINESE_RE.search(token):
+        return False
+    if "/" in token or "\\" in token:
+        return True
+    if any(ch in token for ch in "*?["):
+        return True
+    return bool(_SCOPE_EXT_RE.search(token))
+
+
+def normalize_scope_entries(entries: Iterable[str]) -> list[str]:
+    """Turn planner prose into executable scope patterns.
+
+    Trae/other planners often emit scopes like
+    ``新增 qingming-3d/src/scene/assets/**（materials.js、...）``.  The verifier
+    compares globs, so keeping the sentence produced a false "修改超出范围"
+    on 2026-11-05.  Extract path/file tokens and keep prose only for read-only
+    informational scopes.
+    """
+    out: list[str] = []
+    for raw in entries:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        tokens: list[str] = []
+        for token in _SCOPE_SPLIT_RE.split(text):
+            token = token.strip("。.：:-—… \t")
+            if not _scope_token_looks_like_path(token):
+                continue
+            cleaned = normalize_scope_path(token)
+            if cleaned and cleaned not in tokens:
+                tokens.append(cleaned)
+        if not tokens:
+            out.append(text)
+            continue
+        # A prose entry with one explicit project directory often lists
+        # sibling files/dirs without repeating that prefix.  Re-attach it.
+        top = ""
+        for token in tokens:
+            if "/" in token and not re.match(r"^[A-Za-z]:", token):
+                first = token.split("/", 1)[0]
+                if first and not first.startswith("."):
+                    top = first
+                    break
+        normalized: list[str] = []
+        for token in tokens:
+            candidate = token
+            if (top and "/" in token and not token.startswith(top + "/")
+                    and not re.match(r"^[A-Za-z]:", token)):
+                candidate = f"{top}/{token}"
+            elif (top and "/" not in token and not _SCOPE_EXT_RE.search(token)):
+                # Bare directory/glob such as ``dist/**`` or ``scripts/**``.
+                candidate = f"{top}/{token}"
+            if candidate not in normalized:
+                normalized.append(candidate)
+        out.extend(normalized)
+    deduped: list[str] = []
+    for item in out:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def scope_has_executable_pattern(entries: Iterable[str]) -> bool:
+    return any(_scope_token_looks_like_path(p) for p in entries)
+
+
+_AGENTLOOP_WORKSPACE_RE = re.compile(
+    r"(?:[A-Za-z]:)?[\\/][^\"'\s]*?\.agentloop[\\/](?:planning|runs)[\\/]"
+    r"[^\\/\"'\s]+[\\/]workspace",
+    re.IGNORECASE,
+)
+
+
+def normalize_verification_commands(commands: Iterable[str]) -> list[str]:
+    """Make planner commands runnable inside the task's isolated worktree.
+
+    Trae often emits PowerShell commands plus absolute paths under
+    ``.agentloop/planning/<plan>/workspace`` or ``git -C <project root>``.
+    The verifier runs in a per-task worktree, so those paths either do not
+    exist or point at the wrong tree.  Rewrite them to worktree-relative
+    commands; `git -C <absolute>` is dropped because cwd is already the
+    worktree.
+    """
+    out: list[str] = []
+    for raw in commands:
+        command = str(raw or "").strip()
+        if not command:
+            continue
+        command = _AGENTLOOP_WORKSPACE_RE.sub(".", command)
+        # Remove the worktree-relative ``.\`` / ``./`` prefix entirely; a
+        # leading ``\qingming-3d`` is not a valid relative path.
+        command = re.sub(r"(?<=\s)\.[\\/]", "", command)
+        command = re.sub(r"\bgit\s+-C\s+(\"[^\"]+\"|'[^']+'|\S+)",
+                         lambda m: "git" if (
+                             re.match(r"^[A-Za-z]:", m.group(1).strip("\"'"))
+                             or ".agentloop" in m.group(1)
+                             or m.group(1).strip("\"'").startswith("/")
+                         ) else m.group(0),
+                         command)
+        command = re.sub(r"\s+", " ", command).strip()
+        if command and command not in out:
+            out.append(command)
+    return out
+
+
 def scope_matches(pattern: str, path: str) -> bool:
     """Match a PRD-style scope pattern against a repo-relative POSIX path.
 
@@ -295,10 +458,16 @@ def scope_matches(pattern: str, path: str) -> bool:
     rel = normalize_scope_path(path)
     if not pat:
         return False
-    if pat.endswith("/"):
+    was_directory = pat.endswith("/")
+    if was_directory:
         pat = pat.rstrip("/")
-    # plain path / directory prefix
+    # plain path / directory prefix.  A bare file name from prose scope
+    # (``package-lock.json``) matches that file in any directory.
     if not any(ch in pat for ch in "*?["):
+        if was_directory:
+            return rel == pat or rel.startswith(pat + "/")
+        if "/" not in pat:
+            return rel == pat or rel.endswith("/" + pat)
         return rel == pat or rel.startswith(pat + "/")
     if pat.endswith("/**"):
         prefix = pat[:-3].rstrip("/")
@@ -434,6 +603,12 @@ class TaskSpec:
     title: str
     objective: str
     type: str = TaskType.ANALYSIS.value
+    # Role binding (see control/roles.py). ``role`` selects the model ladder;
+    # ``model`` is the concrete model pinned for this task. Keeping the model on
+    # the task instead of on the agent is what lets one agent play two roles
+    # with two different models inside a single run.
+    role: str = ""
+    model: str = ""
     suggested_agent: str = ""
     parent_task_id: str = ""
     scope: list[str] = field(default_factory=list)
@@ -450,10 +625,19 @@ class TaskSpec:
     risk_level: str = RiskLevel.LOW.value
     approval_policy: str = "auto"
     priority: int = 5  # 0..10, higher first within the same dependency layer
+    # Per-task overrides of the Agent/model profile.  0 / "" means "inherit
+    # the agent's model profile".  Editable while the chain is queued/blocked.
+    context_length: int = 0
+    capability_level: str = ""
 
     @property
     def writable(self) -> bool:
         return self.type in (TaskType.IMPLEMENTATION.value, TaskType.DOCUMENTATION.value)
+
+    @property
+    def pinned(self) -> bool:
+        """True when this task carries an explicit model decision."""
+        return bool(self.model)
 
     @property
     def read_only(self) -> bool:
@@ -468,6 +652,10 @@ class TaskSpec:
             raise ValidationError(f"{self.task_id}: objective 不能为空")
         if self.type not in {t.value for t in TaskType}:
             raise ValidationError(f"{self.task_id}: 未知任务类型 {self.type}")
+        if self.role and not re.match(r"^[a-z][a-z0-9_]{1,31}$", str(self.role)):
+            raise ValidationError(f"{self.task_id}: 角色名非法 {self.role}")
+        if not isinstance(self.model, str):
+            raise ValidationError(f"{self.task_id}: model 必须是字符串")
         if self.risk_level not in {r.value for r in RiskLevel}:
             raise ValidationError(f"{self.task_id}: 未知风险等级 {self.risk_level}")
         if self.approval_policy not in ("auto", "required", "plan_only"):
@@ -484,14 +672,29 @@ class TaskSpec:
             raise ValidationError(f"{self.task_id}: time_limit_minutes 必须大于 0")
         if self.retry_limit < 0:
             raise ValidationError(f"{self.task_id}: retry_limit 不能为负")
-        self.scope = _string_list(self.scope, f"{self.task_id}.scope")
-        self.out_of_scope = _string_list(self.out_of_scope, f"{self.task_id}.out_of_scope")
+        if int(self.context_length or 0) < 0:
+            raise ValidationError(f"{self.task_id}: context_length 不能为负")
+        if self.capability_level and not is_known_capability_level(
+                self.capability_level):
+            raise ValidationError(
+                f"{self.task_id}: 未知能力等级 {self.capability_level}；"
+                f"可用值来自各 Agent 自身的真实选项")
+        self.scope = normalize_scope_entries(
+            _string_list(self.scope, f"{self.task_id}.scope"))
+        self.out_of_scope = normalize_scope_entries(
+            _string_list(self.out_of_scope, f"{self.task_id}.out_of_scope"))
         self.dependencies = _string_list(self.dependencies, f"{self.task_id}.dependencies")
         self.expected_outputs = _string_list(self.expected_outputs, f"{self.task_id}.expected_outputs")
         self.acceptance_criteria = _string_list(self.acceptance_criteria, f"{self.task_id}.acceptance_criteria")
-        self.verification_commands = _string_list(self.verification_commands, f"{self.task_id}.verification_commands")
+        self.verification_commands = normalize_verification_commands(
+            _string_list(self.verification_commands, f"{self.task_id}.verification_commands"))
         if self.writable and not self.scope:
             raise ValidationError(f"{self.task_id}: 可写任务必须声明 scope（允许修改的文件范围）")
+        if self.writable and not scope_has_executable_pattern(self.scope):
+            raise ValidationError(
+                f"{self.task_id}: scope 无法解析为路径/glob，拒绝执行以避免误判",
+                details={"scope": self.scope},
+            )
         if self.writable and self.task_id in self.dependencies:
             raise ValidationError(f"{self.task_id}: 不能依赖自身")
         if self.type == TaskType.ANALYSIS.value and has_test_command(self.verification_commands):
@@ -504,7 +707,8 @@ class TaskSpec:
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id, "title": self.title, "objective": self.objective,
-            "type": self.type, "suggested_agent": self.suggested_agent,
+            "type": self.type, "role": self.role, "model": self.model,
+            "suggested_agent": self.suggested_agent,
             "parent_task_id": self.parent_task_id, "scope": self.scope,
             "out_of_scope": self.out_of_scope, "dependencies": self.dependencies,
             "required_capabilities": self.required_capabilities,
@@ -514,6 +718,8 @@ class TaskSpec:
             "token_budget": int(self.token_budget), "time_limit_minutes": int(self.time_limit_minutes),
             "retry_limit": int(self.retry_limit), "risk_level": self.risk_level,
             "approval_policy": self.approval_policy, "priority": int(self.priority),
+            "context_length": int(self.context_length or 0),
+            "capability_level": self.capability_level or "",
         }
 
     @classmethod
@@ -684,7 +890,8 @@ class Task:
             "run_id": self.run_id, "task_id": self.spec.task_id,
             "parent_task_id": self.spec.parent_task_id,
             "title": self.spec.title, "objective": self.spec.objective,
-            "type": self.spec.type, "assigned_agent": self.assigned_agent,
+            "type": self.spec.type, "role": self.spec.role, "model": self.spec.model,
+            "assigned_agent": self.assigned_agent,
             "status": self.status, "attempts": self.attempts,
             "workdir": self.workdir, "task_dir": self.task_dir,
             "base_commit": self.base_commit, "patch_path": self.patch_path,

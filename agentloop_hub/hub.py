@@ -18,11 +18,12 @@ from .connectors import (
     derive_capability_list, is_auto_executable,
 )
 from .errors import ApprovalRequiredError, ConfigError, NotFoundError, ValidationError
-from .models import AgentRecord, Project, Task, TaskSpec, TaskType
+from .models import (AgentRecord, CAPABILITY_RANK, Project, Task, TaskSpec,
+                     TaskStatus, TaskType, normalize_capability_level)
 from .sessions.service import SessionImportService
 from .storage.db import Database
 from .storage.repo import Store
-from .util import atomic_write_text, ensure_dir, read_json, sha1_hex, write_json
+from .util import atomic_write_text, ensure_dir, read_json, read_text, sha1_hex, write_json
 from .workspace import detect_repo, is_git_repo
 from .workspace.identity import build_project, canonical_path
 from .control.approvals import ApprovalService
@@ -37,10 +38,12 @@ from .control.handoff import HandoffService
 from .control.memory import MemoryService
 from .control.merge import MergeService
 from .control.model_catalog import ModelCatalogService
+from .control.model_profile import resolve_profile
 from .control.paths import WorkspacePaths
 from .control.planning import PlanningService
 from .control.recovery import RecoveryService
 from .control.router import CapabilityRouter
+from .control.roles import RolePolicy
 from .control.runner import RunService
 from .control.sync import SyncService
 from .control.verification import Verifier
@@ -71,6 +74,13 @@ class Hub:
         self.context = ContextBuilder(self.store, self.project, self.config)
         self.router = CapabilityRouter(self.store, self.project, self.config)
         self.cost = CostOptimizer(self.store, self.project, self.config)
+        # Role policy is loaded before the runner so an executing task can be
+        # escalated along its role ladder without touching global state.
+        try:
+            self.roles = RolePolicy.load(self.root)
+        except Exception as exc:  # a broken policy file must not brick the hub
+            self.roles = RolePolicy.default()
+            self.roles_error = str(exc)[:300]
         self.governance = GovernanceService(
             self.store, self.project, self.approvals, self.audit,
         )
@@ -85,6 +95,7 @@ class Hub:
             self.store, self.project, self.paths, self.config, self.approvals,
             self.audit, self.budget, self.memory, self.context, self.checkpoints, self.verifier,
             bus=self.bus, router=self.router, cost=self.cost, governance=self.governance,
+            roles=self.roles, planner=self.planning,
         )
         self.merge_service = MergeService(
             self.store, self.project, self.paths, self.config, self.approvals,
@@ -196,6 +207,50 @@ class Hub:
             self.project = self.store.get_project(self.project.project_id) or self.project
             self.budget.project = self.project
         return info
+
+    def settings(self) -> dict[str, Any]:
+        return {
+            "full_control": bool(self.config.full_control),
+            "multi_round": bool(self.config.multi_round),
+            "max_rounds": int(self.config.max_rounds),
+            "blocked_after_rounds": int(self.config.blocked_after_rounds),
+            "round_replan": bool(self.config.round_replan),
+        }
+
+    def set_full_control(self, enabled: bool) -> dict[str, Any]:
+        value = bool(enabled)
+        self.config.full_control = value
+        path = Path(self.project.root) / ".agentloop" / "config.json"
+        data = read_json(path, {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data["full_control"] = value
+        write_json(path, data, indent=2)
+        self.audit.log("user", "settings.full_control", payload={"enabled": value,
+                                                                 "path": str(path)})
+        return {"full_control": value, "path": str(path)}
+
+    def set_multi_round(self, enabled: bool, *, max_rounds: int | None = None) -> dict[str, Any]:
+        value = bool(enabled)
+        try:
+            rounds = int(self.config.max_rounds if max_rounds is None else max_rounds)
+        except (TypeError, ValueError):
+            raise ValidationError("最大轮次必须是整数")
+        if not 1 <= rounds <= 20:
+            raise ValidationError("最大轮次必须在 1..20")
+        self.config.multi_round = value
+        self.config.max_rounds = rounds
+        path = Path(self.project.root) / ".agentloop" / "config.json"
+        data = read_json(path, {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data["multi_round"] = value
+        data["max_rounds"] = rounds
+        write_json(path, data, indent=2)
+        self.audit.log("user", "settings.multi_round",
+                       payload={"enabled": value, "max_rounds": rounds,
+                                "path": str(path)})
+        return {"multi_round": value, "max_rounds": rounds, "path": str(path)}
 
     def set_project_budget(self, tokens: int) -> dict[str, Any]:
         if tokens < 0:
@@ -342,12 +397,19 @@ class Hub:
         }
 
     def set_main(self, agent_id: str, model: str = "", *, budget_tokens: int = 0,
-                 permissions: dict[str, Any] | None = None, note: str = "") -> dict[str, Any]:
+                 permissions: dict[str, Any] | None = None, note: str = "",
+                 context_length: int | None = None,
+                 capability_level: str | None = None) -> dict[str, Any]:
         self.get_agent(agent_id)
+        if model and (context_length is not None or capability_level is not None):
+            self.set_agent_model(agent_id, model, context_length=context_length,
+                                 capability_level=capability_level)
         self.store.set_main_node(self.project.project_id, agent_id, model,
                                  budget_tokens=budget_tokens, permissions=permissions, note=note)
         self.audit.log("user", "main_node.set", subject=agent_id,
-                       payload={"model": model, "budget_tokens": budget_tokens})
+                       payload={"model": model, "budget_tokens": budget_tokens,
+                                "context_length": context_length,
+                                "capability_level": capability_level})
         return self.get_main()
 
     def auto_main(self, *, agent_id: str = "", model: str = "") -> dict[str, Any]:
@@ -401,8 +463,16 @@ class Hub:
         if not row:
             return None
         agent = self.store.get_agent(row["agent_id"])
+        profile: dict[str, Any] = {}
+        if agent:
+            profiles = (agent.extra or {}).get("model_profiles") or {}
+            candidate = profiles.get(row.get("model") or "")
+            if isinstance(candidate, dict):
+                profile = candidate
         return {
             **row,
+            "context_length": int(profile.get("context_length") or 0),
+            "capability_level": str(profile.get("capability_level") or ""),
             "agent": agent.to_dict() if agent else None,
         }
 
@@ -422,10 +492,16 @@ class Hub:
                        payload={"agents": [a["agent_id"] for a in result["agents"]]})
         return result
 
-    def set_agent_model(self, agent_id: str, model: str) -> dict[str, Any]:
-        result = self.model_catalog.select(agent_id, model)
+    def set_agent_model(self, agent_id: str, model: str, *,
+                        context_length: int | None = None,
+                        capability_level: str | None = None) -> dict[str, Any]:
+        result = self.model_catalog.select(
+            agent_id, model, context_length=context_length,
+            capability_level=capability_level)
         self.audit.log("user", "agent.model_selected", subject=agent_id,
-                       payload={"model": result.get("selected_model", "")})
+                       payload={"model": result.get("selected_model", ""),
+                                "context_length": result.get("context_length", 0),
+                                "capability_level": result.get("capability_level", "")})
         return result
 
     def set_agent_model_programmatically(self, agent_id: str, model: str) -> dict[str, Any]:
@@ -581,12 +657,15 @@ class Hub:
     def submit_summary(self, run_id: str, payload: dict[str, Any] | str | Path) -> dict[str, Any]:
         return self.runner.submit_summary(run_id, payload)
 
+    def cancel_run(self, run_id: str, reason: str = "用户停止运行") -> dict[str, Any]:
+        return self.runner.cancel(run_id, reason=reason)
+
     def pause_run(self, run_id: str, reason: str = "用户暂停") -> dict[str, Any]:
         run = self.store.get_run(run_id)
         if not run:
             raise NotFoundError(f"运行不存在: {run_id}")
-        if run["status"] != "running":
-            raise ValidationError(f"运行当前状态 {run['status']}，只有 running 可以暂停")
+        if run["status"] not in ("running", "waiting_user"):
+            raise ValidationError(f"运行当前状态 {run['status']}，只有 running/waiting_user 可以暂停")
         self.store.update_run(run_id, status="paused", error=reason)
         self.audit.log("user", "run.pause_requested", subject=run_id,
                        payload={"reason": reason})
@@ -597,6 +676,59 @@ class Hub:
 
     def retry_task(self, uid: str) -> dict[str, Any]:
         return self.runner.retry_task(uid)
+
+    def reverify_task(self, uid: str) -> dict[str, Any]:
+        return self.runner.reverify_task(uid)
+
+    def update_task_binding(self, uid: str, *, agent_id: str = "", model: str = "",
+                            context_length: int | None = None,
+                            capability_level: str | None = None) -> dict[str, Any]:
+        """Edit a chain node's agent/model/profile while the run is active."""
+        task = self.store.get_task(uid)
+        if not task:
+            raise NotFoundError(f"任务不存在: {uid}")
+        if task.status in ("completed", "canceled", "rejected"):
+            raise ValidationError(f"任务已结束（{task.status}），不能再修改绑定")
+        if self.runner._is_active(uid):
+            raise ValidationError("该节点正在执行；请在节点结束/重试前修改")
+        agent = self.get_agent(agent_id or task.assigned_agent or task.spec.suggested_agent)
+        name = str(model or task.spec.model or "").strip()
+        if not name:
+            name = str((agent.extra or {}).get("selected_model") or
+                       (agent.models[0] if agent.models else ""))
+        known = [row["model"] for row in self.store.list_agent_models(
+            self.project.project_id, agent_id=agent.agent_id)] or list(agent.models)
+        if name and known and name not in known:
+            raise ValidationError(
+                f"{agent.agent_id} 的真实模型清单中没有 {name}",
+                details={"available": sorted(known)[:40]},
+            )
+        effective_context = task.spec.context_length \
+            if context_length is None else max(0, int(context_length))
+        effective_level = task.spec.capability_level \
+            if capability_level is None else str(capability_level or "").strip()
+        validated = resolve_profile(
+            agent, name, self.config.to_dict(),
+            context_length=effective_context,
+            capability_level=effective_level,
+        )
+        fields: dict[str, Any] = {
+            "assigned_agent": agent.agent_id,
+            "suggested_agent": agent.agent_id,
+            "model": name,
+            "context_length": int(validated["context_length"]),
+            "capability_level": str(validated["capability_level"]),
+        }
+        self.store.update_task(uid, **fields)
+        self.audit.log("user", "task.binding_updated", subject=uid, payload={
+            "agent_id": agent.agent_id, "model": name,
+            "context_length": fields["context_length"],
+            "capability_level": fields["capability_level"],
+            "requested": {"context_length": context_length,
+                          "capability_level": capability_level},
+        })
+        refreshed = self.store.get_task(uid)
+        return refreshed.to_dict() if refreshed else task.to_dict()
 
     def merge(self, run_id: str, *, approval_id: str = "", commit: bool = False) -> dict[str, Any]:
         return self.merge_service.merge(run_id, approval_id=approval_id, commit=commit)
@@ -630,6 +762,16 @@ class Hub:
                 details={"plan_id": existing.plan_id, "approval_id": approval_id},
             )
         approval = self.approvals.decide(approval_id, approved=approve, note=note)
+        if approval.kind == "high_risk" and approve and approval.task_uid:
+            task = self.store.get_task(approval.task_uid)
+            if task and task.status == TaskStatus.WAITING_USER.value:
+                self.store.set_task_status(task.uid, TaskStatus.QUEUED.value,
+                                           error="", force=True)
+                self.store.append_audit(
+                    self.project.project_id, "user", "approval.requeued_task",
+                    subject=task.uid,
+                    payload={"approval_id": approval_id, "task_id": task.task_id},
+                )
         if approval.kind == "plan" and approval.plan_id:
             if approve:
                 result = self.planning.approve_plan(approval.plan_id, approval_id=approval_id, note=note)
@@ -825,89 +967,446 @@ class Hub:
         return self.planning.request_plan(goal, main_agent_id=main_agent_id, model=model)
 
     # ------------------------------------------------------------------
+    # Role routing: role policy + deterministic segmentation + solve loop
+    # ------------------------------------------------------------------
+    def role_catalog(self) -> dict[str, list[str]]:
+        """agent_id -> real model names (the only universe a policy may pick from)."""
+        return {a.agent_id: list(a.models) for a in self.list_agents()}
+
+    def role_policy(self) -> dict[str, Any]:
+        report = self.roles.explain(agents=self.list_agents(), catalog=self.role_catalog())
+        report["error"] = getattr(self, "roles_error", "")
+        return report
+
+    def resolve_role(self, role: str, *, limit: int = 6,
+                     executor_agent: str = "", executor_model: str = "",
+                     commander_agent: str = "", commander_model: str = "") -> dict[str, Any]:
+        policy = self._session_policy(executor_agent, executor_model,
+                                      commander_agent, commander_model)
+        candidates = policy.candidates(role, agents=self.list_agents(),
+                                       catalog=self.role_catalog(), limit=limit)
+        return {
+            "role": role,
+            "policy": policy.name,
+            "candidates": [c.to_dict() for c in candidates],
+            "resolved": bool(candidates),
+        }
+
+    def _session_policy(self, executor_agent: str = "", executor_model: str = "",
+                        commander_agent: str = "", commander_model: str = "") -> RolePolicy:
+        catalog = self.role_catalog()
+        if executor_agent and executor_model:
+            self._require_real_model(executor_agent, executor_model, "执行模型")
+        if commander_agent and commander_model:
+            self._require_real_model(commander_agent, commander_model, "统帅模型")
+        return self.roles.with_overrides(
+            executor=(executor_agent, executor_model),
+            commander=(commander_agent, commander_model),
+            catalog=catalog,
+        )
+
+    def _require_real_model(self, agent_id: str, model: str, label: str) -> None:
+        agent = self.store.get_agent(agent_id)
+        if not agent:
+            raise ValidationError(f"{label}指定的 Agent 不存在: {agent_id}")
+        catalog = self.role_catalog().get(agent_id) or []
+        known = [m.lower() for m in catalog]
+        if model.lower() not in known:
+            raise ValidationError(
+                f"{agent_id} 的真实模型清单中没有 {model}（{label}）",
+                details={"available": sorted(catalog)[:40]},
+            )
+
+    def import_role_policy(self, path: str | Path, *, save: bool = False) -> dict[str, Any]:
+        """Import OpenCode ``agent`` blocks or a DSH-style ``AGENTS.md``."""
+        from .control.roles import policy_from_agents_md, policy_from_opencode
+
+        target = Path(path).expanduser()
+        if not target.exists():
+            raise NotFoundError(f"配置文件不存在: {target}")
+        catalog = self.role_catalog()
+        if target.suffix.lower() in (".md", ".markdown", ".txt"):
+            parsed = policy_from_agents_md(target, catalog=catalog)
+            kind = "agents_md"
+        else:
+            parsed = policy_from_opencode(target, catalog=catalog)
+            kind = "opencode"
+        overlay = {"roles": parsed.get("roles") or {}}
+        merged = self.roles.merged(overlay, source=f"{self.roles.source}+{target.name}")
+        result = {
+            "kind": kind, "source": str(target),
+            "roles_found": parsed.get("roles_found") or [],
+            "matched": parsed.get("matched") or [],
+            "unmatched": parsed.get("unmatched") or [],
+            "policy": merged.name,
+            "saved": "",
+        }
+        if save:
+            out_path = self.root / ".agentloop" / "roles.json"
+            merged.save(out_path)
+            self.roles = merged
+            self.runner.roles = merged
+            result["saved"] = str(out_path)
+        self.audit.log("user", "roles.imported", payload={
+            "source": str(target), "kind": kind, "saved": result["saved"],
+            "matched": len(result["matched"]), "unmatched": len(result["unmatched"]),
+        })
+        return result
+
+    def save_role_policy(self, path: str = "") -> dict[str, Any]:
+        out_path = Path(path).expanduser() if path else self.root / ".agentloop" / "roles.json"
+        saved = self.roles.save(out_path)
+        self.audit.log("user", "roles.saved", subject=str(out_path), payload=saved)
+        return saved
+
+    def segment_goal(self, goal: str, *, max_tasks: int = 4,
+                     executor_agent: str = "", executor_model: str = "",
+                     commander_agent: str = "", commander_model: str = "") -> dict[str, Any]:
+        """Show the deterministic split without running anything."""
+        from .control.segment import Segmenter
+
+        policy = self._session_policy(executor_agent, executor_model,
+                                      commander_agent, commander_model)
+        segmenter = Segmenter(policy, max_tasks=max_tasks,
+                              test_command=self.project.test_command)
+        segment = segmenter.segment(goal)
+        catalog = self.role_catalog()
+        agents = self.list_agents()
+        rows = []
+        for spec in segment.tasks:
+            candidates = policy.candidates(spec.role, agents=agents, catalog=catalog, limit=3)
+            rows.append({
+                "task": spec.to_dict(),
+                "candidates": [c.to_dict() for c in candidates],
+            })
+        payload = segment.to_dict()
+        payload["bindings"] = rows
+        return payload
+
+    def solve(self, goal: str, *, executor_agent: str = "", executor_model: str = "",
+              commander_agent: str = "", commander_model: str = "",
+              max_tasks: int = 4, max_parallel: int = 1, start: bool = True,
+              background: bool = True, polish: bool = False) -> dict[str, Any]:
+        """One request in, a routed multi-model run (and a final answer) out.
+
+        Steps: segment -> resolve each role against the real catalog -> pin
+        (agent, model) per task -> auto-approve architecture/plan -> run ->
+        aggregate. Budget rules from the policy are applied at planning time,
+        so an over-budget run degrades *before* spending.
+        """
+        from .control.segment import Segmenter
+
+        policy = self._session_policy(executor_agent, executor_model,
+                                      commander_agent, commander_model)
+        segmenter = Segmenter(policy, max_tasks=max_tasks,
+                              test_command=self.project.test_command)
+        segment = segmenter.segment(goal)
+        agents = self.list_agents()
+        catalog = self.role_catalog()
+        premium_used = 0
+        agent_used: dict[str, int] = {}
+        executor_agents: set[str] = set()
+        bindings: list[dict[str, Any]] = []
+        notes: list[str] = list(segment.notes)
+        for spec in segment.tasks:
+            # Independent verification must not be the agent that did the work.
+            exclude = executor_agents if spec.role == "verify" else set()
+            candidates = policy.candidates(spec.role, agents=agents, catalog=catalog,
+                                           exclude=exclude)
+            if not candidates:
+                notes.append(f"{spec.role}: 没有可用候选，任务将交给通用路由")
+                bindings.append({"task_id": spec.task_id, "role": spec.role,
+                                 "agent_id": "", "model": "", "tier": None,
+                                 "reason": "no_candidate"})
+                continue
+            chosen = None
+            skipped: list[str] = []
+            for candidate in candidates:
+                limit = policy.limits_for(candidate.agent_id).get("max_tasks_per_run")
+                if limit is not None and agent_used.get(candidate.agent_id, 0) >= int(limit):
+                    skipped.append(f"{candidate.agent_id} 超过每轮 {limit} 个任务上限")
+                    continue
+                if policy.is_premium(candidate.tier) \
+                        and premium_used >= policy.max_premium_tasks_per_run:
+                    skipped.append(f"premium 档预算 {policy.max_premium_tasks_per_run} 已用完")
+                    continue
+                chosen = candidate
+                break
+            downgraded = False
+            if chosen is None:
+                chosen = min(candidates, key=lambda c: (c.tier, c.agent_id))
+                downgraded = True
+                notes.append(f"{spec.role}: 预算/限额已满，降级到 tier {chosen.tier}"
+                             f"（{chosen.agent_id}/{chosen.model}）：{'；'.join(skipped[:3])}")
+            spec.suggested_agent = chosen.agent_id
+            spec.model = chosen.model
+            agent_used[chosen.agent_id] = agent_used.get(chosen.agent_id, 0) + 1
+            if spec.writable:
+                executor_agents.add(chosen.agent_id)
+            if policy.is_premium(chosen.tier):
+                premium_used += 1
+            bindings.append({
+                "task_id": spec.task_id, "role": spec.role, "type": spec.type,
+                "agent_id": chosen.agent_id, "agent_name": chosen.agent_name,
+                "model": chosen.model, "tier": chosen.tier, "tier_label": chosen.tier_label,
+                "reason": chosen.why, "downgraded": downgraded,
+            })
+        plan_payload = {
+            "plan_version": 1,
+            "goal": goal,
+            "constraints": ["只允许通过各 Agent 自身的软件接口执行，禁止 OS 键鼠合成"],
+            "tasks": [spec.to_dict() for spec in segment.tasks],
+        }
+        if not commander_agent and not self.store.get_main_node(self.project.project_id):
+            picked = self.auto_main()
+            chosen_main = (picked.get("selected") or {}).get("agent_id", "")
+            notes.append(f"未指定统帅模型，已自动选择主节点 {chosen_main}（只做记录，不参与执行）")
+        imported = self.import_plan(
+            plan_payload,
+            main_agent_id=commander_agent or "",
+            model=commander_model or "",
+        )
+        architecture_id = imported.get("architecture_approval_id") or ""
+        if architecture_id:
+            self.decide_approval(architecture_id, approve=True)
+        plan_approval = _approval_id_for(self, "plan", imported["plan_id"])
+        approved = self.decide_approval(plan_approval, approve=True)
+        run_id = approved["outcome"]["run_id"]
+        for spec in segment.tasks:
+            binding = next((b for b in bindings if b["task_id"] == spec.task_id), None)
+            if binding and binding["agent_id"]:
+                self.store.update_task(f"{run_id}:{spec.task_id}",
+                                       assigned_agent=binding["agent_id"],
+                                       model=binding["model"])
+        self.audit.log("user", "solve.configured", subject=run_id, payload={
+            "goal": goal[:500], "tasks": len(segment.tasks),
+            "confidence": segment.confidence,
+            "bindings": [{k: b.get(k) for k in ("task_id", "role", "agent_id", "model", "tier")}
+                         for b in bindings],
+            "premium_tasks": premium_used,
+        })
+        if self.bus:
+            self.bus.publish("workflow", {
+                "phase": "solve_planned", "run_id": run_id, "goal": goal,
+                "tasks": len(segment.tasks), "premium_tasks": premium_used,
+                "bindings": bindings,
+            }, correlation_id=run_id, sync_level=5)
+        result = {
+            "status": "planned", "run_id": run_id, "plan_id": imported["plan_id"],
+            "goal": goal, "confidence": segment.confidence,
+            "tasks": [spec.to_dict() for spec in segment.tasks],
+            "bindings": bindings, "notes": notes,
+            "premium_tasks": premium_used,
+            "premium_budget": policy.max_premium_tasks_per_run,
+        }
+        if start:
+            self.start_run(run_id, max_parallel=max_parallel, background=background)
+            result["status"] = "running" if background else "finished"
+            if polish:
+                result["answer"] = self.aggregate_run(run_id, polish=True)
+            else:
+                result["answer"] = self.aggregate_run(run_id)
+        return result
+
+    def aggregate_run(self, run_id: str = "", *, polish: bool = False) -> dict[str, Any]:
+        """Deterministic aggregation of every task result into one answer."""
+        from .control.aggregate import apply_polish, build_answer, build_polish_prompt
+
+        run = self.store.get_run(run_id) if run_id else self.latest_run()
+        if not run:
+            raise NotFoundError("没有可汇总的运行")
+        plan = self.store.get_plan(run["plan_id"])
+        tasks = self.store.list_tasks(run["run_id"])
+        results: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            row = self.store.get_result(task.uid)
+            if row and isinstance(row.get("payload"), dict):
+                results[task.task_id] = row["payload"]
+        answer = build_answer(
+            goal=plan.goal if plan else "",
+            run=run,
+            plan=plan.to_dict() if plan else None,
+            tasks=[t.to_dict() for t in tasks],
+            results=results,
+        )
+        if polish:
+            answer = self._polish_answer(run["run_id"], answer, build_polish_prompt)
+        directory = self.paths.run_dir(run["run_id"])
+        directory.mkdir(parents=True, exist_ok=True)
+        write_json(directory / "answer.json", answer)
+        atomic_write_text(directory / "answer.md", answer["answer_markdown"])
+        if self.bus:
+            self.bus.publish("response", {
+                "purpose": "aggregate", "run_id": run["run_id"],
+                "status": run.get("status", ""), "tasks": len(tasks),
+                "premium_tasks": answer["cost"]["premium_tasks"],
+                "tokens": answer["cost"]["total_tokens"],
+                "polished": answer.get("polished", False),
+                "answer_path": str(directory / "answer.md"),
+            }, correlation_id=run["run_id"])
+        return answer
+
+    def _polish_answer(self, run_id: str, answer: dict[str, Any], prompt_builder) -> dict[str, Any]:
+        """Optional: let the summarizer role rewrite the deterministic digest.
+
+        Any failure keeps the deterministic answer — polishing is an upgrade,
+        never a dependency.
+        """
+        from .adapters import create_adapter
+        from .adapters.base import ExecutionRequest
+        from .control.aggregate import apply_polish
+        from .control.roles import classify_model
+
+        policy = self.roles
+        if "summarize" not in policy.roles:
+            return answer
+        candidates = policy.candidates("summarize", agents=self.list_agents(),
+                                       catalog=self.role_catalog(), limit=1)
+        if not candidates:
+            return answer
+        chosen = candidates[0]
+        agent = self.store.get_agent(chosen.agent_id)
+        if not agent:
+            return answer
+        directory = self.paths.run_dir(run_id) / "aggregate"
+        directory.mkdir(parents=True, exist_ok=True)
+        prompt_path = directory / "polish_request.md"
+        output_path = directory / "polish.md"
+        atomic_write_text(prompt_path, prompt_builder(answer))
+        synthetic = Task(
+            uid=f"{run_id}:AGGREGATE", project_id=self.project.project_id,
+            plan_id="", run_id=run_id,
+            spec=TaskSpec(
+                task_id="AGGREGATE", title="汇总", objective=answer.get("conclusion", ""),
+                type="analysis", role="summarize", model=chosen.model,
+                token_budget=8000, time_limit_minutes=10, retry_limit=0,
+            ),
+            status="running", assigned_agent=chosen.agent_id, base_commit=self.project.commit,
+        )
+        request = ExecutionRequest(
+            project_id=self.project.project_id, project_root=self.project.root,
+            task=synthetic, workdir=str(self.root), task_dir=str(directory),
+            prompt_path=str(prompt_path), result_path=str(output_path),
+            model=chosen.model, timeout_seconds=self.config.summary_timeout_seconds,
+            purpose="aggregate", full_control=bool(self.config.full_control),
+        )
+        try:
+            outcome = create_adapter(agent).execute(request)
+        except Exception as exc:  # adapter/agent problem must not lose the answer
+            self.audit.log("control-plane", "aggregate.polish_failed",
+                           subject=run_id, payload={"error": str(exc)[:300]})
+            return answer
+        text = read_text(output_path, default="") or (outcome.text or "")
+        if outcome.status != "completed" or not text.strip():
+            self.audit.log("control-plane", "aggregate.polish_failed", subject=run_id,
+                           payload={"status": outcome.status, "error": outcome.error[:300]})
+            return answer
+        self.audit.log("control-plane", "aggregate.polished", subject=run_id, payload={
+            "agent": chosen.agent_id, "model": chosen.model,
+            "tier": chosen.tier, "model_class": classify_model(chosen.model),
+        })
+        return apply_polish(answer, text)
+
+    def solve_status(self, run_id: str = "") -> dict[str, Any]:
+        run = self.store.get_run(run_id) if run_id else self.latest_run()
+        if not run:
+            return {"status": "no_run", "answer": None}
+        tasks = self.store.list_tasks(run["run_id"])
+        done = all(t.status in ("completed", "failed", "canceled", "rejected") for t in tasks)
+        answer = self.aggregate_run(run["run_id"]) if done and tasks else None
+        return {
+            "status": run.get("status", ""), "run_id": run["run_id"],
+            "acceptance_status": run.get("acceptance_status", ""),
+            "tasks": [{k: t.to_dict()[k] for k in
+                       ("task_id", "role", "model", "assigned_agent", "status",
+                        "verification_status", "error")} for t in tasks],
+            "answer": answer,
+        }
+
+    # ------------------------------------------------------------------
     # Multi-agent chain (workspace + per-stage agent/model pins)
     # ------------------------------------------------------------------
     def configure_chain(self, *, goal: str, stages: list[dict[str, Any]],
                         main_agent_id: str = "", start: bool = False,
                         background: bool = True, max_parallel: int = 1,
-                        approve: bool = True) -> dict[str, Any]:
-        """Pin one agent + one real model per stage, then build and run a chain.
+                        approve: bool = True, plan_id: str = "",
+                        save_only: bool = False) -> dict[str, Any]:
+        """Pin one agent + one real model per stage of a chain.
 
-        Each stage is a task in the same dependency chain.  ``assigned_agent``
-        is written on the task row so the capability router cannot silently
-        substitute a different agent, and the model is validated against the
-        agent's own discovered catalog before anything is stored.
+        Two modes exist on purpose:
+
+        * ``plan_id`` given: the stages are bound onto an existing
+          ``pending_approval`` plan.  Nothing is approved or started here; the
+          plan approval in step 4 remains the single execution gate.
+        * no ``plan_id``: a standalone chain plan is created.  Unless the
+          caller explicitly asks for ``approve``/``start`` it stays pending and
+          uses the same step-4 gate.
+
+        Each stage's model is validated against the agent's own discovered
+        catalog before anything is stored.  ``assigned_agent`` is written on
+        the task row so the capability router cannot silently substitute a
+        different agent.
         """
-        if not goal.strip():
+        if not goal.strip() and not plan_id:
             raise ValidationError("链路目标不能为空")
         if not stages:
             raise ValidationError("链路至少需要一个阶段")
-        prepared: list[dict[str, Any]] = []
-        for index, raw in enumerate(stages, start=1):
-            agent_id = str(raw.get("agent_id") or "").strip()
-            model = str(raw.get("model") or "").strip()
-            if not agent_id:
-                raise ValidationError(f"第 {index} 阶段缺少 agent_id")
-            agent = self.get_agent(agent_id)
-            if not model:
-                model = str((agent.extra or {}).get("selected_model") or
-                            (agent.models[0] if agent.models else ""))
-            known = [row["model"] for row in self.store.list_agent_models(
-                self.project.project_id, agent_id=agent_id)]
-            if not known:
-                known = list(agent.models)
-            if not known:
-                raise ValidationError(
-                    f"{agent_id} 没有可验证的模型清单；请先 discover/models --refresh"
-                )
-            if model not in known:
-                raise ValidationError(
-                    f"{agent_id} 的真实模型清单中没有 {model}",
-                    details={"available": sorted(known)[:40]},
-                )
-            stage_type = str(raw.get("type") or
-                             {1: "analysis", 2: "review", 3: "implementation"}.get(
-                                 index, "analysis"))
-            legal_types = {t.value for t in TaskType}
-            if stage_type not in legal_types:
-                raise ValidationError(
-                    f"未知任务类型 {stage_type}",
-                    details={"allowed": sorted(legal_types)},
-                )
-            prepared.append({
-                "stage": index,
-                "agent_id": agent_id,
-                "agent_name": agent.name,
-                "model": model,
-                "type": stage_type,
-                "objective": str(raw.get("objective") or "").strip(),
-                "title": str(raw.get("title") or "").strip(),
-                "scope": list(raw.get("scope") or []),
-                "out_of_scope": list(raw.get("out_of_scope") or []),
-                "verification_commands": list(raw.get("verification_commands") or []),
-                "time_limit_minutes": int(raw.get("time_limit_minutes") or 30),
-                "retry_limit": int(raw.get("retry_limit", 1)),
-                "token_budget": int(raw.get("token_budget") or 60000),
-            })
-        # A model is a property of the Agent, not of the stage: the executor
-        # reads ``agent.extra.selected_model``.  Two stages that reuse one agent
-        # with different models would silently run the last one everywhere.
+        prepared = [self._prepare_chain_stage(raw, index)
+                    for index, raw in enumerate(stages, start=1)]
+        # A model is a property of the task, not of the agent: the executor
+        # reads ``task.spec.model`` first and only falls back to the agent's
+        # selected model.
         pinned: dict[str, str] = {}
         for stage in prepared:
-            previous = pinned.get(stage["agent_id"])
-            if previous and previous != stage["model"]:
-                raise ValidationError(
-                    f"{stage['agent_id']} 在不同阶段使用了不同模型"
-                    f"（{previous} vs {stage['model']}）",
-                    details={"agent_id": stage["agent_id"], "models": [previous, stage["model"]]},
-                )
             pinned[stage["agent_id"]] = stage["model"]
-        # Persist each stage model through the same catalog used by the WebUI.
         for agent_id, model in pinned.items():
             self.set_agent_model(agent_id, model)
-        # Narrow on purpose: a bare "**" pattern overlaps every high-risk file
-        # pattern (lock files, .env, *.pem) and would force a high-risk
-        # approval for an ordinary test-generation stage.
+
+        if plan_id:
+            plan = self.store.get_plan(plan_id)
+            if not plan:
+                raise NotFoundError(f"计划不存在: {plan_id}")
+            if plan.status != "pending_approval":
+                raise ValidationError(
+                    f"计划状态为 {plan.status}，只有待审批计划可以绑定链路配置",
+                    details={"plan_id": plan_id, "status": plan.status},
+                )
+            prepared = self._bind_chain_to_plan(plan, prepared)
+            self.store.save_plan(plan)
+            self.audit.log("user", "chain.bound", subject=plan_id, payload={
+                "goal": plan.goal,
+                "stages": [{"task_id": s["task_id"], "agent": s["agent_id"],
+                            "model": s["model"], "type": s["type"]} for s in prepared],
+            })
+            outcome: dict[str, Any] = {
+                "status": "bound", "plan_id": plan_id, "run_id": "",
+                "main_agent_id": main_agent_id or plan.main_agent_id,
+                "stages": prepared,
+                "next": "到第 4 步批准计划，再点击开始执行",
+            }
+            if approve and not save_only:
+                for item in self.approvals.pending():
+                    if item.kind == "architecture" and item.plan_id == plan_id:
+                        self.decide_approval(item.approval_id, approve=True)
+                approval_id = _approval_id_for(self, "plan", plan_id)
+                approved = self.decide_approval(approval_id, approve=True)
+                run_id = approved["outcome"]["run_id"]
+                for stage in prepared:
+                    self.store.update_task(f"{run_id}:{stage['task_id']}",
+                                           assigned_agent=stage["agent_id"],
+                                           model=stage["model"])
+                outcome.update({"status": "approved", "run_id": run_id,
+                                "approval_id": approval_id})
+                if start:
+                    self.start_run(run_id, max_parallel=max_parallel,
+                                   background=background)
+                    outcome["status"] = "started"
+            return outcome
+
+        # ------------------------------------------------------------------
+        # Standalone chain: build a plan; approval remains explicit unless the
+        # caller opted into the legacy one-shot behaviour.
+        # ------------------------------------------------------------------
         default_write_scope = ["tests/**", "test_*.py"]
         tasks: list[dict[str, Any]] = []
         previous = ""
@@ -923,6 +1422,8 @@ class Hub:
                 "task_id": task_id,
                 "title": stage["title"] or f"阶段 {index} · {stage['agent_name']}",
                 "type": stage["type"],
+                "role": str(stage.get("role") or ""),
+                "model": stage["model"],
                 "objective": objective,
                 "suggested_agent": stage["agent_id"],
                 "dependencies": [previous] if previous else [],
@@ -947,6 +1448,33 @@ class Hub:
             "tasks": tasks,
         }
         imported = self.import_plan(plan_payload)
+        # The collaboration contract in import_plan may reassign roles to the
+        # main/selected sub-agent. A 3.5 chain is an explicit human pin, so the
+        # per-stage agent/model/type must win over that automatic contract.
+        imported_plan = self.store.get_plan(imported["plan_id"])
+        if imported_plan is not None:
+            prepared = self._bind_chain_to_plan(imported_plan, prepared)
+            self.store.save_plan(imported_plan)
+            self.audit.log("user", "chain.pins_applied", subject=imported_plan.plan_id,
+                           payload={"stages": [
+                               {"task_id": s["task_id"], "agent": s["agent_id"],
+                                "model": s["model"], "type": s["type"]}
+                               for s in prepared]})
+        outcome = {
+            "status": "pending_approval", "plan_id": imported["plan_id"],
+            "run_id": "", "main_agent_id": main_agent_id or "",
+            "stages": prepared, "approval_id": imported.get("approval_id", ""),
+            "architecture_approval_id": imported.get("architecture_approval_id", ""),
+            "next": "到第 4 步批准计划，再点击开始执行",
+        }
+        if save_only or not approve:
+            self.audit.log("user", "chain.saved", subject=imported["plan_id"], payload={
+                "goal": goal,
+                "stages": [{"task_id": s["task_id"], "agent": s["agent_id"],
+                            "model": s["model"], "type": s["type"]} for s in prepared],
+                "next": "批准计划后开始执行",
+            })
+            return outcome
         architecture_id = imported.get("architecture_approval_id") or ""
         if architecture_id:
             self.decide_approval(architecture_id, approve=True)
@@ -955,29 +1483,107 @@ class Hub:
         run_id = approved["outcome"]["run_id"]
         for stage in prepared:
             self.store.update_task(f"{run_id}:{stage['task_id']}",
-                                   assigned_agent=stage["agent_id"])
+                                   assigned_agent=stage["agent_id"],
+                                   model=stage["model"])
         self.audit.log("user", "chain.configured", subject=run_id, payload={
             "goal": goal,
             "stages": [{"task_id": s["task_id"], "agent": s["agent_id"],
                         "model": s["model"], "type": s["type"]} for s in prepared],
         })
-        outcome: dict[str, Any] = {
-            "status": "configured", "plan_id": imported["plan_id"], "run_id": run_id,
-            "main_agent_id": main_agent_id or "",
-            "stages": prepared,
-        }
+        outcome.update({"status": "configured", "run_id": run_id})
         if start:
             self.start_run(run_id, max_parallel=max_parallel, background=background)
             outcome["status"] = "started"
-        if not approve:
-            outcome["status"] = "pending_approval"
         return outcome
+
+    def _prepare_chain_stage(self, raw: dict[str, Any], index: int) -> dict[str, Any]:
+        agent_id = str(raw.get("agent_id") or "").strip()
+        model = str(raw.get("model") or "").strip()
+        if not agent_id:
+            raise ValidationError(f"第 {index} 阶段缺少 agent_id")
+        agent = self.get_agent(agent_id)
+        if not model:
+            model = str((agent.extra or {}).get("selected_model") or
+                        (agent.models[0] if agent.models else ""))
+        known = [row["model"] for row in self.store.list_agent_models(
+            self.project.project_id, agent_id=agent_id)]
+        if not known:
+            known = list(agent.models)
+        if not known:
+            raise ValidationError(
+                f"{agent_id} 没有可验证的模型清单；请先 discover/models --refresh"
+            )
+        if model not in known:
+            raise ValidationError(
+                f"{agent_id} 的真实模型清单中没有 {model}",
+                details={"available": sorted(known)[:40]},
+            )
+        stage_type = str(raw.get("type") or
+                         {1: "analysis", 2: "review", 3: "implementation"}.get(
+                             index, "analysis"))
+        legal_types = {t.value for t in TaskType}
+        if stage_type not in legal_types:
+            raise ValidationError(
+                f"未知任务类型 {stage_type}",
+                details={"allowed": sorted(legal_types)},
+            )
+        return {
+            "stage": index,
+            "task_id": str(raw.get("task_id") or "").strip(),
+            "agent_id": agent_id,
+            "agent_name": agent.name,
+            "model": model,
+            "type": stage_type,
+            "role": str(raw.get("role") or ""),
+            "objective": str(raw.get("objective") or "").strip(),
+            "title": str(raw.get("title") or "").strip(),
+            "scope": list(raw.get("scope") or []),
+            "out_of_scope": list(raw.get("out_of_scope") or []),
+            "verification_commands": list(raw.get("verification_commands") or []),
+            "time_limit_minutes": int(raw.get("time_limit_minutes") or 30),
+            "retry_limit": int(raw.get("retry_limit", 1)),
+            "token_budget": int(raw.get("token_budget") or 60000),
+        }
+
+    def _bind_chain_to_plan(self, plan: Any,
+                            prepared: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Write per-stage agent/model/type onto an existing pending plan.
+
+        The plan owns the task graph; step 3.5 only pins who runs each node.
+        Stage order and task count must match so a stale browser draft cannot
+        silently retarget a different plan.
+        """
+        by_id = {task.task_id: task for task in plan.tasks}
+        if len(prepared) != len(plan.tasks):
+            raise ValidationError(
+                f"阶段数量（{len(prepared)}）与计划任务数（{len(plan.tasks)}）不一致",
+                details={"plan_id": plan.plan_id,
+                         "tasks": [t.task_id for t in plan.tasks]},
+            )
+        for index, stage in enumerate(prepared):
+            spec = by_id.get(stage["task_id"]) if stage["task_id"] else plan.tasks[index]
+            if spec is None:
+                raise ValidationError(f"计划中没有任务 {stage['task_id']}")
+            if not stage["task_id"]:
+                stage["task_id"] = spec.task_id
+            old = {"agent": spec.suggested_agent, "model": spec.model,
+                   "type": spec.type}
+            spec.suggested_agent = stage["agent_id"]
+            spec.model = stage["model"]
+            spec.type = stage["type"]
+            if spec.type in ("implementation", "documentation") and not spec.scope:
+                spec.scope = ["tests/**", "test_*.py"]
+            stage.update({"title": spec.title, "objective": spec.objective,
+                          "role": spec.role, "previous": old})
+        plan.validate()
+        return prepared
 
     # ------------------------------------------------------------------
     # Preflight: open the selected agents and bind workspace + model
     # ------------------------------------------------------------------
     def preflight_agents(self, stages: list[dict[str, Any]], *,
                          workspace: str = "", open_apps: bool = True,
+                         full_control: bool = True,
                          config: dict[str, Any] | None = None) -> dict[str, Any]:
         """Open every selected agent and verify its workspace + model.
 
@@ -991,6 +1597,7 @@ class Hub:
             prepare_qoder_session, qoder_model_key, verify_qoder_session,
         )
         from .connectors import is_auto_executable
+        from .gui.permissions import ensure_trae_full_access
 
         root = str(Path(workspace).expanduser().resolve()) if workspace else \
             str(self.project.root)
@@ -1020,7 +1627,7 @@ class Hub:
                         app=app, port=int(cfg.get("trae_cdp_port")
                                           or trae_interface.CDP_DEFAULT_PORT),
                         workspace=root, executable=str(cfg.get("executable") or ""),
-                        config=cfg, allow_restart=open_apps, force_restart=open_apps,
+                        config=cfg, allow_restart=open_apps, force_restart=False,
                         before_launch=lambda: trae_interface.set_trae_workspace(
                             workspace=root, app=app, config=cfg))
                     if not cdp.ok:
@@ -1040,18 +1647,30 @@ class Hub:
                         app=app, config=cfg,
                         cdp_port=int(cfg.get("trae_cdp_port")
                                      or trae_interface.CDP_DEFAULT_PORT))
+                    full_access = {}
+                    if full_control:
+                        try:
+                            full_access = ensure_trae_full_access(
+                                port=int(cfg.get("trae_cdp_port")
+                                         or trae_interface.CDP_DEFAULT_PORT))
+                        except Exception as exc:
+                            full_access = {"ok": False, "reason": str(exc)[:300]}
                     item.update({
                         "ok": bool(ws.ok and md.ok and verify.ok),
                         "stage": "ready" if verify.ok else "verify",
                         "process": "running" if cdp.ok else "not_running",
                         "visible_model": md.actual.get("visible_model", ""),
                         "workspace_set": ws.ok, "model_set": md.ok,
+                        "full_access": full_access,
                         "verify": verify.to_dict(),
                         "error": "" if verify.ok else verify.reason,
                     })
                 elif app == "qoder_cn":
                     qkey = qoder_model_key(model)
-                    prep = prepare_qoder_session(workspace=root, model=qkey, config=cfg)
+                    prep = prepare_qoder_session(
+                        workspace=root, model=qkey, config=cfg,
+                        permission_mode=("bypassPermissions" if full_control else ""),
+                    )
                     if not prep.ok:
                         item.update({"ok": False, "stage": "launch", "error": prep.reason})
                         report.append(item)
@@ -1067,11 +1686,23 @@ class Hub:
                         "error": "" if verify.ok else verify.reason,
                     })
                 elif app == "workbuddy":
-                    # The deeplink prefills a probe without sending; a real
-                    # workspace/model binding is verified when the task runs.
-                    item.update({"ok": True, "stage": "deferred",
-                                 "process": "deeplink",
-                                 "note": "WorkBuddy 在任务执行时用 deeplink 绑定工作区/模型"})
+                    # Opening the renderer with the debugging switch is the
+                    # only preflight WorkBuddy needs; workspace/model are bound
+                    # by the task deeplink at execution time.
+                    from .control.interfaces import ensure_workbuddy_cdp
+                    cdp = ensure_workbuddy_cdp(
+                        executable=str(cfg.get("executable") or ""),
+                        port=int(cfg.get("workbuddy_cdp_port") or 9223),
+                        allow_restart=open_apps,
+                    )
+                    item.update({
+                        "ok": cdp.ok, "stage": "ready" if cdp.ok else "launch",
+                        "process": "running" if cdp.ok else "not_running",
+                        "workspace_set": False, "model_set": False,
+                        "note": "工作区/模型由任务 deeplink 在执行时绑定",
+                        "error": "" if cdp.ok else cdp.reason,
+                        "evidence": cdp.evidence,
+                    })
                 else:
                     command = cfg.get("command")
                     exe = str(cfg.get("executable") or (
@@ -1135,13 +1766,18 @@ class Hub:
                     cost, source = float(rate), "trae_catalog_rate"
                 else:
                     cost, source = 0.5, "estimated"
+                level = str(row.get("capability_level") or "")
+                level_bias = CAPABILITY_RANK.get(
+                    normalize_capability_level(level), 0.0)
                 candidates.append({
                     "agent_id": agent.agent_id, "agent_name": agent.name,
                     "model": name, "adapter": agent.adapter_type,
-                    "quality": round(quality, 4),
+                    "quality": round(max(0.0, min(1.0, quality + level_bias)), 4),
                     "verification": round(verification, 4),
                     "speed": round(speed, 4),
                     "cost": round(cost, 4), "cost_source": source,
+                    "context_length": int(row.get("context_length") or 0),
+                    "capability_level": level,
                     "capabilities": sorted(required & caps),
                 })
         if not candidates:
@@ -1205,7 +1841,9 @@ class Hub:
             rows.append({
                 "task_id": task.task_id, "agent_id": task.assigned_agent,
                 "agent_name": agent.name if agent else "",
-                "model": str(((agent.extra or {}) if agent else {}).get("selected_model") or ""),
+                "role": task.spec.role,
+                "model": task.spec.model or str(
+                    ((agent.extra or {}) if agent else {}).get("selected_model") or ""),
                 "workspace": task.workdir,
                 "status": task.status, "verification": task.verification_status,
                 "visible_model": visible,
@@ -1214,6 +1852,184 @@ class Hub:
                 "error": task.error,
             })
         return {"run_id": run_id, "status": run["status"], "stages": rows}
+
+    # ------------------------------------------------------------------
+    # Chain draft persistence (survives WebUI refreshes and restarts)
+    # ------------------------------------------------------------------
+    def chain_draft(self) -> dict[str, Any]:
+        path = Path(self.paths.base) / "chain-draft.json"
+        data = read_json(path, {}) or {}
+        if not isinstance(data, dict):
+            return {}
+        data["path"] = str(path)
+        return data
+
+    def save_chain_draft(self, draft: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(draft, dict):
+            raise ValidationError("链路草稿必须是 JSON 对象")
+        stages = draft.get("stages")
+        if stages is not None and not isinstance(stages, list):
+            raise ValidationError("stages 必须是数组")
+        path = Path(self.paths.base) / "chain-draft.json"
+        payload = {
+            "project_id": self.project.project_id,
+            "plan_id": str(draft.get("plan_id") or ""),
+            "goal": str(draft.get("goal") or ""),
+            "policy": str(draft.get("policy") or "balanced"),
+            "main_agent_id": str(draft.get("main_agent_id") or ""),
+            "stages": [
+                {
+                    "task_id": str(item.get("task_id") or ""),
+                    "title": str(item.get("title") or ""),
+                    "agent_id": str(item.get("agent_id") or ""),
+                    "model": str(item.get("model") or ""),
+                    "type": str(item.get("type") or "analysis"),
+                }
+                for item in (stages or [])
+                if isinstance(item, dict)
+            ],
+        }
+        write_json(path, payload)
+        self.audit.log("user", "chain.draft_saved", payload={
+            "plan_id": payload["plan_id"], "stages": len(payload["stages"]),
+        })
+        return {**payload, "path": str(path)}
+
+    # ------------------------------------------------------------------
+    # Manual intervention / blocked nodes
+    # ------------------------------------------------------------------
+    def manual_actions(self, run_id: str = "") -> list[dict[str, Any]]:
+        run = self.store.get_run(run_id) if run_id else self.latest_run()
+        if not run:
+            return []
+        out: list[dict[str, Any]] = []
+        for task in self.store.list_tasks(run["run_id"]):
+            if task.status != TaskStatus.WAITING_USER.value:
+                continue
+            payload: dict[str, Any] = {}
+            if task.task_dir:
+                payload = read_json(Path(task.task_dir) / "manual-action.json", {}) or {}
+            if not payload:
+                # Budget/high-risk approval waits have their own section-4
+                # queue; only adapter-reported human actions pop the alert.
+                continue
+            agent = self.store.get_agent(task.assigned_agent) if task.assigned_agent else None
+            out.append({
+                "task_uid": task.uid, "task_id": task.task_id,
+                "title": task.spec.title, "status": task.status,
+                "agent_id": task.assigned_agent,
+                "agent_name": agent.name if agent else (payload.get("agent_name") or ""),
+                "model": task.spec.model,
+                "error": task.error,
+                "manual_action": payload if isinstance(payload, dict) else {},
+            })
+        seen = {item["task_uid"] for item in out}
+        run_dir = Path(self.paths.run_dir(run["run_id"]))
+        round_number = int(run.get("round_number") or 1)
+
+        def add_synthetic(path: Path, task_id: str, title: str) -> None:
+            if not path.exists():
+                return
+            data = read_json(path, {})
+            if not isinstance(data, dict) or not data:
+                return
+            uid = f"{run['run_id']}:{task_id}"
+            if uid in seen:
+                return
+            agent_id = str(data.get("agent_id") or run.get("main_agent_id") or "")
+            agent = self.store.get_agent(agent_id) if agent_id else None
+            out.append({
+                "task_uid": uid, "task_id": task_id, "title": title,
+                "status": TaskStatus.WAITING_USER.value,
+                "agent_id": agent_id,
+                "agent_name": agent.name if agent else (data.get("agent_name") or ""),
+                "model": str(data.get("model") or run.get("model") or ""),
+                "error": f"MANUAL_ACTION_REQUIRED: {data.get('message', '')}",
+                "manual_action": data,
+                "synthetic": True,
+            })
+            seen.add(uid)
+
+        # Synthetic main-node blocks belong to a live run; a paused/finished
+        # run must not keep showing an old summary/planning prompt.
+        if run.get("status") in ("running", "waiting_user"):
+            add_synthetic(run_dir / "summary" / "manual-action.json",
+                          "SUMMARY", "主节点汇总")
+            for path in Path(self.paths.planning).glob(
+                    f"round{round_number}_*/manual-action.json"):
+                add_synthetic(path, f"ROUND{round_number}_PLAN",
+                              f"第 {round_number} 轮主节点规划")
+        return out
+
+    def main_activity(self, run_id: str = "") -> dict[str, Any]:
+        """Latest visible main-node activity (summary / next-round planning)."""
+        run = self.store.get_run(run_id) if run_id else self.latest_run()
+        if not run:
+            return {}
+        if run.get("status") not in ("running", "waiting_user", "ready"):
+            return {}
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        summary_path = Path(self.paths.run_dir(run["run_id"])) / "summary" / "activity.json"
+        for path in (summary_path,):
+            data = read_json(path, {}) if path.exists() else {}
+            if isinstance(data, dict) and data:
+                candidates.append((path.stat().st_mtime, {**data, "path": str(path)}))
+        round_number = int(run.get("round_number") or 1)
+        for pattern in (f"round{round_number}_*/activity.json", "*/activity.json"):
+            found = False
+            for path in Path(self.paths.planning).glob(pattern):
+                if not path.is_file():
+                    continue
+                data = read_json(path, {})
+                # Old completed planning records are history, not "current
+                # main-node activity"; only show a live/waiting plan.
+                if isinstance(data, dict) and data and \
+                        data.get("status") in ("running", "waiting_user", "waiting_agent"):
+                    candidates.append((path.stat().st_mtime, {**data, "path": str(path)}))
+                    found = True
+            if found:
+                break
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def restart_agent_interface(self, agent_id: str) -> dict[str, Any]:
+        """Explicit user action: restart one desktop app with its CDP interface.
+
+        Never called automatically.  The WebUI shows the button only when an
+        app is running without the debugging interface.
+        """
+        from .control import trae_interface
+        from .control.interfaces import ensure_workbuddy_cdp
+
+        agent = self.get_agent(agent_id)
+        cfg = dict(agent.adapter_config or {})
+        app = str(cfg.get("gui_app") or "")
+        if app in ("trae_cn", "trae"):
+            outcome = trae_interface.ensure_trae_cdp(
+                app=app,
+                port=int(cfg.get("trae_cdp_port") or trae_interface.CDP_DEFAULT_PORT),
+                executable=str(cfg.get("executable") or ""),
+                config=cfg, allow_restart=True, force_restart=True,
+                workspace=str(self.project.root),
+                before_launch=lambda: trae_interface.set_trae_workspace(
+                    workspace=str(self.project.root), app=app, config=cfg),
+            )
+        elif app == "workbuddy":
+            outcome = ensure_workbuddy_cdp(
+                executable=str(cfg.get("executable") or ""),
+                port=int(cfg.get("workbuddy_cdp_port") or 9223),
+                allow_restart=True, force_restart=True,
+            )
+        else:
+            raise ValidationError(f"{agent_id} 没有可重启的桌面程序接口")
+        self.audit.log("user", "agent.interface_restart", subject=agent_id,
+                       payload={"app": app, "ok": outcome.ok,
+                                "reason": outcome.reason,
+                                "method": outcome.method,
+                                "evidence": outcome.evidence})
+        return {"agent_id": agent_id, "app": app, **outcome.to_dict()}
 
     def chain_status(self, run_id: str = "") -> dict[str, Any]:
         run = self.store.get_run(run_id) if run_id else self.latest_run()
@@ -1228,8 +2044,9 @@ class Hub:
             stages.append({
                 "task_id": task.task_id, "status": task.status,
                 "agent_id": agent_id, "agent_name": agent.name if agent else "",
-                "model": str(((agent.extra or {}) if agent else {}).get("selected_model")
-                             or ""),
+                "role": task.spec.role,
+                "model": task.spec.model or str(
+                    ((agent.extra or {}) if agent else {}).get("selected_model") or ""),
                 "verification": task.verification_status, "error": task.error,
                 "objective": task.spec.objective,
             })
@@ -1262,6 +2079,9 @@ class Hub:
             "latest_run": run,
             "task_counts": counts,
             "tasks": [t.to_dict() for t in tasks],
+            "manual_actions": self.manual_actions(run["run_id"] if run else ""),
+            "main_activity": self.main_activity(run["run_id"] if run else ""),
+            "chain_draft": self.chain_draft(),
             "pending_approvals": [a.to_dict() for a in self.approvals.pending()],
             "budget": self.budget.snapshot(run_id=run["run_id"] if run else ""),
             "checkpoint": self.checkpoints.latest(run_id=run["run_id"] if run else ""),

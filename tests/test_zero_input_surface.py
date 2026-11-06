@@ -141,7 +141,8 @@ def test_cdp_submit_prefilled_workbuddy_composer():
     assert result["submit"]["label"] == "发送"
     expressions = [params["expression"] for _, params in transport.calls]
     assert all("Input." not in expr for expr in expressions)
-    assert any("const text = (c.innerText" in expr for expr in expressions)
+    assert any("getClientRects" in expr for expr in expressions)
+    assert any("bestText" in expr for expr in expressions)
 
 
 def test_cdp_refuses_empty_prefilled_composer():
@@ -245,3 +246,15 @@ def test_surface_report_requires_evidence_for_verified_cells(tmp_path):
         if cap["status"] == "verified":
             assert cap["evidence"], cap
             assert cap["zero_input"] is True
+
+
+def test_cdp_rejects_placeholder_prefill_when_marker_expected():
+    from agentloop_hub.gui.cdp import submit_composer_via_cdp
+    transport = FakeTransport([
+        _value({"ok": True, "chars": 25, "text": "今天帮你做些什么？@ 添加上下文"}),
+    ])
+    with pytest.raises(GuiAutomationError) as info:
+        submit_composer_via_cdp(transport=transport, prefill_timeout=0.05,
+                                expect_contains="AGENTMESH_GUI_MARKER_TEST")
+    assert info.value.code == "GUI_SEND_FAILED"
+    assert "占位符" in str(info.value)

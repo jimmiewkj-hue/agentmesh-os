@@ -54,6 +54,7 @@ PLAN_TEMPLATE: dict[str, Any] = {
             "task_id": "T001",
             "title": "",
             "type": "analysis",
+            "role": "",
             "objective": "",
             "suggested_agent": "",
             "dependencies": [],
@@ -80,6 +81,8 @@ SUMMARY_TEMPLATE: dict[str, Any] = {
     "risks": [],
     "merge_recommendation": "approve",
     "next_actions": [],
+    "goal_status": "complete",
+    "blocking_reason": "",
 }
 
 VERIFICATION_TEMPLATE: dict[str, Any] = {
@@ -161,7 +164,8 @@ class PromptBuilder:
                            memories: list[dict[str, Any]], *,
                            runtime_dir: str | Path,
                            extra_context: dict[str, Any] | None = None,
-                           bootstrap: dict[str, Any] | None = None) -> TaskPackage:
+                           bootstrap: dict[str, Any] | None = None,
+                           agent_profile: dict[str, Any] | None = None) -> TaskPackage:
         task_dir = ensure_dir(self.paths.task_dir(task.uid))
         runtime = ensure_dir(runtime_dir)
         task_json_path = task_dir / "task.json"
@@ -204,6 +208,7 @@ class PromptBuilder:
             },
             "memories": memories,
             "bootstrap": bootstrap or {},
+            "agent_profile": agent_profile or {},
             "extra_context": extra_context or {},
             "result_path": str(result_path),
             "result_schema": _result_schema(),
@@ -264,9 +269,20 @@ class PromptBuilder:
             ensure_ascii=False, indent=2,
         )
         bootstrap = json.dumps(package.get("bootstrap") or {}, ensure_ascii=False, indent=2)
+        profile = package.get("agent_profile") or {}
+        profile_text = (
+            f"- 上下文长度配置：{profile.get('context_length') or '默认'}\n"
+            f"- 能力等级：{profile.get('capability_level') or '默认'}"
+        )
+        round_context = json.dumps(
+            (package.get("extra_context") or {}).get("round_context") or {},
+            ensure_ascii=False, indent=2,
+        )
         return f"""# AgentMesh OS 任务包
 
 你正在作为子节点执行任务，Agent：{agent.name}（{agent.agent_id}）。
+
+{profile_text}
 
 ## 目标
 {task.spec.objective}
@@ -310,6 +326,12 @@ class PromptBuilder:
 {bootstrap}
 ```
 
+## 多轮任务上下文
+若 `round` 大于 1，当前工作区已通过依赖补丁包含上一轮成果；只修复 listed unresolved 项，不要重复已完成工作。
+```json
+{round_context}
+```
+
 ## 上游成果摘要（result sync，不是完整上下文）
 只接收依赖任务的压缩摘要；不要假设未列出的细节。
 ```json
@@ -346,10 +368,14 @@ class PromptBuilder:
 
     # -- planning ----------------------------------------------------------
     def write_plan_request(self, *, plan_id: str, goal: str, main_agent: AgentRecord,
-                           model: str, context: dict[str, Any]) -> tuple[Path, Path]:
+                           model: str, context: dict[str, Any],
+                           output_path: Path | None = None,
+                           workspace: str = "", gui_mode: bool = False,
+                           round_context: dict[str, Any] | None = None) -> tuple[Path, Path]:
         directory = ensure_dir(self.paths.planning / plan_id)
         prompt_path = directory / "plan_request.md"
         plan_path = directory / "plan.json"
+        target_path = Path(output_path) if output_path else plan_path
         write_json(directory / "plan-template.json", PLAN_TEMPLATE)
         write_json(directory / "plan-schema.json", {
             "required": ["plan_version", "goal", "tasks"],
@@ -366,6 +392,7 @@ class PromptBuilder:
                 "type=implementation/documentation 的任务必须有非空 scope",
                 "type=architecture 只产出架构判断；若需落地文档请另建 documentation 任务",
                 "每个任务只做一件事，可独立验收",
+                "role 取 explore/research/implement/review/write/verify；必须与 suggested_agent 的协作契约一致",
                 "priority 0..10，越大越先执行；依赖仍优先于优先级",
                 "不得把需要人工审批的高风险操作写成自动执行",
             ],
@@ -373,6 +400,49 @@ class PromptBuilder:
         agents_text = json.dumps(context.get("agents", []), ensure_ascii=False, indent=2)
         memory_text = json.dumps(context.get("memories", []), ensure_ascii=False, indent=2)
         conversations = json.dumps(context.get("recent_conversations", []), ensure_ascii=False, indent=2)
+        collaboration = context.get("collaboration") or {}
+        collab_text = json.dumps(collaboration, ensure_ascii=False, indent=2)
+        collab_block = ""
+        if collaboration.get("sub_agents"):
+            sub_names = ", ".join(
+                f"{a.get('agent_id')}（{a.get('model')}）"
+                for a in collaboration.get("sub_agents") or []
+            )
+            collab_block = f"""## 协作契约（强制）
+用户已明确本次只用下列执行者，请严格按角色分配 `suggested_agent` 与 `role`：
+
+```json
+{collab_text}
+```
+
+- 主节点 `{collaboration.get('main_agent_id')}` 只负责 plan / review / summarize；
+  不要给它分配 implementation / documentation / verification / analysis 任务。
+- 子 Agent 只允许：{sub_names}。
+- role=explore / research / implement / write / verify 的任务必须交给子 Agent；
+  role=review 的任务交给主节点。
+- 每个任务都要填写 `role`（explore/research/implement/review/write/verify），
+  并把 `suggested_agent` 写成上面真实存在的 agent_id。
+- 任务数量控制在 6-8 个；不要把同一目标拆成多个重复实现任务。
+"""
+        gui_block = ""
+        if gui_mode:
+            gui_block = f"""## GUI 执行方式（重要）
+- 你正在通过 GUI Agent 执行本规划请求；工作区是 `{workspace}`。
+- 本步骤只做规划：不要创建实现文件，不要运行构建或测试。
+- 把计划 JSON 写入 `{target_path}`（该路径位于工作区内）。
+- 在最终聊天回复中再给出一个完整 JSON 代码块（以 ```json 开始），不要输出其他解释文字。
+"""
+        round_block = ""
+        if round_context:
+            round_block = f"""## 多轮续跑上下文（强制）
+这是第 {round_context.get('round', '?')} / {round_context.get('max_rounds', '?')} 轮。
+上一轮没有满足目标，不要重复已经完成的工作。只规划解决下列未解决项所需的最小任务图；
+可写任务必须给出最小必要 scope，并依赖上一轮相关任务（系统会自动补上上轮补丁依赖）。
+
+```json
+{json.dumps(round_context, ensure_ascii=False, indent=2)}
+```
+"""
         prompt = f"""# AgentMesh OS 主节点规划请求
 
 你是用户指定的主节点 Agent：{main_agent.name}（{main_agent.agent_id}），模型：{model or "用户指定"}。
@@ -400,6 +470,8 @@ class PromptBuilder:
 {agents_text}
 ```
 
+{collab_block}
+{round_block}
 ## 规划规则
 - 只输出任务图，不要直接执行任务。
 - 任务粒度应可独立验收；实现类任务必须写清允许修改的 scope。
@@ -410,9 +482,10 @@ class PromptBuilder:
 - 不虚构项目事实；不确定时在任务中写明“先核实”。
 
 ## 输出（强制）
+{gui_block}
 将符合计划的 JSON 写入：
 
-`{plan_path}`
+`{target_path}`
 
 必填结构：
 ```json
@@ -426,11 +499,20 @@ class PromptBuilder:
 
     # -- summary -----------------------------------------------------------
     def write_summary_request(self, *, run_id: str, main_agent: AgentRecord, model: str,
-                              context: dict[str, Any]) -> tuple[Path, Path]:
+                              context: dict[str, Any], output_path: Path | None = None,
+                              workspace: str = "", gui_mode: bool = False) -> tuple[Path, Path]:
         directory = ensure_dir(self.paths.run_dir(run_id) / "summary")
         prompt_path = directory / "summary_request.md"
         summary_path = directory / "summary.json"
+        target_path = Path(output_path) if output_path else summary_path
         write_json(directory / "summary-template.json", SUMMARY_TEMPLATE)
+        gui_block = ""
+        if gui_mode:
+            gui_block = f"""## GUI 执行方式（重要）
+- 你正在通过 GUI Agent 执行汇总；工作区是 `{workspace}`。
+- 把汇总 JSON 写入 `{target_path}`（该路径位于工作区内）。
+- 在最终聊天回复中再给出一个完整 JSON 代码块（以 ```json 开始），不要输出其他解释文字。
+"""
         prompt = f"""# AgentMesh OS 主节点汇总请求
 
 你是主节点 Agent：{main_agent.name}（{main_agent.agent_id}），模型：{model or "用户指定"}。
@@ -446,11 +528,19 @@ class PromptBuilder:
 - 汇总修改内容、验证结论、剩余风险、是否建议合并。
 - 这是合并前的预汇总：不要因为“主工作区尚未应用补丁/仍处于基线”而判定失败；补丁应用与后置验证由合并阶段负责，合并后控制平面会重写最终汇总。
 - 若有未解决项或任务验证失败，merge_recommendation 必须为 reject。
+- `goal_status` 只能取 complete / continue / blocked：
+  * 只有全部验收条件真正满足、证据充分时才写 complete；
+  * 目标尚未完成、还有可执行修复工作，写 continue，并把修复项逐条写入 next_actions；
+  * 只有同一阻塞条件已经连续多轮无法推进时才写 blocked，并在 blocking_reason 写具体阻塞条件。
+    难度、不确定、还有剩余工作都不算 blocked。
+- next_actions 会被控制平面用于自动规划下一轮；必须是可执行、最小、带文件/行为定位的动作，不要写“继续优化”这类空泛描述。
+- 多轮上下文会以 `round` 字段提供；同一阻塞条件重复时控制平面会提前停止，不要重复上一轮已经验证失败的方案。
 
 ## 输出（强制）
+{gui_block}
 将以下结构的 JSON 写入：
 
-`{summary_path}`
+`{target_path}`
 
 ```json
 {json.dumps(SUMMARY_TEMPLATE, ensure_ascii=False, indent=2)}

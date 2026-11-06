@@ -32,6 +32,13 @@ GUI_ERROR_CODES: dict[str, str] = {
     "MODEL_GUI_FORBIDDEN": "零鼠标模式禁止使用 GUI 模型切换",
     "MODEL_MISMATCH": "回读的实际模型与请求不一致",
     "INTERFACE_WRITE_FAILED": "程序接口写入失败",
+    "APP_RESTART_REQUIRED": "应用正在运行但没有开放程序接口，需要用户确认重启",
+    "MANUAL_ACTION_REQUIRED": "节点需要用户在 Agent 应用内手动提交或审批",
+    "APP_BUSY": "Agent 应用仍有其他任务在运行，需要等待或先停止",
+    "APP_LOGIN_REQUIRED": "Agent 应用未登录，需要先在应用内登录",
+    "MODEL_STREAM_ERROR": "模型流在应用内中断（上游返回错误/空流）",
+    "GUI_CANCELED": "任务在 Agent 应用内被用户中断",
+    "PROFILE_SYNC_FAILED": "模型上下文/能力等级未能写入 Agent 应用",
 }
 
 

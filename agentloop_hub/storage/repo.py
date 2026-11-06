@@ -483,16 +483,22 @@ class Store:
     # Runs
     # ------------------------------------------------------------------
     def create_run(self, project_id: str, plan_id: str, *, main_agent: str, model: str,
-                   base_commit: str, base_branch: str, status: str = "ready") -> str:
+                   base_commit: str, base_branch: str, status: str = "ready",
+                   round_number: int = 1, max_rounds: int = 0,
+                   goal_status: str = "active") -> str:
         run_id = new_id("run")
         self.db.execute(
             "INSERT INTO runs(run_id, project_id, plan_id, status, main_agent_id, model, "
-            "base_commit, base_branch, created_at, started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "base_commit, base_branch, round_number, max_rounds, goal_status, "
+            "created_at, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, project_id, plan_id, status, main_agent, model, base_commit, base_branch,
+             int(round_number), int(max_rounds), goal_status,
              now_iso(), now_iso() if status == "running" else ""),
         )
         self.emit("workflow", {"run_id": run_id, "plan_id": plan_id, "status": status,
-                               "main_agent_id": main_agent, "model": model},
+                               "main_agent_id": main_agent, "model": model,
+                               "round_number": int(round_number),
+                               "max_rounds": int(max_rounds)},
                   correlation_id=run_id)
         return run_id
 
@@ -517,6 +523,7 @@ class Store:
         allowed = {
             "status", "summary", "error", "started_at", "finished_at", "main_agent_id", "model",
             "acceptance_status", "release_status", "acceptance_at", "release_at",
+            "round_number", "max_rounds", "goal_status", "blocked_reason",
         }
         assignments = []
         values = []
@@ -529,41 +536,58 @@ class Store:
             return
         values.append(run_id)
         self.db.execute(f"UPDATE runs SET {', '.join(assignments)} WHERE run_id=?", values)
-        if "status" in fields or "acceptance_status" in fields or "release_status" in fields:
+        if ("status" in fields or "acceptance_status" in fields or "release_status" in fields
+                or "round_number" in fields or "goal_status" in fields):
             self.emit("workflow", {
                 "run_id": run_id,
                 "status": fields.get("status"),
                 "acceptance_status": fields.get("acceptance_status"),
                 "release_status": fields.get("release_status"),
+                "round_number": fields.get("round_number"),
+                "max_rounds": fields.get("max_rounds"),
+                "goal_status": fields.get("goal_status"),
+                "blocked_reason": fields.get("blocked_reason"),
             }, correlation_id=run_id)
 
     # ------------------------------------------------------------------
     # Tasks
     # ------------------------------------------------------------------
-    def create_tasks(self, run_id: str, plan: TaskPlan, base_commit: str) -> list[Task]:
+    def create_tasks(self, run_id: str, plan: TaskPlan, base_commit: str,
+                     specs: list[TaskSpec] | None = None) -> list[Task]:
         tasks: list[Task] = []
         now = now_iso()
         with self.db.transaction() as conn:
-            for spec in plan.topological_order():
+            for spec in (specs if specs is not None else plan.topological_order()):
                 uid = f"{run_id}:{spec.task_id}"
                 conn.execute(
                     """
                     INSERT INTO tasks(uid, project_id, plan_id, run_id, task_id, parent_task_id, title,
-                        objective, type, suggested_agent, scope, out_of_scope, dependencies, required_capabilities,
+                        objective, type, role, model, suggested_agent, assigned_agent,
+                        scope, out_of_scope, dependencies,
+                        required_capabilities,
                         input_artifacts, expected_outputs, acceptance_criteria, verification_commands,
                         token_budget, time_limit_minutes, retry_limit, risk_level, approval_policy,
-                        priority, status, created_at, updated_at, base_commit)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        priority, context_length, capability_level,
+                        status, created_at, updated_at, base_commit)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         uid, plan.project_id, plan.plan_id, run_id, spec.task_id, spec.parent_task_id,
-                        spec.title, spec.objective, spec.type, spec.suggested_agent, _dumps(spec.scope),
+                        spec.title, spec.objective, spec.type, spec.role, spec.model,
+                        spec.suggested_agent,
+                        # A pinned model is an explicit chain binding; show the
+                        # effective agent immediately. Unpinned tasks stay blank
+                        # so the capability router can still choose.
+                        (spec.suggested_agent if spec.model else ""),
+                        _dumps(spec.scope),
                         _dumps(spec.out_of_scope), _dumps(spec.dependencies),
                         _dumps(spec.required_capabilities), _dumps(spec.input_artifacts),
                         _dumps(spec.expected_outputs), _dumps(spec.acceptance_criteria),
                         _dumps(spec.verification_commands), int(spec.token_budget),
                         int(spec.time_limit_minutes), int(spec.retry_limit), spec.risk_level,
-                        spec.approval_policy, int(spec.priority), TaskStatus.QUEUED.value,
+                        spec.approval_policy, int(spec.priority),
+                        int(spec.context_length or 0), spec.capability_level or "",
+                        TaskStatus.QUEUED.value,
                         now, now, base_commit,
                     ),
                 )
@@ -577,7 +601,8 @@ class Store:
     def _task_from_row(self, row: dict[str, Any]) -> Task:
         spec = TaskSpec(
             task_id=row["task_id"], title=row["title"], objective=row["objective"],
-            type=row["type"], suggested_agent=row["suggested_agent"], parent_task_id=row["parent_task_id"],
+            type=row["type"], role=str(row.get("role") or ""), model=str(row.get("model") or ""),
+            suggested_agent=row["suggested_agent"], parent_task_id=row["parent_task_id"],
             scope=_j(row["scope"], []), out_of_scope=_j(row["out_of_scope"], []),
             dependencies=_j(row["dependencies"], []),
             required_capabilities=_j(row["required_capabilities"], []),
@@ -588,6 +613,8 @@ class Store:
             token_budget=int(row["token_budget"]), time_limit_minutes=int(row["time_limit_minutes"]),
             retry_limit=int(row["retry_limit"]), risk_level=row["risk_level"],
             approval_policy=row["approval_policy"], priority=int(row.get("priority", 5) or 5),
+            context_length=int(row.get("context_length", 0) or 0),
+            capability_level=str(row.get("capability_level") or ""),
         )
         return Task(
             uid=row["uid"], project_id=row["project_id"], plan_id=row["plan_id"],
@@ -623,6 +650,7 @@ class Store:
         allowed = {
             "assigned_agent", "attempts", "workdir", "task_dir", "base_commit", "patch_path",
             "result_path", "verification_status", "error", "pid", "started_at", "finished_at",
+            "role", "model", "suggested_agent", "context_length", "capability_level",
         }
         assignments = []
         values: list[Any] = []
@@ -645,13 +673,25 @@ class Store:
         if not force:
             assert_task_transition(task.status, status)
         fields: dict[str, Any] = {"status": status}
-        if error:
+        if status in {
+            TaskStatus.COMPLETED.value, TaskStatus.QUEUED.value,
+            TaskStatus.RUNNING.value, TaskStatus.VERIFYING.value,
+        }:
+            # A new attempt or a completed node must not keep the previous
+            # attempt's stall/block message in the UI.
+            fields["error"] = error or ""
+        elif error:
             fields["error"] = error
         if status == TaskStatus.RUNNING.value and not task.started_at:
             fields["started_at"] = now_iso()
         if status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.REJECTED.value,
                       TaskStatus.CANCELED.value}:
             fields["finished_at"] = now_iso()
+        elif status in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value,
+                        TaskStatus.VERIFYING.value, TaskStatus.WAITING_USER.value}:
+            # A retried/running node must not keep the previous attempt's
+            # finished_at, which made the UI show "running" with an end time.
+            fields["finished_at"] = ""
         assignments = [f"{k}=?" for k in fields]
         values = list(fields.values())
         assignments.append("updated_at=?")

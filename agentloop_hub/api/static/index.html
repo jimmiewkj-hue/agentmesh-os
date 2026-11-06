@@ -90,13 +90,37 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
 .console{background:#0b1220;color:#cbd5e1;font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;height:340px;overflow:auto;padding:10px 12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}
 .console .bus{color:#93c5fd}.console .logs{color:#cbd5e1}.console .sys{color:#34d399}.console .err{color:#fca5a5}
 .banner{border:1px dashed #fcd34d;background:#fffbeb;color:#92400e;padding:12px;border-radius:8px;margin-bottom:12px}
-.models-row{display:grid;grid-template-columns:1.2fr .9fr 1fr auto auto;gap:8px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--line)}
+.models-row{display:grid;grid-template-columns:1.1fr .9fr .8fr .7fr .7fr auto auto;gap:8px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--line)}
 @media(max-width:1100px){.models-row{grid-template-columns:1fr}}
 .drift{border-left:3px solid #f59e0b;background:#fffbeb;padding:10px 12px;border-radius:6px;margin-bottom:8px}
 .timeline{border-left:2px solid var(--line);padding-left:12px;margin-left:6px}
 .timeline .item{margin:0 0 12px;position:relative}
 .timeline .dot{position:absolute;left:-17px;top:5px;width:8px;height:8px;border-radius:50%;background:var(--accent)}
 .small-text{font-size:12px}
+.modal-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:120}
+.modal{background:var(--panel);border-radius:12px;padding:16px;width:min(760px,94vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(15,23,42,.25)}
+.dirlist{overflow:auto;max-height:46vh;border:1px solid var(--line);border-radius:8px;background:#fff}
+.dirrow{display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--line);cursor:pointer;font-size:13px}
+.dirrow:last-child{border-bottom:0}
+.dirrow:hover{background:#f5f7ff}
+.dirrow.sel{background:#eef2ff}
+.dirrow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dirrow .meta{color:var(--muted);font-size:12px;white-space:nowrap}
+.crumbs{display:flex;gap:4px;align-items:center;flex-wrap:wrap;font-size:12px;overflow:hidden}
+.crumbs a{color:var(--accent);text-decoration:none;cursor:pointer}
+.crumbs span.sep{color:var(--muted)}
+.recent-chip{font-size:12px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;cursor:pointer;background:#fff;color:var(--ink)}
+.recent-chip:hover{border-color:var(--accent);color:var(--accent)}
+.recent-chip .miss{color:var(--muted);text-decoration:line-through}
+.block-alert{position:fixed;right:22px;top:76px;z-index:60;width:min(520px,calc(100vw - 44px));
+  border:1px solid #fecaca;border-left:6px solid #dc2626;border-radius:12px;background:#fff7f7;
+  box-shadow:0 18px 48px rgba(127,29,29,.22);padding:14px 16px}
+.block-alert.hidden{display:none}
+.block-alert h3{margin:0 0 4px;color:#991b1b;font-size:15px}
+.block-alert .item{border-top:1px dashed #fecaca;padding:8px 0;font-size:13px}
+.block-alert .item:first-of-type{border-top:0}
+.block-alert .mono{word-break:break-all}
+.chain-row .del{padding:6px 9px;border-color:#fecaca;color:#b91c1c;background:#fff}
 </style>
 </head>
 <body>
@@ -110,6 +134,7 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
     <a href="#agents" data-view="agents">Agent 管理</a>
     <a href="#versions" data-view="versions">Agent 版本</a>
     <a href="#graph" data-view="graph">任务图</a>
+    <a href="#roles" data-view="roles">角色路由</a>
     <a href="#task" data-view="task">任务详情</a>
     <a href="#approvals" data-view="approvals">人类治理</a>
     <a href="#bus" data-view="bus">Context Bus</a>
@@ -126,6 +151,34 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
     <div class="row" id="topBadges"></div>
   </header>
 
+  <div id="blockAlert" class="block-alert hidden" role="alertdialog" aria-live="assertive"></div>
+  <div id="bindingModal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal" style="width:min(520px,94vw)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 id="bindingTitle" style="margin:0">编辑节点绑定</h3>
+        <button class="small" onclick="closeBindingEditor()">关闭</button>
+      </div>
+      <div class="sub" id="bindingInfo" style="margin:6px 0 12px"></div>
+      <label>Agent</label>
+      <select id="bindingAgent" onchange="onBindingAgentChange()"></select>
+      <label>模型（真实清单）</label>
+      <select id="bindingModel" onchange="onBindingModelChange()"></select>
+      <div class="row" style="gap:8px;margin-top:8px">
+        <div class="grow"><label>上下文长度（tokens，0=默认）</label>
+          <input id="bindingContext" type="number" min="0"></div>
+        <div class="grow"><label>能力等级</label>
+          <select id="bindingCapability"></select></div>
+      </div>
+      <div class="row" style="margin-top:14px;justify-content:flex-end">
+        <button onclick="closeBindingEditor()">取消</button>
+        <button class="primary" onclick="saveBindingEditor()">保存绑定</button>
+      </div>
+    </div>
+  </div>
+  <div id="jsError" style="display:none;position:fixed;left:16px;bottom:16px;z-index:80;
+       max-width:70vw;background:#7f1d1d;color:#fff;padding:8px 12px;border-radius:8px;
+       font:12px/1.4 Consolas,monospace;white-space:pre-wrap"></div>
+
   <section class="section active" id="view-command">
     <div id="workspaceBanner"></div>
 
@@ -133,10 +186,12 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
       <div class="step-head"><div class="step-no">1</div><div><h3>项目目录</h3><div class="sub">创建或打开一个 Git 项目；AgentMesh 数据保存在项目内 .agentloop/。</div></div></div>
       <div class="row">
         <input id="wsPath" class="grow" placeholder="例如 D:\projects\my-app">
+        <button onclick="openDirPicker()">浏览…</button>
         <input id="wsName" placeholder="项目名称（可选）" style="max-width:200px">
         <button class="primary" onclick="initWorkspace()">初始化项目</button>
         <button onclick="openWorkspace()">打开已有项目</button>
       </div>
+      <div class="row" id="recentBox" style="margin-top:8px"></div>
       <div class="row" style="margin-top:8px">
         <input id="budgetTokens" type="number" min="0" placeholder="Token 预算：0 = 不限（仅统计，不会自动停止任务）" style="max-width:320px">
         <button onclick="saveBudget()">保存预算</button>
@@ -158,6 +213,27 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
 
     <div class="card step">
       <div class="step-head"><div class="step-no">3</div><div><h3>指挥中心：主 / 子 Agent 与模型</h3><div class="sub">模型列表全部来自本机真实探测或用户登记，不虚构。主 Agent 负责规划，子 Agent 参与任务调度。</div></div></div>
+      <div class="check" style="margin:2px 0 12px">
+        <label class="row" style="gap:8px;align-items:flex-start">
+          <input type="checkbox" id="fullControl" checked onchange="saveFullControl()">
+          <span><b>完全控制</b>（默认勾选）
+            <div class="sub">开启后，各 GUI Agent 会切到自己的完全访问模式，并通过应用自身接口自动接受工作区外读取/命令等确认；关闭后按 Agent 默认权限，由你手动确认。</div>
+          </span>
+        </label>
+        <span class="sub" id="fullControlInfo"></span>
+      </div>
+      <div class="check" style="margin:2px 0 12px">
+        <label class="row" style="gap:8px;align-items:flex-start">
+          <input type="checkbox" id="multiRound" checked onchange="saveMultiRound()">
+          <span><b>多轮自动续跑</b>（默认勾选）
+            <div class="sub">一轮未通过时，主节点基于上一轮结论重新规划并继续执行，直到通过、重复卡死或达到上限。最大轮次（含首轮）：
+              <input type="number" id="maxRounds" min="1" max="20" value="3"
+                     style="width:64px" onchange="saveMultiRound()">
+            </div>
+          </span>
+        </label>
+        <span class="sub" id="multiRoundInfo"></span>
+      </div>
       <div class="grid two">
         <div>
           <h3>主 Agent</h3>
@@ -167,6 +243,12 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
           <select id="mainModelSelect" onchange="syncMainCustom()"></select>
           <label>或手填模型名</label>
           <input id="mainModel" placeholder="provider/model">
+          <div class="row" style="gap:8px">
+            <div class="grow"><label>上下文长度（tokens，0=默认）</label>
+              <input id="mainContext" type="number" min="0" placeholder="来自该模型的真实选项"></div>
+            <div class="grow"><label>能力等级</label>
+              <select id="mainCapability"></select></div>
+          </div>
           <label>主节点预算（tokens，0 表示使用项目预算）</label>
           <input id="mainBudget" type="number" min="0" value="0">
           <div class="row" style="margin-top:10px">
@@ -191,20 +273,29 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
     </div>
 
     <div class="card step">
-      <div class="step-head"><div class="step-no">3.5</div><div><h3>多 Agent 链路（工作区 / Agent / 模型固定）</h3><div class="sub">每个阶段锁定一个 Agent 与该 Agent 真实模型清单中的模型；执行只经应用自身软件接口（store / CLI / CDP），不合成 OS 键鼠。</div></div></div>
-      <textarea id="chainGoal" placeholder="链路目标">用三步完成一次代码巡检：扫描当前项目 → 检查缺陷 → 生成测试。</textarea>
+      <div class="step-head"><div class="step-no">3.5</div><div><h3>多 Agent 链路配置（绑定计划，第 4 步统一审批与启动）</h3><div class="sub">阶段数量跟随第 2 步生成的计划任务，可增删；每个阶段锁定一个 Agent 与该 Agent 真实模型清单中的模型。这里只保存配置，不会执行。执行唯一入口：第 4 步批准计划 → 开始执行。</div></div></div>
+      <textarea id="chainGoal" placeholder="链路目标（从计划载入时使用计划目标）" oninput="chainFieldChanged()">用三步完成一次代码巡检：扫描当前项目 → 检查缺陷 → 生成测试。</textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="small" onclick="loadChainFromPlan()">从计划载入阶段</button>
+        <button class="small" onclick="addChainStage()">添加阶段</button>
+        <button class="small" onclick="resetChain()">重置阶段</button>
+        <span class="sub" id="chainPlanInfo"></span>
+      </div>
       <div id="chainStages" style="margin-top:10px"></div>
       <div class="row" style="margin-top:10px">
-        <select id="chainPolicy" style="max-width:150px" title="选型策略">
+        <select id="chainPolicy" style="max-width:150px" title="选型策略" onchange="chainFieldChanged()">
           <option value="cost_first">最省优先</option>
           <option value="balanced" selected>均衡</option>
           <option value="quality_first">效果优先</option>
         </select>
-        <button class="primary" onclick="runChain()">配置并运行链路</button>
+        <button class="primary" onclick="saveChainConfig()">保存链路配置（待审批）</button>
         <button onclick="autoSelectChain()">智能选型</button>
         <button onclick="preflightChain()">预检并打开 Agent</button>
-        <button onclick="renderChain()">重置阶段</button>
         <span class="sub" id="chainStatus"></span>
+      </div>
+      <div class="sub" style="margin-top:8px;padding:8px 10px;background:#eef6ff;border-radius:8px">
+        执行逻辑已统一：<b>3.5 保存配置</b> → <b>4 批准计划</b> → <b>4 开始执行</b>。
+        “配置并运行链路”不再自动批准或自动启动。
       </div>
       <div id="chainRecommend" class="sub" style="margin-top:8px"></div>
       <div id="chainPreflight" style="margin-top:10px"></div>
@@ -212,7 +303,7 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
     </div>
 
     <div class="card step">
-      <div class="step-head"><div class="step-no">4</div><div><h3>计划审批与运行</h3><div class="sub">架构设计 → 计划批准 → 执行 → 验收 → 合并 → 发布，每一步都由你决定。</div></div></div>
+      <div class="step-head"><div class="step-no">4</div><div><h3>计划审批与运行（唯一执行入口）</h3><div class="sub">架构设计 → 计划批准 → 开始执行 → 验收 → 合并 → 发布。节点需要人工提交/审批时，这里会阻塞并弹窗提醒；节点完成后自动继续下一节点。</div></div></div>
       <div class="grid two">
         <div>
           <h3>待审批</h3>
@@ -223,6 +314,10 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
           <div id="commandRun"></div>
         </div>
       </div>
+      <h3 style="margin-top:14px">主节点活动</h3>
+      <div id="mainActivity"></div>
+      <h3 style="margin-top:14px">链路节点</h3>
+      <div id="commandChainNodes"></div>
       <h3 style="margin-top:14px">计划列表</h3>
       <div id="commandPlans"></div>
     </div>
@@ -282,6 +377,28 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
     </div>
     <div class="card"><h3>版本台账</h3><div id="versionTable"></div></div>
     <div class="card"><h3>版本历史</h3><div id="versionHistory" class="muted">点击上表“历史”查看某个 Agent 的版本记录。</div></div>
+  </section>
+
+  <section class="section" id="view-roles">
+    <div class="card">
+      <h3>角色路由 <span class="sub">一个角色 = 一条 (成本档位 → Agent → 模型) 阶梯，模型只从本机真实目录解析</span></h3>
+      <div class="sub">执行模型负责干活（走免费额度），统帅模型只做规划/审阅/汇总。留空则按策略默认阶梯自动选。</div>
+      <div class="grid two" style="margin-top:10px">
+        <label>需求<textarea id="solveGoal" rows="4" placeholder="例如：修复 calc.py 的加法错误并补充测试"></textarea></label>
+        <div>
+          <label>执行模型 <input id="solveExecutor" placeholder="agent:model，例如 qoder_cn:DeepSeek-Flash"></label>
+          <label>统帅模型 <input id="solveCommander" placeholder="agent:model，例如 workbuddy:deepseek-v4-pro"></label>
+          <div class="row" style="margin-top:8px">
+            <button onclick="previewSegment()">只看切分</button>
+            <button class="primary" onclick="runSolve()">运行并汇总</button>
+            <button onclick="loadRoles(true)">刷新策略</button>
+          </div>
+        </div>
+      </div>
+      <div id="segmentResult" style="margin-top:12px"></div>
+    </div>
+    <div class="card"><h3>策略与候选阶梯</h3><div id="rolePolicy" class="muted">加载中…</div></div>
+    <div class="card"><h3>最终答案</h3><div id="solveResult" class="muted">运行后在这里显示汇总结果。</div></div>
   </section>
 
   <section class="section" id="view-graph">
@@ -380,6 +497,54 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
   <div class="toast" id="toast"></div>
 </main>
 </div>
-<script src="app.js"></script>
+
+<div class="modal-mask" id="dirModal" style="display:none">
+  <div class="modal">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h3 style="margin:0">选择工作目录</h3>
+      <button class="small" onclick="closeDirPicker()">关闭</button>
+    </div>
+    <div class="sub" style="margin:4px 0 10px">浏览本机目录；双击进入，单击选中。仅本机可访问。</div>
+    <div class="row" style="margin-bottom:6px">
+      <button class="small" onclick="dirUp()">↑ 上一级</button>
+      <button class="small" onclick="dirHome()">主目录</button>
+      <button class="small" onclick="dirToggleHidden()" id="dirHiddenBtn">显示隐藏项</button>
+      <div class="crumbs grow" id="dirCrumbs"></div>
+    </div>
+    <div class="row" style="margin-bottom:6px">
+      <input id="dirPathInput" class="grow" placeholder="绝对路径，回车前往">
+      <button class="small" onclick="dirGo()">前往</button>
+    </div>
+    <div class="row" id="dirRoots" style="flex-wrap:wrap;margin-bottom:6px"></div>
+    <div class="dirlist" id="dirList"></div>
+    <div class="row" style="justify-content:space-between;margin-top:10px;align-items:center">
+      <div class="row">
+        <input id="dirNewName" placeholder="新建文件夹名" style="max-width:180px">
+        <button class="small" onclick="dirMkdir()">新建</button>
+      </div>
+      <div class="row" style="align-items:center">
+        <span class="sub" id="dirSelected">未选择</span>
+        <button class="primary" onclick="dirConfirm()">选择此目录</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=20261105-18"></script>
+<script>
+window.addEventListener('error', (e) => {
+  var box = document.getElementById('jsError');
+  if (!box) return;
+  box.style.display = 'block';
+  box.textContent = '页面脚本错误：' + (e.message || e.error || 'unknown')
+    + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '');
+});
+window.addEventListener('unhandledrejection', (e) => {
+  var box = document.getElementById('jsError');
+  if (!box) return;
+  box.style.display = 'block';
+  box.textContent = '页面脚本异常：' + ((e.reason && (e.reason.message || e.reason)) || 'unknown');
+});
+</script>
 </body>
 </html>

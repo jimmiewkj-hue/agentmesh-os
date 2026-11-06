@@ -201,3 +201,35 @@ opencode run -m opencode/glm-5.3-flash-free "只回复一行..."
 3. **GUI 子进程生命周期**：从工具会话直接启动的 GUI 进程会随父进程结束；生产使用应由常驻的 `agentmesh serve` 进程拉起。
 4. **ZCode / DSH / Cursor**：只做到状态库读取与工作区事实确认，未找到零输入发送通道，未做任何输入合成。
 5. **未安装的 4 款 CLI**：`claude_code` / `gemini_cli` / `codex_cli` / `aider` 仅登记公开 CLI 参数，未在本机验证。
+
+---
+
+## 权限确认与完全控制（2026-11-04）
+
+详细行为、边界与证据见 [完全控制与权限自动接受](完全控制与权限自动接受.md)。
+
+### Trae CN / Trae
+
+- 触发按钮：`button[data-permission-mode-trigger="true"]`，`aria-label` 即当前模式。
+- 菜单：`.permissionModePopover-*`；选项 `.permissionModeItem-*`，名称节点 `.permissionModeItemName-*`：
+  `手动审批` / `自动审批` / `完全访问` / `自定义`。
+- 切“完全访问”会弹确认框：容器 `.dialog-*`，标题 `启用完全访问？`，按钮 `取消` / `启用`；
+  点击“启用”后回读 trigger `aria-label=完全访问`。
+- 实测：手动审批 → 完全访问成功（`logs/ui-e2e-20261104/trae-full-access-test.log`）。
+
+### WorkBuddy
+
+- 任务 deeplink 的 `permissionMode=fullAccess` 会在 `workbuddy.db` 回读为 `permission_mode=fullAccess`；
+  这是任务级权限，不依赖输入区开关。
+- 输入区 `.cr-permission-setting` 显示 `允许完全访问` / `默认权限`，弹层 `.cr-permission-panel`，
+  开关为 `input[role="switch"][aria-label="允许完全访问"]`。
+- 文件安全弹窗（实拍）：`读取文件命令询问规则，需要确认。` / `允许读取` / `本次会话内始终允许` / `拒绝`。
+  该弹窗由文件安全规则触发，规则可能在用户点过“始终允许”后不再出现。
+
+### Qoder CN
+
+- 会话权限：`%APPDATA%\com.qodercn.app.stable\main.sqlite` → `chat_sessions.permission_mode`；
+  活动会话实测 `bypassPermissions`（UI 文案“完全访问”）。
+- 模式：`每次询问=acceptEdits`、`自动审批=auto`、`完全访问=bypassPermissions`。
+- 确认卡文案：`高危操作` / `允许“{{toolName}}”？` / `拒绝` / `允许` / `允许一次`；
+  建议项 `本次任务允许` / `始终允许`。

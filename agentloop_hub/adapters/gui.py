@@ -19,11 +19,16 @@ from typing import Any
 
 from ..control.interfaces import (
     ensure_workbuddy_cdp, prepare_qoder_session, prepare_workbuddy_task,
-    qoder_model_key, set_model_programmatically, verify_qoder_session,
-    verify_workbuddy_task, workbuddy_model_key,
+    qoder_model_key, set_model_programmatically, sync_qoder_model_profile,
+    sync_workbuddy_session_profile, verify_qoder_session, verify_workbuddy_task,
+    workbuddy_model_key, workbuddy_user_id,
 )
 from ..control import trae_interface
 from ..control.zero_input import os_input_allowed
+from ..gui.permissions import (
+    APP_LABELS, PermissionWatcher, ensure_trae_full_access,
+    ensure_workbuddy_full_access,
+)
 from ..gui import (
     GUI_ERROR_CODES, GuiAutomationError, GuiProfile, GuiReply, WindowsGuiDriver,
     create_reader, find_window, profile_for_app, resolve_model_key,
@@ -44,6 +49,7 @@ class GuiAutomationAdapter(BaseAdapter):
         super().__init__(agent, config)
         self._driver = driver
         self._reader = reader
+        self.full_control = False
         self.no_gui = (str(self.config.get("no_gui_fallback") or "").lower() in ("1", "true", "yes")
                        or os.environ.get("AGENTMESH_DISABLE_GUI_INPUT") == "1")
         self.qoder_cdp_port = int(
@@ -71,6 +77,18 @@ class GuiAutomationAdapter(BaseAdapter):
         self.allow_gui_model_fallback = str(
             self.config.get("allow_gui_model_fallback") or ""
         ).lower() in ("1", "true", "yes")
+        # Restarting a running desktop app is a user-visible action.  Execution
+        # never does it unless the operator explicitly opted in; otherwise the
+        # task blocks with APP_RESTART_REQUIRED and the WebUI asks the user.
+        self.allow_app_restart = str(
+            self.config.get("allow_app_restart")
+            or os.environ.get("AGENTMESH_ALLOW_APP_RESTART") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self.manual_wait_seconds = int(
+            self.config.get("manual_wait_seconds")
+            or os.environ.get("AGENTMESH_MANUAL_WAIT_SECONDS")
+            or 1800
+        )
 
     # -- public contract -------------------------------------------------
     def execute(self, request: ExecutionRequest) -> ExecutionOutcome:
@@ -84,7 +102,11 @@ class GuiAutomationAdapter(BaseAdapter):
         screenshots: list[str] = []
         reply: GuiReply | None = None
         driver = self._driver
+        watcher: PermissionWatcher | None = None
+        self.full_control = bool(getattr(request, "full_control", True))
         interface_info: dict[str, Any] = {"method": "gui"}
+        sent = False
+        manual: dict[str, Any] | None = None
         try:
             profile = self._profile()
             prompt_text = read_text(request.prompt_path)
@@ -97,9 +119,38 @@ class GuiAutomationAdapter(BaseAdapter):
             )
             driver = driver or WindowsGuiDriver(profile, self.config, log_path=log_path)
             reader = self._reader or create_reader(profile, self.config)
+            if hasattr(reader, "cancel_event"):
+                reader.cancel_event = request.cancel_event
+            if profile.app == "workbuddy" and hasattr(reader, "cdp_port"):
+                reader.cdp_port = self.workbuddy_cdp_port
+            if hasattr(reader, "completion_path"):
+                # GUI planning/task result files are unique per request; a
+                # complete JSON file is an unambiguous done signal even when
+                # Trae reuses a session whose messageIds no longer grow.
+                reader.completion_path = str(request.result_path)
             interface_info = self._prepare_interface(
                 profile, request, prompt_with_marker, marker, log_path, started_epoch,
             )
+            interface_info["full_control"] = self.full_control
+            if self.full_control:
+                full_access: dict[str, Any] = {}
+                if profile.app == "trae_cn" or profile.app == "trae":
+                    full_access = ensure_trae_full_access(
+                        port=self.trae_cdp_port, log_path=log_path)
+                if full_access:
+                    _log(log_path, "full_access", app=profile.app, **full_access)
+                    interface_info["full_access"] = full_access
+                if profile.app in APP_LABELS:
+                    port = {
+                        "trae_cn": self.trae_cdp_port, "trae": self.trae_cdp_port,
+                        "workbuddy": self.workbuddy_cdp_port,
+                        "qoder_cn": self.qoder_cdp_port,
+                    }.get(profile.app, 0)
+                    if port:
+                        watcher = PermissionWatcher(
+                            app=profile.app, port=port, log_path=log_path,
+                        ).start()
+                        interface_info["permission_watcher"] = "started"
             window = self._attach(driver, profile)
             _log(log_path, "attached", window=window, method=interface_info.get("method"))
             model_key = interface_info.get("model_key") or \
@@ -182,71 +233,65 @@ class GuiAutomationAdapter(BaseAdapter):
             if shot:
                 screenshots.append(shot)
             prompt_to_send = interface_info.get("short_prompt") or prompt_with_marker
-            if interface_info.get("method") == "workbuddy_deeplink":
-                # Verified in WorkBuddy 5.9.3: the task deeplink calls
-                # prepareInput and does NOT send.  Submit through the renderer:
-                # wait until the prefilled text is visible, then click the
-                # composer's own 发送 button.  No Enter key, no OS input.
-                from ..gui.cdp import submit_composer_via_cdp
-                # A freshly restarted renderer can keep the send button
-                # disabled while React settles; retry, and re-issue the
-                # deeplink once (it re-prefills the same text) before failing.
-                for attempt in (1, 2):
-                    try:
-                        cdp_result = submit_composer_via_cdp(
-                            port=self.workbuddy_cdp_port,
-                            prefill_timeout=float(
-                                self.config.get("workbuddy_prefill_timeout_seconds") or 20
-                            ),
-                            submit_retries=int(
-                                self.config.get("workbuddy_submit_retries") or 30
-                            ),
-                            submit_interval=0.5,
-                        )
-                        break
-                    except GuiAutomationError as exc:
-                        if attempt == 2:
-                            raise
-                        _log(log_path, "submit_retry_deeplink", error=str(exc))
-                        prepare_workbuddy_task(
-                            workspace=str(interface_info.get("workspace") or ""),
-                            model=request.model, prompt=prompt_to_send,
-                            welcome_mode=str(interface_info.get("welcome_mode") or "code"),
-                            permission_mode=str(interface_info.get("permission_mode")
-                                                or "fullAccess"),
-                            config=self.config,
-                        )
-                _log(log_path, "prompt_submitted", marker=marker,
-                     chars=len(prompt_to_send), method="deeplink+cdp-dom",
-                     cdp=cdp_result, deeplink=interface_info.get("deeplink", ""))
-            elif interface_info.get("method") == "qoder_db_transcript":
-                from ..gui.cdp import send_prompt_via_cdp
-                cdp_result = send_prompt_via_cdp(
-                    prompt_to_send, port=self.qoder_cdp_port,
+            cdp_result, manual = self._submit_prompt(
+                request, interface_info, marker, prompt_to_send, log_path, profile)
+            sent = manual is None
+            initial_sync = interface_info.get("profile_sync") or {}
+            if profile.app == "workbuddy" and \
+                    (initial_sync.get("evidence") or {}).get("deferred"):
+                # The session row is created with the first prompt.  Persist
+                # the requested profile now so WorkBuddy's next turn/session
+                # reads the same context/effort the user selected.
+                prepare = interface_info.get("prepare") or {}
+                deferred_sync = sync_workbuddy_session_profile(
+                    workspace=str(request.workdir),
+                    started_at=float((prepare.get("evidence") or {}).get(
+                        "started_at") or started_epoch),
+                    model=request.model,
+                    context_length=int(getattr(request, "context_length", 0) or 0),
+                    capability_level=str(
+                        getattr(request, "capability_level", "") or ""),
+                    config=self.config, timeout_seconds=30.0,
                 )
-                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"), input="cdp-dom", cdp=cdp_result)
-            elif interface_info.get("method") == "trae_state_vscdb":
-                cdp_result = trae_interface.send_trae_prompt(
-                    prompt_to_send, port=self.trae_cdp_port,
-                )
-                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method="trae_state_vscdb", input="cdp-dom", cdp=cdp_result)
-            else:
-                driver.send_prompt(prompt_to_send)
-                _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
-                     method=interface_info.get("method"), input="diagnostic-gui")
+                interface_info["profile_sync_after_submit"] = \
+                    deferred_sync.to_dict()
+                _log(log_path, "profile_sync_after_submit", app=profile.app,
+                     **deferred_sync.to_dict())
+            if cdp_result.get("page_id") and hasattr(reader, "page_id"):
+                # Poll the exact renderer that received and submitted the
+                # prompt; Trae may have several windows open.
+                reader.page_id = str(cdp_result["page_id"])
+                interface_info["trae_page_id"] = reader.page_id
             timeout = float(request.timeout_seconds or profile.timeout_seconds)
             # Never stall earlier than the measured profile threshold; the
             # discovery-written adapter_config may still carry an old 90s.
             stall_seconds = max(float(self.config.get("stall_seconds") or 0),
                                 float(profile.stall_seconds))
+            if profile.app == "workbuddy":
+                # A legitimate npm install / Blender asset build can run for
+                # several minutes without emitting a transcript event.
+                stall_seconds = max(
+                    stall_seconds,
+                    float(self.config.get("workbuddy_stall_seconds") or 600),
+                )
+            if manual is not None and hasattr(reader, "send_timeout"):
+                # The prompt is prefilled but the app kept its send button
+                # disabled.  The user was just asked to click it by hand, so
+                # give the transcript reader the same manual window instead of
+                # abandoning the prompt after the normal 90s.
+                reader.send_timeout = max(
+                    float(getattr(reader, "send_timeout", 0) or 0),
+                    float(self.manual_wait_seconds),
+                )
             reply = reader.wait_reply(
                 marker, started_at=started_epoch, timeout=timeout,
                 stall_seconds=stall_seconds, expected_model=model_key,
             )
             _log(log_path, "reply_received", session_id=reply.session_id,
                  model=reply.model, events=reply.events, chars=len(reply.text))
+            if manual is not None:
+                self._end_manual(request, log_path, outcome="resolved",
+                                 detail={"session_id": reply.session_id})
             verify = interface_info.get("verify")
             if verify:
                 if callable(verify):
@@ -267,6 +312,9 @@ class GuiAutomationAdapter(BaseAdapter):
             return self._finish_success(request, reply, profile, model_key, screenshots,
                                         log_path, started, interface_info)
         except GuiAutomationError as exc:
+            if manual is not None:
+                self._end_manual(request, log_path, outcome="failed",
+                                 detail={"error": f"{exc.code}: {exc.message}"})
             if driver:
                 try:
                     shot = driver.screenshot(gui_dir / "error.png")
@@ -276,12 +324,130 @@ class GuiAutomationAdapter(BaseAdapter):
                     pass
             _log(log_path, "error", code=exc.code, message=exc.message,
                  details=exc.details, screenshots=screenshots)
+            app = str(profile.app if 'profile' in locals() else "")
+            reader = locals().get("reader")
+            if (app == "workbuddy" and exc.code == "GUI_TIMEOUT"
+                    and manual is None and reader is not None
+                    and hasattr(reader, "active_sessions")):
+                try:
+                    active = reader.active_sessions(
+                        max_idle_seconds=float(self.config.get(
+                            "workbuddy_active_idle_seconds") or 900))
+                except Exception:
+                    active = []
+
+                def _norm_path(value: str) -> str:
+                    return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+                same_task = [
+                    item for item in active
+                    if _norm_path(item.get("cwd") or "") ==
+                    _norm_path(str(request.workdir or ""))
+                ]
+                if same_task:
+                    message = (
+                        f"WorkBuddy 已超过 {request.timeout_seconds or 0:.0f}s 仍在执行该节点，"
+                        "控制平面已停止等待但不会重试或新开会话"
+                    )
+                    manual = self._begin_manual(
+                        request, log_path, kind="agent_busy", app=app,
+                        message=message,
+                        instructions=(
+                            "WorkBuddy 超时后会话仍在更新，说明模型/工具仍在工作。"
+                            "请等待应用内完成：若已写出 result.json，点“重新验证”；"
+                            "若没有成果包，点“重试该节点”。未处理前不会自动重试，"
+                            "也不会新开第二个 WorkBuddy 会话。"
+                        ),
+                        error_code=exc.code,
+                        extra={"details": exc.details,
+                               "sessions": same_task[:3],
+                               "prompt_file": interface_info.get("prompt_file", "")},
+                    )
+                    return ExecutionOutcome(
+                        status="waiting_user",
+                        error=f"MANUAL_ACTION_REQUIRED: {message}",
+                        error_code=exc.code,
+                        logs=tail_text(log_path, max_chars=20000),
+                        duration_ms=_duration_ms(started),
+                        extras={"gui_app": app, "screenshots": screenshots,
+                                "error_code": exc.code, "details": exc.details,
+                                "manual_action": manual,
+                                "still_running": same_task[:3],
+                                "interface": {k: ("<callable>" if callable(v) else v)
+                                              for k, v in interface_info.items()}},
+                        result_path=request.result_path,
+                    )
+            blocking_codes = {
+                "APP_RESTART_REQUIRED", "GUI_SEND_FAILED", "GUI_DRIVER_ERROR",
+                "WORKSPACE_SWITCH_FAILED", "WORKSPACE_MISMATCH",
+                "INTERFACE_WRITE_FAILED", "MODEL_UNAVAILABLE", "MODEL_MISMATCH",
+                "GUI_MODEL_SWITCH_FAILED", "GUI_MODE_MISMATCH",
+                "MODEL_GUI_FORBIDDEN", "GUI_INPUT_FORBIDDEN", "APP_BUSY",
+                "APP_LOGIN_REQUIRED",
+            }
+            # Injected drivers/readers are test diagnostics; a real desktop
+            # interface attempt is required before the chain blocks for a human.
+            if (not sent and app and exc.code in blocking_codes
+                    and self._driver is None and self._reader is None):
+                if exc.code == "APP_RESTART_REQUIRED":
+                    kind = "restart_required"
+                    instructions = (
+                        f"{app} 正在运行但没有开放程序接口。请点击“重启 Agent 接口”"
+                        "由控制平面优雅重启它，或手动完全退出该应用后点击“继续运行”。"
+                    )
+                elif exc.code == "APP_BUSY":
+                    kind = "agent_busy"
+                    same_task = bool((exc.details or {}).get("same_task"))
+                    if same_task:
+                        instructions = (
+                            "该节点自己的上一会话仍在 WorkBuddy 中运行（模型可能仍在深度思考）。"
+                            "请等待它结束，或先在该会话点击停止按钮，然后点击“重试该节点”。"
+                            "未处理前不会新开第二个会话。"
+                        )
+                    else:
+                        instructions = (
+                            f"{app} 还有其他任务在运行。请先在 {app} 中等待它完成，"
+                            "或点击该任务的停止按钮，然后点击“重试该节点”。"
+                            "未处理前不会新开第二个任务，避免两个会话互相覆盖。"
+                        )
+                elif exc.code == "APP_LOGIN_REQUIRED":
+                    kind = "login_required"
+                    instructions = (
+                        f"{app} 当前未登录，AI 模型不可用。请切换到 {app} 完成登录，"
+                        "确认输入框可正常使用后，点击“重试该节点”。"
+                    )
+                else:
+                    kind = "agent_not_running"
+                    instructions = (
+                        f"请切换到 {app} 检查任务是否已发出；若输入框仍在，请手动点击发送"
+                        "或完成应用内审批。该节点完成后链路会自动继续。"
+                    )
+                manual = self._begin_manual(
+                    request, log_path, kind=kind, app=app,
+                    message=exc.message, instructions=instructions,
+                    error_code=exc.code,
+                    extra={"details": exc.details,
+                           "prompt_file": interface_info.get("prompt_file", "")},
+                )
+                return ExecutionOutcome(
+                    status="waiting_user",
+                    error=f"MANUAL_ACTION_REQUIRED: {exc.message}",
+                    error_code=exc.code,
+                    logs=tail_text(log_path, max_chars=20000),
+                    duration_ms=_duration_ms(started),
+                    extras={"gui_app": app, "screenshots": screenshots,
+                            "error_code": exc.code, "details": exc.details,
+                            "manual_action": manual,
+                            "interface": {k: ("<callable>" if callable(v) else v)
+                                          for k, v in interface_info.items()}},
+                    result_path=request.result_path,
+                )
             status = "timeout" if exc.code in ("GUI_TIMEOUT", "GUI_STALLED") else "failed"
             return ExecutionOutcome(
                 status=status, error=f"{exc.code}: {exc.message}", error_code=exc.code,
                 logs=tail_text(log_path, max_chars=20000),
                 duration_ms=_duration_ms(started), session_id=(reply.session_id if reply else ""),
-                extras={"gui_app": profile.app if 'profile' in locals() else "",
+                extras={"gui_app": app,
                         "screenshots": screenshots, "error_code": exc.code,
                         "details": exc.details,
                         "interface": {k: ("<callable>" if callable(v) else v)
@@ -298,11 +464,209 @@ class GuiAutomationAdapter(BaseAdapter):
                 extras={"screenshots": screenshots},
             )
         finally:
+            if watcher is not None:
+                try:
+                    watcher.stop()
+                    interface_info["permission_accepted"] = len(watcher.accepted)
+                except Exception:
+                    pass
             if driver:
                 try:
                     driver.close()
                 except Exception:
                     pass
+
+    # -- manual intervention bridge ---------------------------------------
+    def _notify(self, request: ExecutionRequest, event: str,
+                payload: dict[str, Any]) -> None:
+        callback = getattr(request, "notify", None)
+        if not callable(callback):
+            return
+        try:
+            callback({"event": event, **payload})
+        except Exception:
+            # The control plane must never lose the adapter's actual result
+            # because a UI notification failed.
+            pass
+
+    def _begin_manual(self, request: ExecutionRequest, log_path: Path, *,
+                      kind: str, app: str, message: str, instructions: str,
+                      error_code: str = "",
+                      extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = {
+            "kind": kind,
+            "app": app,
+            "agent_id": self.agent.agent_id,
+            "agent_name": self.agent.name,
+            "model": request.model,
+            "task_uid": request.task.uid,
+            "task_id": request.task.task_id,
+            "message": message,
+            "instructions": instructions,
+            "error_code": error_code,
+            "prompt_path": request.prompt_path,
+            "result_path": request.result_path,
+            "since": now_iso(),
+            "timeout_seconds": self.manual_wait_seconds,
+            **(extra or {}),
+        }
+        target = ensure_dir(Path(request.task_dir)) / "manual-action.json"
+        write_json(target, payload)
+        _log(log_path, "manual_action_required", **payload)
+        self._notify(request, "manual_action_required", payload)
+        return payload
+
+    def _end_manual(self, request: ExecutionRequest, log_path: Path, *,
+                    outcome: str, detail: dict[str, Any] | None = None) -> None:
+        target = Path(request.task_dir) / "manual-action.json"
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        payload = {
+            "task_uid": request.task.uid,
+            "task_id": request.task.task_id,
+            "agent_id": self.agent.agent_id,
+            "outcome": outcome,
+            "detail": detail or {},
+        }
+        _log(log_path, "manual_action_resolved" if outcome == "resolved"
+             else "manual_action_failed", **payload)
+        self._notify(request, "manual_action_resolved" if outcome == "resolved"
+                     else "manual_action_failed", payload)
+
+    def _submit_prompt(self, request: ExecutionRequest,
+                       interface_info: dict[str, Any], marker: str,
+                       prompt_to_send: str, log_path: Path,
+                       profile: GuiProfile
+                       ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Submit through the app interface; on failure, ask the user.
+
+        Restarting WorkBuddy/Trae here was the direct cause of the observed
+        "闪退": a prefill race made the old code kill three perfectly healthy
+        processes in 20 seconds.  This path never restarts.  It re-issues the
+        deeplink once, falls back to inserting into the visible composer, and
+        then blocks on a manual action file that the WebUI surfaces.
+        """
+        method = str(interface_info.get("method") or "")
+        if method == "workbuddy_deeplink":
+            from ..gui.cdp import send_visible_prompt_via_cdp, submit_composer_via_cdp
+            errors: list[str] = []
+            for attempt in (1, 2):
+                try:
+                    result = submit_composer_via_cdp(
+                        port=self.workbuddy_cdp_port,
+                        prefill_timeout=float(
+                            self.config.get("workbuddy_prefill_timeout_seconds") or 20
+                        ),
+                        submit_retries=int(
+                            self.config.get("workbuddy_submit_retries") or 30
+                        ),
+                        submit_interval=0.5,
+                        expect_contains=marker,
+                    )
+                    _log(log_path, "prompt_submitted", marker=marker,
+                         chars=len(prompt_to_send), method="deeplink+cdp-dom",
+                         cdp=result, deeplink=interface_info.get("deeplink", ""))
+                    return result, None
+                except GuiAutomationError as exc:
+                    errors.append(f"{exc.code}: {exc.message}")
+                    _log(log_path, "submit_retry_deeplink", attempt=attempt,
+                         error=f"{exc.code}: {exc.message}")
+                    if attempt == 1:
+                        # Re-issue the same deeplink; it calls prepareInput and
+                        # never sends, and does not touch the process.
+                        prepare_workbuddy_task(
+                            workspace=str(interface_info.get("workspace") or ""),
+                            model=request.model, prompt=prompt_to_send,
+                            welcome_mode=str(interface_info.get("welcome_mode") or "code"),
+                            permission_mode=str(interface_info.get("permission_mode")
+                                                or "fullAccess"),
+                            config=self.config,
+                        )
+                        time.sleep(float(
+                            self.config.get("workbuddy_deeplink_settle_seconds") or 3.0
+                        ))
+            try:
+                result = send_visible_prompt_via_cdp(
+                    prompt_to_send, port=self.workbuddy_cdp_port, timeout=15,
+                    submit_retries=int(self.config.get("workbuddy_submit_retries") or 30),
+                    submit_interval=0.5,
+                )
+                _log(log_path, "prompt_submitted", marker=marker,
+                     chars=len(prompt_to_send), method="cdp-visible-composer",
+                     cdp=result, previous_errors=errors)
+                return result, None
+            except GuiAutomationError as exc:
+                errors.append(f"{exc.code}: {exc.message}")
+                _log(log_path, "prompt_insert_fallback_failed",
+                     error=f"{exc.code}: {exc.message}")
+            manual = self._begin_manual(
+                request, log_path, kind="manual_submit",
+                app=str(profile.app or "workbuddy"),
+                message="WorkBuddy 输入框未自动提交，需要人工点击发送",
+                instructions=(
+                    "WorkBuddy 已打开任务（或需要重新粘贴任务说明）。请切换到 WorkBuddy，"
+                    f"确认输入框内容后点击“发送”；任务说明文件：{request.prompt_path}。"
+                    "发送完成后链路会自动继续。"
+                ),
+                error_code="GUI_SEND_FAILED",
+                extra={"errors": errors, "marker": marker,
+                       "prompt_file": interface_info.get("prompt_file", "")},
+            )
+            return {"ok": False, "manual": True, "errors": errors}, manual
+        if method == "qoder_db_transcript":
+            from ..gui.cdp import send_prompt_via_cdp
+            try:
+                result = send_prompt_via_cdp(prompt_to_send, port=self.qoder_cdp_port)
+            except GuiAutomationError as exc:
+                manual = self._begin_manual(
+                    request, log_path, kind="manual_submit",
+                    app=str(profile.app or "qoder_cn"),
+                    message=f"Qoder 自动提交失败: {exc.message}",
+                    instructions=(
+                        "请切换到 Qoder，确认任务文本并在输入框点击“发送”；"
+                        f"任务说明文件：{request.prompt_path}。发送完成后链路会自动继续。"
+                    ),
+                    error_code=exc.code,
+                    extra={"marker": marker,
+                           "prompt_file": interface_info.get("prompt_file", "")},
+                )
+                return {"ok": False, "manual": True}, manual
+            _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                 method=method, input="cdp-dom", cdp=result)
+            return result, None
+        if method == "trae_state_vscdb":
+            try:
+                result = trae_interface.send_trae_prompt(
+                    prompt_to_send, port=self.trae_cdp_port,
+                    page_id=str(interface_info.get("trae_page_id") or ""),
+                )
+            except GuiAutomationError as exc:
+                manual = self._begin_manual(
+                    request, log_path, kind="manual_submit",
+                    app=str(profile.app or "trae_cn"),
+                    message=f"Trae 自动发送失败: {exc.message}",
+                    instructions=(
+                        "请切换到 Trae，任务文本通常已在输入框；确认后点击应用内的发送按钮"
+                        f"（或完成应用内审批）。任务说明文件：{request.prompt_path}。"
+                        "发送完成后链路会自动继续。"
+                    ),
+                    error_code=exc.code,
+                    extra={"marker": marker,
+                           "prompt_file": interface_info.get("prompt_file", "")},
+                )
+                return {"ok": False, "manual": True}, manual
+            _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+                 method="trae_state_vscdb", input="cdp-dom", cdp=result)
+            return result, None
+        driver = self._driver
+        if driver is None:
+            raise GuiAutomationError("GUI_DRIVER_ERROR", "GUI driver 不可用")
+        driver.send_prompt(prompt_to_send)
+        _log(log_path, "prompt_sent", marker=marker, chars=len(prompt_to_send),
+             method=method, input="diagnostic-gui")
+        return {}, None
 
     # -- programmatic interface -------------------------------------------
     def _prepare_interface(self, profile: GuiProfile, request: ExecutionRequest,
@@ -311,6 +675,12 @@ class GuiAutomationAdapter(BaseAdapter):
         """Use the agent's own launch/store interface before touching the GUI."""
         app = str(profile.app or "")
         workspace = str(request.workdir or "")
+        plan_hint = ""
+        if request.purpose in ("plan", "plan_repair"):
+            plan_hint = (
+                "本步骤只做规划，不要创建实现文件；最终回复必须包含完整 JSON 代码块，"
+                f"并把同一 JSON 写入 `{request.result_path}`。"
+            )
         if self._driver is not None or self._reader is not None:
             return {"method": "gui", "fallback_reason": "injected stub driver/reader"}
         if not workspace:
@@ -325,11 +695,65 @@ class GuiAutomationAdapter(BaseAdapter):
             short_prompt = (
                 f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
                 "完成后按其中的输出契约写结果。\n"
+                f"{plan_hint}\n"
                 f"<!-- {MARKER_PREFIX}: {marker} -->\n"
             )
+            guard = self._reader
+            if guard is None:
+                guard = create_reader(profile, self.config)
+            if hasattr(guard, "active_sessions"):
+                active = guard.active_sessions(
+                    max_idle_seconds=float(
+                        self.config.get("workbuddy_active_idle_seconds") or 900
+                    )
+                )
+                if active:
+                    wait_seconds = float(
+                        self.config.get("workbuddy_active_wait_seconds") or 120
+                    )
+                    _log(log_path, "workbuddy_active_wait",
+                         sessions=[{k: item.get(k) for k in
+                                    ("id", "cwd", "title", "status", "last_activity_at")}
+                                   for item in active[:5]],
+                         timeout_seconds=wait_seconds)
+                    deadline = time.monotonic() + max(0.0, wait_seconds)
+                    while active and time.monotonic() < deadline:
+                        time.sleep(2.0)
+                        active = guard.active_sessions(
+                            max_idle_seconds=float(
+                                self.config.get("workbuddy_active_idle_seconds") or 900
+                            )
+                        )
+                    if active:
+                        def _norm(value: str) -> str:
+                            return str(value or "").replace("\\", "/").rstrip("/").lower()
+                        same_task = any(
+                            _norm(item.get("cwd") or "") == _norm(workspace)
+                            for item in active
+                        )
+                        _log(log_path, "workbuddy_busy", same_task=same_task,
+                             sessions=[{k: item.get(k) for k in
+                                        ("id", "cwd", "title", "status", "last_activity_at")}
+                                       for item in active[:5]])
+                        message = (
+                            "该节点自己的上一 WorkBuddy 会话仍在运行；"
+                            "请等待它完成或先在 WorkBuddy 中停止，再重试"
+                            if same_task else
+                            "WorkBuddy 还有另一个任务在运行；请等待或先停止它，再重试"
+                        )
+                        raise GuiAutomationError(
+                            "APP_BUSY",
+                            message,
+                            details={"same_task": same_task, "sessions": [
+                                {k: item.get(k) for k in
+                                 ("id", "cwd", "title", "status", "last_activity_at")}
+                                for item in active[:5]
+                            ]},
+                        )
             cdp = ensure_workbuddy_cdp(
                 executable=str(self.config.get("executable") or ""),
                 port=self.workbuddy_cdp_port,
+                allow_restart=self.allow_app_restart,
             )
             _log(log_path, "cdp_ready", app=app, **cdp.to_dict())
             if not cdp.ok:
@@ -338,6 +762,38 @@ class GuiAutomationAdapter(BaseAdapter):
                     cdp.reason or "WorkBuddy CDP 未就绪",
                     details=cdp.to_dict(),
                 )
+            profile_ctx = int(getattr(request, "context_length", 0) or 0)
+            profile_cap = str(getattr(request, "capability_level", "") or "")
+            selection_sync: dict[str, Any] = {}
+            if profile_ctx or profile_cap:
+                from ..gui.cdp import sync_workbuddy_selection_preferences
+                selection_sync = sync_workbuddy_selection_preferences(
+                    port=self.workbuddy_cdp_port,
+                    model_id=workbuddy_model_key(request.model),
+                    context_length=profile_ctx,
+                    capability_level=profile_cap,
+                    user_id=workbuddy_user_id(self.config),
+                    reload_if_changed=bool(
+                        self.config.get("workbuddy_profile_reload", True)),
+                )
+                _log(log_path, "selection_preferences", app=app,
+                     **selection_sync)
+                if not selection_sync.get("ok"):
+                    raise GuiAutomationError(
+                        "PROFILE_SYNC_FAILED",
+                        selection_sync.get("reason")
+                        or "WorkBuddy 新任务上下文/能力偏好写入失败",
+                        details=selection_sync,
+                    )
+                if selection_sync.get("reloaded"):
+                    time.sleep(float(self.config.get(
+                        "workbuddy_profile_reload_settle_seconds") or 5.0))
+            if self.full_control:
+                # WorkBuddy's task deeplink carries permissionMode=fullAccess
+                # and workbuddy.db verifies it per session; the composer switch
+                # belongs to the user's own chat, so we do not touch it.
+                _log(log_path, "full_access", app=app, ok=True,
+                     mode="fullAccess", method="deeplink")
             outcome = prepare_workbuddy_task(
                 workspace=workspace, model=request.model, prompt=short_prompt,
                 welcome_mode=welcome, permission_mode=permission, config=self.config,
@@ -349,6 +805,21 @@ class GuiAutomationAdapter(BaseAdapter):
                     outcome.reason or "WorkBuddy 深链接准备失败",
                     details={**outcome.to_dict(), "prompt_copy": str(prompt_copy)},
                 )
+            profile_sync = sync_workbuddy_session_profile(
+                workspace=workspace,
+                started_at=float(outcome.evidence.get("started_at") or started_epoch),
+                model=request.model,
+                context_length=int(getattr(request, "context_length", 0) or 0),
+                capability_level=str(getattr(request, "capability_level", "") or ""),
+                config=self.config,
+            )
+            _log(log_path, "profile_sync", app=app, **profile_sync.to_dict())
+            if not profile_sync.ok:
+                raise GuiAutomationError(
+                    "PROFILE_SYNC_FAILED",
+                    profile_sync.reason or "WorkBuddy 上下文/能力等级写入失败",
+                    details=profile_sync.to_dict(),
+                )
             return {
                 "method": "workbuddy_deeplink", "model_key": model_key,
                 "short_prompt": short_prompt, "prepare": outcome.to_dict(),
@@ -356,6 +827,8 @@ class GuiAutomationAdapter(BaseAdapter):
                 "welcome_mode": welcome, "permission_mode": permission,
                 "deeplink": str(outcome.evidence.get("uri")
                                 or outcome.evidence.get("deeplink") or ""),
+                "selection_preferences": selection_sync,
+                "profile_sync": profile_sync.to_dict(),
                 "verify": lambda _sid="": verify_workbuddy_task(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, welcome_mode=welcome,
@@ -370,12 +843,30 @@ class GuiAutomationAdapter(BaseAdapter):
             short_prompt = (
                 f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
                 "完成后按其中的输出契约写结果。\n"
+                f"{plan_hint}\n"
                 f"<!-- {MARKER_PREFIX}: {marker} -->\n"
             )
             outcome = prepare_qoder_session(
                 workspace=workspace, model=model_key, config=self.config,
+                permission_mode=("bypassPermissions" if self.full_control else ""),
             )
             _log(log_path, "interface_prepare", app=app, **outcome.to_dict())
+            if outcome.ok:
+                profile_sync = sync_qoder_model_profile(
+                    model_key=qoder_model_key(request.model),
+                    context_length=int(getattr(request, "context_length", 0) or 0),
+                    capability_level=str(getattr(request, "capability_level", "") or ""),
+                    config=self.config,
+                )
+                _log(log_path, "profile_sync", app=app, **profile_sync.to_dict())
+                if not profile_sync.ok:
+                    raise GuiAutomationError(
+                        "PROFILE_SYNC_FAILED",
+                        profile_sync.reason or "Qoder 上下文/能力等级写入失败",
+                        details=profile_sync.to_dict(),
+                    )
+            else:
+                profile_sync = None
             if not outcome.ok:
                 fallback = set_model_programmatically(
                     "qoder_cn", request.model, self.config,
@@ -393,6 +884,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 "method": "qoder_db_transcript", "model_key": model_key,
                 "short_prompt": short_prompt, "prompt_file": str(prompt_copy),
                 "prepare": outcome.to_dict(),
+                "profile_sync": (profile_sync.to_dict() if profile_sync else {}),
                 "verify": lambda sid="": verify_qoder_session(
                     workspace=workspace, model=request.model,
                     started_at=started_epoch, config=self.config,
@@ -418,6 +910,7 @@ class GuiAutomationAdapter(BaseAdapter):
             short_prompt = (
                 f"请先读取并严格执行 `{prompt_copy}` 中的任务说明，"
                 "完成后按其中的输出契约写结果。\n"
+                f"{plan_hint}\n"
                 f"<!-- {MARKER_PREFIX}: {marker} -->\n"
             )
             applied: list[Any] = []
@@ -429,19 +922,45 @@ class GuiAutomationAdapter(BaseAdapter):
             cdp = trae_interface.ensure_trae_cdp(
                 app=app, port=self.trae_cdp_port, workspace=workspace,
                 executable=str(self.config.get("executable") or ""),
-                config=self.config, force_restart=True, before_launch=_apply_state,
+                config=self.config, force_restart=False,
+                allow_restart=self.allow_app_restart, before_launch=_apply_state,
             )
             _log(log_path, "cdp_ready", app=app, **cdp.to_dict())
             if not cdp.ok:
                 raise GuiAutomationError(cdp.error_code or "GUI_SEND_FAILED",
                                          cdp.reason or "Trae CDP 未就绪",
                                          details=cdp.to_dict())
+            if not applied and workspace:
+                # Reuse path: the app was already running with CDP, so only
+                # the folder-open CLI ran. Persist the mode/session keys the
+                # verifier reads without ever restarting the editor.
+                applied.append(trae_interface.set_trae_workspace(
+                    workspace=workspace, app=app, dev_mode=dev_mode, config=self.config))
             workspace_outcome = applied[0] if applied else None
             if workspace_outcome is not None and not workspace_outcome.ok:
                 raise GuiAutomationError(
                     workspace_outcome.error_code or "INTERFACE_WRITE_FAILED",
                     workspace_outcome.reason or "Trae 工作区写入失败",
                     details=workspace_outcome.to_dict(),
+                )
+            # Pin one renderer for model selection, prompt submission and
+            # reply polling.  Trae can have several windows (folder CLI), and
+            # a freshly launched window needs time to mount the workbench.
+            trae_page = trae_interface.wait_for_trae_chat(
+                self.trae_cdp_port,
+                timeout_seconds=float(
+                    self.config.get("trae_chat_ready_timeout_seconds") or 30
+                ),
+            ) or trae_interface.pick_trae_page(self.trae_cdp_port)
+            trae_page_id = str((trae_page or {}).get("id") or "")
+            _log(log_path, "trae_page_pinned", page_id=trae_page_id,
+                 title=str((trae_page or {}).get("title") or ""))
+            if trae_interface.trae_login_required(
+                    self.trae_cdp_port, page_id=trae_page_id):
+                raise GuiAutomationError(
+                    "APP_LOGIN_REQUIRED",
+                    "Trae CN 当前页面显示登录墙，AI 模型不可用",
+                    details={"page_id": trae_page_id},
                 )
             # Model selection must happen while the renderer is alive: the SOLO
             # preference is server-synced and the composer is the authority.
@@ -450,7 +969,7 @@ class GuiAutomationAdapter(BaseAdapter):
             expected_display = str(resolved.get("display_name") or request.model)
             model_outcome = trae_interface.set_trae_model(
                 model=request.model, app=app, config=self.config,
-                cdp_port=self.trae_cdp_port,
+                cdp_port=self.trae_cdp_port, page_id=trae_page_id,
             )
             applied.append(model_outcome)
             _log(log_path, "interface_prepare", app=app,
@@ -471,9 +990,23 @@ class GuiAutomationAdapter(BaseAdapter):
                     details={"visible_model": visible, "expected": expected_display,
                              "model_outcome": model_outcome.to_dict()},
                 )
+            effort_sync = trae_interface.set_trae_reasoning_effort(
+                model=request.model,
+                effort=str(getattr(request, "capability_level", "") or ""),
+                app=app, config=self.config,
+            )
+            _log(log_path, "profile_sync", app=app, **effort_sync.to_dict())
+            if not effort_sync.ok:
+                raise GuiAutomationError(
+                    "PROFILE_SYNC_FAILED",
+                    effort_sync.reason or "Trae 思考等级写入失败",
+                    details=effort_sync.to_dict(),
+                )
             return {
                 "method": "trae_state_vscdb", "model_key": model_key,
                 "short_prompt": short_prompt, "prompt_file": str(prompt_copy),
+                "trae_page_id": trae_page_id,
+                "profile_sync": effort_sync.to_dict(),
                 "prepare": {
                     "workspace": workspace_outcome.to_dict() if workspace_outcome else {},
                     "model": model_outcome.to_dict() if model_outcome else {},
@@ -482,6 +1015,7 @@ class GuiAutomationAdapter(BaseAdapter):
                 "verify": lambda _sid="": trae_interface.verify_trae_session(
                     workspace=workspace, model=request.model, dev_mode=dev_mode,
                     app=app, config=self.config, cdp_port=self.trae_cdp_port,
+                    page_id=trae_page_id,
                 ),
             }
         return {"method": "gui", "fallback_reason": f"{app} 未实现程序接口"}

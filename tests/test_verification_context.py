@@ -138,6 +138,7 @@ def test_combine_filters_verification_noise(git_repo):
 
 def test_verifier_fails_scope_violation_and_missing_patch(git_repo, tmp_path):
     verifier = build_verifier(git_repo)
+    verifier.config.scope_violation_policy = "strict"
     wt = tmp_path / "wt2"
     create_worktree(str(git_repo), str(wt), "HEAD")
     (wt / "README.md").write_text("tampered\n", encoding="utf-8")

@@ -253,6 +253,55 @@ def test_set_model_qoder_uses_db_transcript_path(tmp_path, monkeypatch):
     assert calls == [(str(tmp_path / "ws"), "dfmodel")]
 
 
+def test_workbuddy_prepare_returns_selection_sync(tmp_path, monkeypatch):
+    from agentloop_hub.adapters import gui as gui_module
+    from agentloop_hub.control.interfaces import InterfaceOutcome
+
+    class FakeReader:
+        def active_sessions(self, **_kwargs):
+            return []
+
+    sync_calls = []
+
+    def fake_sync(**kwargs):
+        sync_calls.append(kwargs)
+        return {"ok": True, "changed": False, "context": kwargs["context_length"],
+                "effort": kwargs["capability_level"]}
+
+    monkeypatch.setattr(gui_module, "create_reader", lambda *a, **k: FakeReader())
+    monkeypatch.setattr(
+        gui_module, "ensure_workbuddy_cdp",
+        lambda **k: InterfaceOutcome(True, "cdp", {"port": 9223}, {}))
+    monkeypatch.setattr(
+        gui_module, "prepare_workbuddy_task",
+        lambda **k: InterfaceOutcome(True, "deeplink", {}, {},
+                                     evidence={"started_at": 1000.0}))
+    monkeypatch.setattr(
+        gui_module, "sync_workbuddy_session_profile",
+        lambda **k: InterfaceOutcome(True, "db_write", {}, {"deferred": True},
+                                     evidence={"deferred": True}))
+    monkeypatch.setattr(gui_module, "workbuddy_user_id", lambda config: "uid-1")
+    monkeypatch.setattr(
+        "agentloop_hub.gui.cdp.sync_workbuddy_selection_preferences", fake_sync)
+
+    request = make_request(tmp_path)
+    request.model = "GLM-5.3-Flash"
+    request.context_length = 600000
+    request.capability_level = "max"
+    adapter = GuiAutomationAdapter(
+        make_agent("workbuddy"),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "workbuddy_cdp_port": 9223},
+    )
+    info = adapter._prepare_interface(
+        adapter._profile(), request, "prompt", "marker",
+        tmp_path / "gui.log", 1000.0,
+    )
+    assert info["selection_preferences"]["ok"] is True
+    assert sync_calls and sync_calls[0]["model_id"] == "glm-5.3-flash"
+    assert info["profile_sync"]["actual"] == {"deferred": True}
+
+
 def test_set_model_workbuddy_readback_mismatch(tmp_path, monkeypatch):
     from agentloop_hub.adapters import gui as gui_module
     from agentloop_hub.control import interfaces as iface

@@ -8,6 +8,7 @@ declared by the control plane, retrying once with `--continue` if it is missing.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -101,6 +102,29 @@ class OpenCodeAdapter(CliAgentAdapter):
             "files outside the declared scope."
         )
 
+    @staticmethod
+    def error_summary(stdout: str, stderr: str) -> str:
+        """Extract OpenCode's structured error instead of an empty exit code."""
+        for line in reversed((stdout or "").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            error = event.get("error") if event.get("type") == "error" else None
+            if not isinstance(error, dict):
+                continue
+            data = error.get("data") if isinstance(error.get("data"), dict) else {}
+            message = (data.get("message") or error.get("message")
+                       or data.get("responseBody") or error.get("name") or "")
+            if message:
+                return str(message)[:800]
+        return (stderr or "").strip()[:800]
+
     def execute(self, request: ExecutionRequest) -> ExecutionOutcome:
         if not self.executable or not (shutil.which(self.executable) or Path(self.executable).exists()):
             return ExecutionOutcome(status="failed", error="opencode 未安装或不可执行")
@@ -126,17 +150,26 @@ class OpenCodeAdapter(CliAgentAdapter):
         usage, tool_calls, session_id = self.parse_jsonl(proc.stdout, read_text(request.prompt_path), proc.duration_ms)
         payload = _load_json_file(request.result_path)
 
+        error_text = self.error_summary(proc.stdout, proc.stderr)
         if proc.timed_out:
             return ExecutionOutcome(status="timeout", usage=usage, tool_calls=tool_calls,
                                     result_payload=payload, result_path=request.result_path,
                                     logs=(proc.stdout + "\n" + proc.stderr)[-30000:],
-                                    error="opencode 执行超时", duration_ms=proc.duration_ms,
+                                    error=f"opencode 执行超时{(': ' + error_text) if error_text else ''}",
+                                    duration_ms=proc.duration_ms,
                                     pid=proc.pid, session_id=session_id)
         if proc.exit_code != 0:
             return ExecutionOutcome(status="failed", usage=usage, tool_calls=tool_calls,
                                     result_payload=payload, result_path=request.result_path,
                                     logs=(proc.stdout + "\n" + proc.stderr)[-30000:],
-                                    error=f"opencode 退出码 {proc.exit_code}: {proc.stderr.strip()[:800]}",
+                                    error=(f"opencode 退出码 {proc.exit_code}"
+                                           f"{(': ' + error_text) if error_text else ''}"),
+                                    duration_ms=proc.duration_ms, pid=proc.pid, session_id=session_id)
+        if error_text and payload is None:
+            return ExecutionOutcome(status="failed", usage=usage, tool_calls=tool_calls,
+                                    result_payload=None, result_path=request.result_path,
+                                    logs=(proc.stdout + "\n" + proc.stderr)[-30000:],
+                                    error=f"opencode 返回错误: {error_text}",
                                     duration_ms=proc.duration_ms, pid=proc.pid, session_id=session_id)
 
         repair_logs = ""

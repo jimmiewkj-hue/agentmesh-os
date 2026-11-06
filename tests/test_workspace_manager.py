@@ -17,6 +17,24 @@ def test_initialize_project_creates_git_repo(tmp_path):
     assert again["git_initialized"] is False
 
 
+def test_initialize_existing_nonempty_dir_creates_empty_commit(tmp_path):
+    target = tmp_path / "existing"
+    target.mkdir()
+    (target / "unrelated.bin").write_text("keep me", encoding="utf-8")
+
+    info = initialize_project(target)
+
+    assert info["git_initialized"] is True
+    assert info["initial_commit"] is True
+    from agentloop_hub.workspace.gitops import detect_repo, run_git
+
+    assert detect_repo(target).get("commit")
+    tracked = run_git(["ls-files"], cwd=target, check=False).stdout
+    tracked = tracked.decode("utf-8", "replace") if isinstance(tracked, bytes) else tracked
+    assert "unrelated.bin" not in tracked
+    assert (target / "unrelated.bin").read_text(encoding="utf-8") == "keep me"
+
+
 def test_workspace_manager_opens_and_switches(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"

@@ -3,11 +3,14 @@ const state = {
   workspace: null, overview: null, plans: [], runs: [], tasks: [], approvals: [],
   costs: null, usage: [], audit: [], conversations: [], memories: [], bus: [],
   busStats: null, busSubs: [], sync: null, models: null, versionStatus: null,
-  modelsSync: null,
+  modelsSync: null, settings: null,
   surface: null,
+  roles: null,
   mcp: null, selected: null, view: 'command', stream: null, lastSeq: 0,
   consoleLines: 0, reconnectTimer: null, refreshTimer: null,
   chainDraft: null, chainRunId: '', chainTimer: null,
+  chainHydratedFor: '', chainPersistTimer: null, manualAlertKey: '',
+  bindingTask: null,
 };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
@@ -39,11 +42,69 @@ async function api(path, opts = {}) {
 function post(path, body) { return api(path, { method: 'POST', body: JSON.stringify(body || {}) }); }
 
 /* ------------------------------------------------------------------ */
+/* Full control (GUI permission auto-accept)                           */
+/* ------------------------------------------------------------------ */
+function renderFullControl() {
+  const box = $('fullControl');
+  if (!box) return;
+  const enabled = !state.settings || state.settings.full_control !== false;
+  box.checked = enabled;
+  const info = $('fullControlInfo');
+  if (info) {
+    info.textContent = enabled
+      ? '已开启：GUI Agent 的越界读取/命令确认将通过应用自身接口自动接受'
+      : '已关闭：确认会留在 Agent 应用内，由你手动处理';
+  }
+}
+async function saveFullControl() {
+  const enabled = !!($('fullControl') && $('fullControl').checked);
+  try {
+    const r = await post('/api/settings/full_control', { enabled });
+    state.settings = { ...(state.settings || {}), ...r };
+    renderFullControl();
+    toast(enabled ? '完全控制已开启' : '完全控制已关闭');
+  } catch (e) {
+    toast('保存失败：' + e.message, true);
+    renderFullControl();
+  }
+}
+
+/* Multi-round continuation (default on, bounded rounds) */
+function renderMultiRound() {
+  const box = $('multiRound');
+  if (!box) return;
+  const settings = state.settings || {};
+  const enabled = settings.multi_round !== false;
+  box.checked = enabled;
+  const maxInput = $('maxRounds');
+  if (maxInput && settings.max_rounds) maxInput.value = settings.max_rounds;
+  const info = $('multiRoundInfo');
+  if (info) {
+    info.textContent = enabled
+      ? `已开启：最多 ${settings.max_rounds || 3} 轮（含首轮）；未通过时自动重新规划下一轮`
+      : '已关闭：一轮结束即进入验收/合并门禁';
+  }
+}
+async function saveMultiRound() {
+  const enabled = !!($('multiRound') && $('multiRound').checked);
+  const maxRounds = Math.max(1, Math.min(20, Number($('maxRounds') && $('maxRounds').value || 3)));
+  try {
+    const r = await post('/api/settings/multi_round', { enabled, max_rounds: maxRounds });
+    state.settings = { ...(state.settings || {}), ...r };
+    renderMultiRound();
+    toast(enabled ? `多轮自动续跑已开启（最多 ${maxRounds} 轮）` : '多轮自动续跑已关闭');
+  } catch (e) {
+    toast('保存失败：' + e.message, true);
+    renderMultiRound();
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Routing / refresh                                                   */
 /* ------------------------------------------------------------------ */
 function route() {
   const hash = (location.hash || '#command').slice(1);
-  const views = ['command', 'agents', 'versions', 'graph', 'task', 'approvals', 'bus', 'audit'];
+  const views = ['command', 'agents', 'versions', 'graph', 'roles', 'task', 'approvals', 'bus', 'audit'];
   state.view = views.includes(hash) ? hash : 'command';
   document.querySelectorAll('.section').forEach((s) => s.classList.remove('active'));
   const target = $('view-' + state.view);
@@ -57,6 +118,7 @@ async function refresh() {
   try {
     const ws = await api('/api/workspace');
     state.workspace = ws;
+    state.settings = await api('/api/settings').catch(() => null);
     if (!ws.open) {
       state.overview = null; state.models = null; state.versionStatus = null;
       render();
@@ -167,6 +229,14 @@ function renderWorkspace() {
     <dt>构建 / 测试</dt><dd>${esc(p.build_command || '未配置')} / ${esc(p.test_command || '未配置')}</dd>
     <dt>数据目录</dt><dd class="mono">${esc(ov ? ov.data_dir : '')}</dd>
   </dl>`;
+  const gitTop = String((p.extra || {}).git_toplevel || '');
+  const norm = (value) => String(value || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  if (gitTop && norm(gitTop) !== norm(p.root)) {
+    $('wsInfo').innerHTML += `<div class="banner" style="margin-top:8px;background:#fff7ed;color:#9a3412">
+      <b>注意：</b>当前项目目录位于 Git 仓库子目录中。Git 根是
+      <span class="mono">${esc(gitTop)}</span>，任务 Worktree 会从 Git 根创建。
+      建议直接打开 Git 根目录，避免 Agent 看到“项目根”与 Git 根不一致。</div>`;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -188,6 +258,111 @@ function modelOptions(agentId, selected) {
   return html;
 }
 
+const CAPABILITY_LABELS = {
+  none: '关闭思考', minimal: '最小', light: '轻', low: '低', medium: '中',
+  high: '高', xhigh: '极高', extra_high: '极高', max: '最大', ultra: '极高',
+};
+function modelProfile(agentId, model) {
+  const entry = ((state.models || {}).by_agent || {})[agentId] || {};
+  const profiles = entry.model_profiles || {};
+  if (profiles[model]) return profiles[model];
+  const row = (entry.models || []).find((m) => m.name === model) || {};
+  if (model && (row.context_default || row.capability_default)) {
+    return {
+      context_length: row.context_default || 0,
+      capability_level: row.capability_default || '',
+    };
+  }
+  return {
+    context_length: entry.context_length || 0,
+    capability_level: entry.capability_level || '',
+  };
+}
+function modelMeta(agentId, model) {
+  const entry = ((state.models || {}).by_agent || {})[agentId] || {};
+  const row = (entry.models || []).find((m) => m.name === model) || {};
+  const fallback = !model ? entry : {};
+  return {
+    contextOptions: (row.context_options || fallback.context_options || []).map(Number),
+    contextMax: Number(row.context_max || fallback.context_max || 0),
+    capabilityOptions: row.capability_options || fallback.capability_options || [],
+    capabilityLabels: row.capability_labels || fallback.capability_labels || {},
+  };
+}
+function capabilityLabel(level, labels) {
+  return (labels && labels[level]) || CAPABILITY_LABELS[level] || level;
+}
+function capabilitySelectHtml(agentId, model, selected) {
+  const meta = modelMeta(agentId, model);
+  let options = (meta.capabilityOptions || []).slice();
+  if (!options.length) options = ['low', 'medium', 'high', 'ultra'];
+  if (selected && !options.includes(selected)) options.unshift(selected);
+  return ['<option value="">默认</option>'].concat(options.map((level) =>
+    `<option value="${esc(level)}" ${level === selected ? 'selected' : ''}>${esc(capabilityLabel(level, meta.capabilityLabels))}</option>`)).join('');
+}
+function contextDatalistHtml(id, meta) {
+  return `<datalist id="${esc(id)}">${(meta.contextOptions || []).map((value) =>
+    `<option value="${Number(value)}"></option>`).join('')}</datalist>`;
+}
+function contextTitle(meta) {
+  if (meta.contextOptions && meta.contextOptions.length) {
+    return `该模型的上下文选项：${meta.contextOptions.join(' / ')}`;
+  }
+  return meta.contextMax ? `该模型的上下文上限：${meta.contextMax}` : '上下文长度（0=默认）';
+}
+function applyContextMeta(ctx, meta) {
+  if (!ctx) return;
+  ctx.setAttribute('list', ctx.id + 'Options');
+  let list = document.getElementById(ctx.id + 'Options');
+  if (!list) {
+    list = document.createElement('datalist');
+    list.id = ctx.id + 'Options';
+    document.body.appendChild(list);
+  }
+  list.innerHTML = (meta.contextOptions || []).map((value) =>
+    `<option value="${Number(value)}"></option>`).join('');
+  ctx.title = contextTitle(meta);
+  if (meta.contextMax) ctx.max = meta.contextMax; else ctx.removeAttribute('max');
+  if (meta.contextOptions && meta.contextOptions.length) {
+    ctx.placeholder = `可选 ${meta.contextOptions.join(' / ')}`;
+  } else if (meta.contextMax) {
+    ctx.placeholder = `≤ ${meta.contextMax}`;
+  }
+}
+function validateProfileInputs(agentId, model, context, capability) {
+  const meta = modelMeta(agentId, model);
+  if (context > 0 && meta.contextOptions.length && !meta.contextOptions.includes(context)) {
+    throw new Error(`该模型上下文只支持 ${meta.contextOptions.join(' / ')}`);
+  }
+  if (context > 0 && meta.contextMax && context > meta.contextMax) {
+    throw new Error(`该模型上下文上限为 ${meta.contextMax}`);
+  }
+  if (capability && meta.capabilityOptions.length
+      && !meta.capabilityOptions.includes(capability)) {
+    throw new Error(`该模型能力等级只支持 ${meta.capabilityOptions.join(' / ')}`);
+  }
+}
+function fillProfileInputs(contextId, capabilityId, agentId, model, overrides = {}) {
+  const profile = modelProfile(agentId, model);
+  const meta = modelMeta(agentId, model);
+  const ctx = $(contextId);
+  const cap = $(capabilityId);
+  if (ctx) {
+    if (document.activeElement !== ctx && overrides.context !== undefined) {
+      ctx.value = overrides.context;
+    } else if (document.activeElement !== ctx) {
+      ctx.value = profile.context_length || 0;
+    }
+    applyContextMeta(ctx, meta);
+  }
+  if (cap) {
+    const selected = overrides.capability !== undefined
+      ? overrides.capability : (profile.capability_level || '');
+    cap.innerHTML = capabilitySelectHtml(agentId, model, selected);
+    cap.value = selected;
+  }
+}
+
 function renderCommandAgents() {
   const ov = state.overview;
   if (!ov) {
@@ -206,9 +381,13 @@ function renderCommandAgents() {
   const mainEntry = ((state.models || {}).by_agent || {})[selectedMain] || {};
   $('mainModelSelect').innerHTML = modelOptions(selectedMain, mainEntry.selected_model || (main ? main.model : ''));
   if (main && !$('mainModel').value) $('mainModel').value = main.model || '';
+  const mainModel = $('mainModelSelect').value || (main ? main.model : '');
+  fillProfileInputs('mainContext', 'mainCapability', selectedMain, mainModel);
   $('mainBudget').value = main ? (main.budget_tokens || 0) : 0;
+  const mainWarning = mainEntry.profile_warning || '';
   $('mainInfo').innerHTML = main
     ? `<span class="pill ok">${esc(main.agent_id)}</span> 模型 ${esc(main.model || '未指定')} · 设置于 ${esc(main.set_at || '')}`
+      + (mainWarning ? `<div style="color:#b45309">配置警告：${esc(mainWarning)}，请按真实选项重新保存</div>` : '')
     : '尚未指定主节点。选择一个 Agent 并保存。';
 
   const mainModelCount = ((state.models || {}).models || []).length;
@@ -217,27 +396,47 @@ function renderCommandAgents() {
     const entry = ((state.models || {}).by_agent || {})[a.agent_id] || {};
     const selected = entry.selected_model || '';
     const isMain = a.agent_id === mainId;
+    const profile = modelProfile(a.agent_id, selected);
+    const meta = modelMeta(a.agent_id, selected);
+    const selectedRow = (entry.models || []).find((m) => m.name === selected) || {};
+    const warning = selectedRow.profile_warning || '';
     return `<div class="models-row">
       <div><b>${esc(a.name)}</b> <span class="pill ${isMain ? 'ok' : ''}">${isMain ? '主' : '子'}</span>
         <div class="sub">${esc(a.agent_id)} · v${esc(a.version)} · ${esc(a.status)} · ${esc(a.adapter_type)}</div></div>
-      <select id="model-${esc(a.agent_id)}">${modelOptions(a.agent_id, selected)}</select>
+      <select id="model-${esc(a.agent_id)}" onchange="onSubModelChange('${esc(a.agent_id)}')">${modelOptions(a.agent_id, selected)}</select>
       <input id="custom-${esc(a.agent_id)}" placeholder="或手填模型名">
+      <input id="context-${esc(a.agent_id)}" type="number" min="0" list="context-${esc(a.agent_id)}Options" placeholder="上下文 tokens" title="${esc(contextTitle(meta))}" value="${esc(profile.context_length || 0)}">
+      ${contextDatalistHtml('context-' + a.agent_id + 'Options', meta)}
+      <select id="capability-${esc(a.agent_id)}" title="能力等级（来自该模型真实选项）">
+        ${capabilitySelectHtml(a.agent_id, selected, profile.capability_level || '')}
+      </select>
       <button class="small" onclick="saveSubModel('${esc(a.agent_id)}')">保存</button>
-      <span class="sub">${selected ? '已选 ' + esc(selected) : '未选配'}</span>
+      <span class="sub">${selected ? '已选 ' + esc(selected) : '未选配'}
+        ${warning ? `<span style="color:#b45309"> · 配置警告：${esc(warning)}</span>` : ''}</span>
     </div>`;
   }).join('') || '<div class="empty">没有 Agent。点击“重新探测 Agent”。</div>';
 }
 
+function onSubModelChange(agentId) {
+  const model = $('model-' + agentId) ? $('model-' + agentId).value : '';
+  fillProfileInputs('context-' + agentId, 'capability-' + agentId, agentId, model);
+}
 function onMainAgentChange() {
   const id = $('mainAgent').value;
   const entry = ((state.models || {}).by_agent || {})[id] || {};
   $('mainModelSelect').innerHTML = modelOptions(id, entry.selected_model || '');
   $('mainModel').value = entry.selected_model || '';
+  fillProfileInputs('mainContext', 'mainCapability', id,
+    $('mainModelSelect').value || entry.selected_model || '');
   $('mainInfo').innerHTML = entry.models && entry.models.length
     ? `该 Agent 已探测到 ${entry.models.length} 个模型：${entry.models.map((m) => esc(m.name)).join(', ')}`
     : '该 Agent 暂未探测到模型；可手填模型名。';
 }
-function syncMainCustom() { $('mainModel').value = $('mainModelSelect').value; }
+function syncMainCustom() {
+  $('mainModel').value = $('mainModelSelect').value;
+  fillProfileInputs('mainContext', 'mainCapability', $('mainAgent').value,
+    $('mainModelSelect').value);
+}
 
 async function autoMain() {
   try {
@@ -257,6 +456,16 @@ async function pauseRun(runId) {
   } catch (e) { toast('暂停失败：' + e.message, true); }
 }
 
+async function cancelRun(runId) {
+  if (!confirm('停止整个运行？排队/运行中的节点会取消，WorkBuddy/Trae 当前任务会被停止。')) return;
+  try {
+    const r = await post('/api/runs/' + encodeURIComponent(runId) + '/cancel',
+      { reason: '用户停止运行' });
+    toast(`运行已停止：${(r.tasks || []).length} 个节点取消`);
+    refresh();
+  } catch (e) { toast('停止失败：' + e.message, true); }
+}
+
 async function saveBudget() {
   try {
     const r = await post('/api/budget', { tokens: Number($('budgetTokens').value || 0) });
@@ -269,12 +478,15 @@ async function saveMain() {
   const agent = $('mainAgent').value;
   if (!agent) { toast('请选择主节点 Agent', true); return; }
   const model = $('mainModel').value.trim() || $('mainModelSelect').value;
+  const contextLength = Math.max(0, Number($('mainContext').value || 0));
+  const capabilityLevel = $('mainCapability').value || '';
   try {
+    validateProfileInputs(agent, model, contextLength, capabilityLevel);
     await post('/api/main', {
       agent_id: agent, model, budget_tokens: Number($('mainBudget').value || 0),
+      context_length: contextLength, capability_level: capabilityLevel,
     });
-    if (model) await post('/api/agents/' + encodeURIComponent(agent) + '/model', { model });
-    toast('主节点与模型已保存');
+    toast('主节点、模型、上下文与能力等级已保存');
     refresh();
   } catch (e) { toast(e.message, true); }
 }
@@ -283,9 +495,15 @@ async function saveSubModel(agentId) {
   const select = $('model-' + agentId);
   const custom = $('custom-' + agentId);
   const model = (custom && custom.value.trim()) || (select && select.value) || '';
+  const contextLength = Math.max(0, Number(
+    ($('context-' + agentId) && $('context-' + agentId).value) || 0));
+  const capabilityLevel = ($('capability-' + agentId) && $('capability-' + agentId).value) || '';
   try {
-    await post('/api/agents/' + encodeURIComponent(agentId) + '/model', { model });
-    toast(`${agentId} 模型已${model ? '选配：' + model : '清空'}`);
+    validateProfileInputs(agentId, model, contextLength, capabilityLevel);
+    await post('/api/agents/' + encodeURIComponent(agentId) + '/model', {
+      model, context_length: contextLength, capability_level: capabilityLevel,
+    });
+    toast(`${agentId} 已保存模型/上下文/能力等级`);
     if (custom) custom.value = '';
     refresh();
   } catch (e) { toast(e.message, true); }
@@ -311,10 +529,14 @@ function renderCommandRun() {
     return;
   }
   const counts = {};
-  (state.tasks || []).forEach((t) => { counts[t.status] = (counts[t.status] || 0) + 1; });
+  (state.tasks || []).filter((t) => t.run_id === run.run_id)
+    .forEach((t) => { counts[t.status] = (counts[t.status] || 0) + 1; });
+  const manualSubmit = (((state.overview || {}).manual_actions) || []).some(
+    (a) => ((a.manual_action || {}).kind === 'manual_submit'));
   $('commandRun').innerHTML = `<dl class="kv">
     <dt>运行 ID</dt><dd class="mono">${esc(run.run_id)}</dd>
     <dt>状态</dt><dd><span class="pill ${pillClass(run.status)}">${esc(run.status)}</span></dd>
+    <dt>轮次</dt><dd>第 ${esc(run.round_number || 1)} / ${esc(run.max_rounds || '—')} 轮 · ${esc(run.goal_status || 'active')}${run.blocked_reason ? ` · <span class="sub">${esc(run.blocked_reason)}</span>` : ''}</dd>
     <dt>主节点</dt><dd>${esc(run.main_agent_id)} · ${esc(run.model || '')}</dd>
     <dt>任务</dt><dd>${Object.entries(counts).map(([k, v]) => `<span class="pill ${pillClass(k)}">${esc(k)} ${v}</span>`).join('') || '无'}</dd>
     <dt>验收 / 发布</dt><dd>${esc(run.acceptance_status || 'pending')} / ${esc(run.release_status || 'not_requested')}</dd>
@@ -322,12 +544,129 @@ function renderCommandRun() {
   <div class="row" style="margin-top:10px">
     ${run.status === 'ready' ? `<button class="primary" onclick="startRun('${esc(run.run_id)}')">开始执行</button>` : ''}
     ${run.status === 'running' ? `<button class="danger" onclick="pauseRun('${esc(run.run_id)}')">暂停运行</button><button onclick="refresh()">刷新进度</button>` : ''}
-    ${['waiting_user', 'paused'].includes(run.status) ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
+    ${['running', 'waiting_user', 'paused'].includes(run.status)
+      ? `<button class="danger" onclick="cancelRun('${esc(run.run_id)}')">停止运行（取消节点）</button>` : ''}
+    ${['waiting_user', 'paused'].includes(run.status) && !manualSubmit ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
+    ${manualSubmit ? '<span class="sub">已阻塞：请按弹窗提示在 Agent 应用中点击发送，完成后会自动继续</span>' : ''}
     ${run.status === 'pending_acceptance' ? `<button onclick="location.hash='#approvals'">验收确认</button>` : ''}
     ${run.status === 'pending_merge' ? `<button class="primary" onclick="mergeRun('${esc(run.run_id)}')">批准并合并</button>` : ''}
     ${run.status === 'completed' ? `<button class="primary" onclick="releaseRun('${esc(run.run_id)}')">申请发布审批</button>` : ''}
     <button onclick="location.hash='#graph'">任务图</button>
   </div>`;
+}
+
+function renderMainActivity() {
+  const box = $('mainActivity');
+  if (!box) return;
+  const activity = (state.overview || {}).main_activity || {};
+  if (!activity || !activity.phase) {
+    box.innerHTML = '<div class="empty">主节点没有正在进行的规划或汇总</div>';
+    return;
+  }
+  const phase = activity.phase === 'summary'
+    ? '主节点汇总'
+    : `主节点第 ${activity.round || '?'} 轮规划`;
+  const status = activity.status || '';
+  const started = activity.started_at ? new Date(activity.started_at).getTime() : 0;
+  const finished = activity.finished_at ? new Date(activity.finished_at).getTime() : 0;
+  const elapsed = started ? Math.max(0, Math.round(((finished || Date.now()) - started) / 1000)) : 0;
+  box.innerHTML = `<div class="card" style="box-shadow:none;margin:0">
+    <div class="row" style="justify-content:space-between">
+      <div><b>${esc(phase)}</b>
+        <span class="pill ${pillClass(status)}">${esc(status)}</span>
+        <div class="sub">${esc(activity.agent_name || activity.agent_id || '')} · ${esc(activity.model || '')}
+          · 已运行 ${elapsed}s</div></div>
+      <span class="pill info">${esc(activity.task_id || 'MAIN')}</span>
+    </div>
+    ${activity.error ? `<div class="sub" style="color:#b91c1c;margin-top:6px">${esc(activity.error)}</div>` : ''}
+    ${activity.prompt_path ? `<div class="sub mono" style="margin-top:6px;word-break:break-all">提示词：${esc(activity.prompt_path)}</div>` : ''}
+  </div>`;
+}
+
+function renderCommandChainNodes() {
+  const box = $('commandChainNodes');
+  if (!box) return;
+  const run = state.overview && state.overview.latest_run;
+  if (!run) { box.innerHTML = '<div class="empty">暂无运行</div>'; return; }
+  const tasks = (state.tasks || []).filter((t) => t.run_id === run.run_id);
+  if (!tasks.length) { box.innerHTML = '<div class="empty">本次运行还没有任务</div>'; return; }
+  const manualByUid = Object.fromEntries(
+    (((state.overview || {}).manual_actions) || []).map((a) => [a.task_uid, a.manual_action || {}]));
+  const rows = tasks.map((t) => {
+    const manualKind = (manualByUid[t.uid] || {}).kind || '';
+    const canRetry = ['failed', 'blocked'].includes(t.status)
+      || (t.status === 'waiting_user' && manualKind !== 'manual_submit');
+    const manual = String(t.error || '').startsWith('MANUAL_ACTION_REQUIRED');
+    const started = t.started_at ? new Date(t.started_at).getTime() : 0;
+    const finished = t.finished_at ? new Date(t.finished_at).getTime() : 0;
+    const elapsed = started ? Math.max(0, Math.round(((finished || Date.now()) - started) / 1000)) : 0;
+    const limitMin = (t.spec && t.spec.time_limit_minutes) || 0;
+    const elapsedText = started
+      ? `${Math.floor(elapsed / 60)}m${String(elapsed % 60).padStart(2, '0')}s / ${limitMin || '—'}m`
+      : `— / ${limitMin || '—'}m`;
+    return `<tr>
+      <td class="mono">${esc(t.task_id)}</td>
+      <td>${esc(t.assigned_agent || (t.spec && t.spec.suggested_agent) || '')}</td>
+      <td class="mono">${esc(t.model || '')}</td>
+      <td><span class="pill ${pillClass(t.status)}">${esc(t.status)}</span>
+        ${t.verification_status === 'warning' ? '<span class="pill warn" title="验证通过但有警告，详见验证报告">验证警告</span>' : ''}</td>
+      <td class="sub">${esc(elapsedText)}</td>
+      <td class="sub">${esc((t.error || (t.verification_status === 'warning'
+        ? '验证通过但有警告（可能是 scope 超出计划范围），详见任务详情' : '')).slice(0, 160))}</td>
+      <td>${!['completed', 'canceled', 'rejected', 'running', 'verifying'].includes(t.status)
+        ? `<button class="small" onclick="openBindingEditor('${esc(t.uid)}')">编辑绑定</button>` : ''}
+        ${canRetry ? `<button class="small" onclick="retryNode('${esc(t.uid)}','${esc(run.run_id)}')">重试节点</button>` : ''}
+        ${t.status === 'failed' ? `<button class="small" onclick="reverifyNode('${esc(t.uid)}')">重新验证</button>` : ''}
+        ${manual ? `<button class="small" onclick="refresh()">刷新状态</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+  box.innerHTML = `<div class="sub" style="margin-bottom:6px">运行 <span class="mono">${esc(run.run_id)}</span>
+    · <span class="pill ${pillClass(run.status)}">${esc(run.status)}</span>
+    ${run.blocked_reason ? ` · ${esc(run.blocked_reason)}` : ''}</div>
+    <table class="table"><thead><tr><th>节点</th><th>Agent</th><th>模型</th>
+    <th>状态</th><th>耗时/上限</th><th>错误/阻塞原因</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderBlockAlert() {
+  const box = $('blockAlert');
+  if (!box) return;
+  const actions = ((state.overview || {}).manual_actions) || [];
+  if (!actions.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    if (document.title.startsWith('⚠')) document.title = 'AgentMesh OS 指挥中心';
+    return;
+  }
+  const run = state.overview.latest_run || {};
+  const key = actions.map((a) => `${a.task_uid}:${(a.manual_action || {}).kind}:${(a.manual_action || {}).since}`).join('|');
+  if (key !== state.manualAlertKey) {
+    state.manualAlertKey = key;
+    toast('链路已阻塞：请处理弹窗中的 Agent 节点', true);
+    document.title = '⚠ 链路阻塞 - AgentMesh OS';
+  }
+  const items = actions.map((a) => {
+    const manual = a.manual_action || {};
+    const kind = manual.kind || '';
+    const synthetic = !!a.synthetic;
+    const restart = !synthetic
+      && (kind === 'restart_required' || manual.error_code === 'APP_RESTART_REQUIRED');
+    return `<div class="item">
+      <div><b>${esc(a.task_id)}</b> · ${esc(a.agent_name || a.agent_id || '')}
+        <span class="pill warn">${esc(kind || '需要人工处理')}</span></div>
+      <div class="sub">${esc(a.error || manual.message || '')}</div>
+      <div style="margin:6px 0">${esc(manual.instructions || '请在对应 Agent 应用中完成提交/审批；完成后链路会自动继续。')}</div>
+      ${manual.prompt_file ? `<div class="sub mono">任务说明：${esc(manual.prompt_file)}</div>` : ''}
+      <div class="row" style="margin-top:6px">
+        ${restart ? `<button class="primary small" onclick="restartAgentInterface('${esc(a.agent_id)}','${esc(a.task_uid)}','${esc(run.run_id)}')">重启 Agent 接口</button>` : ''}
+        ${synthetic ? `<button class="primary small" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
+        ${!synthetic && (restart || ['agent_not_running', 'agent_busy', 'login_required'].includes(kind)) ? `<button class="small" onclick="retryNode('${esc(a.task_uid)}','${esc(run.run_id)}')">重试该节点</button>` : ''}
+        <button class="small" onclick="refresh()">刷新状态</button>
+      </div>
+    </div>`;
+  }).join('');
+  box.innerHTML = `<h3>链路已阻塞：需要人工处理 ${actions.length} 个节点</h3>
+    <div class="sub">阻塞期间不会启动下一个节点；该节点完成后自动继续。</div>${items}`;
+  box.classList.remove('hidden');
 }
 
 function renderCommandPlans() {
@@ -420,14 +759,116 @@ async function setAgentModelFromCard(agentId, model) {
 /* ------------------------------------------------------------------ */
 /* Multi-agent chain: one agent + one real model per stage             */
 /* ------------------------------------------------------------------ */
-const CHAIN_STAGES = [
-  { agent: 'trae_cn', type: 'analysis', label: '阶段 1 · 扫描' },
-  { agent: 'qoder_cn', type: 'review', label: '阶段 2 · 查 Bug' },
-  { agent: 'opencode', type: 'implementation', label: '阶段 3 · 生成测试' },
+const CHAIN_TASK_TYPES = [
+  'analysis', 'review', 'implementation', 'verification', 'documentation', 'architecture',
+];
+const CHAIN_DEFAULT_STAGES = [
+  { agent_id: 'trae_cn', type: 'analysis', title: '阶段 1 · 扫描' },
+  { agent_id: 'qoder_cn', type: 'review', title: '阶段 2 · 查 Bug' },
+  { agent_id: 'opencode', type: 'implementation', title: '阶段 3 · 生成测试' },
 ];
 
 function chainAgentList() {
   return (((state.overview || {}).agents || {}).list || []);
+}
+
+function chainProjectKey() {
+  return (((state.workspace || {}).project_id) ||
+    (((state.overview || {}).project || {}).project_id) || 'default');
+}
+function chainStorageKey() {
+  return 'agentmesh.chain.' + chainProjectKey();
+}
+function pendingPlan() {
+  return (state.plans || []).find((p) => p.status === 'pending_approval') || null;
+}
+
+function agentModels(agentId) {
+  return (((state.models || {}).by_agent || {})[agentId] || {}).models || [];
+}
+function firstAgentWithModel() {
+  const agents = chainAgentList();
+  return agents.find((a) => agentModels(a.agent_id).length)
+    || agents.find((a) => a.status === 'online') || agents[0] || {};
+}
+
+function defaultChainStages() {
+  const agents = chainAgentList();
+  return CHAIN_DEFAULT_STAGES.map((stage) => {
+    let agent = agents.find((a) => a.agent_id === stage.agent_id);
+    if (!agent || !agentModels(agent.agent_id).length) agent = firstAgentWithModel();
+    const models = agentModels(agent.agent_id || '');
+    return {
+      task_id: '', title: stage.title,
+      agent_id: agent.agent_id || stage.agent_id,
+      model: models.length ? models[0].name : '',
+      type: stage.type,
+    };
+  });
+}
+
+function chainStagesFromPlan(plan) {
+  const agents = chainAgentList();
+  return (plan.tasks || []).map((task, index) => {
+    const agentId = task.suggested_agent || (agents[0] && agents[0].agent_id) || '';
+    const agent = agents.find((a) => a.agent_id === agentId);
+    const models = (((state.models || {}).by_agent || {})[agentId] || {}).models || [];
+    const selected = (agent && agent.extra && agent.extra.selected_model) || '';
+    return {
+      task_id: task.task_id || '',
+      title: `${task.task_id || 'T' + String(index + 1).padStart(3, '0')} · ${task.title || ''}`,
+      agent_id: agentId,
+      model: task.model || selected || (models.length ? models[0].name : ''),
+      type: task.type || 'analysis',
+    };
+  });
+}
+
+function ensureChainDraft() {
+  const projectKey = chainProjectKey();
+  if (state.chainDraft && state.chainHydratedFor === projectKey) return;
+  let draft = null;
+  const server = ((state.overview || {}).chain_draft) || {};
+  if (Array.isArray(server.stages) && server.stages.length
+      && (!server.project_id || server.project_id === projectKey)) {
+    draft = server;
+  }
+  if (!draft) {
+    try { draft = JSON.parse(localStorage.getItem(chainStorageKey()) || 'null'); }
+    catch (e) { draft = null; }
+  }
+  if (!draft) {
+    const plan = pendingPlan();
+    draft = {
+      plan_id: plan ? plan.plan_id : '',
+      goal: (plan && plan.goal) || ($('chainGoal') && $('chainGoal').value) || '',
+      policy: 'balanced',
+      stages: plan ? chainStagesFromPlan(plan) : defaultChainStages(),
+    };
+  }
+  draft.stages = (draft.stages || []).map((s) => ({ ...s }));
+  if (!draft.stages.length) draft.stages = defaultChainStages();
+  state.chainDraft = draft;
+  state.chainHydratedFor = projectKey;
+  if ($('chainGoal') && draft.goal) $('chainGoal').value = draft.goal;
+  if ($('chainPolicy') && draft.policy) $('chainPolicy').value = draft.policy;
+  renderChainPlanInfo();
+}
+
+function renderChainPlanInfo() {
+  const box = $('chainPlanInfo');
+  if (!box || !state.chainDraft) return;
+  const plan = pendingPlan();
+  const bound = state.chainDraft.plan_id || '';
+  const count = (state.chainDraft.stages || []).length;
+  if (bound) {
+    const target = (state.plans || []).find((p) => p.plan_id === bound);
+    box.innerHTML = `绑定计划 <span class="mono">${esc(bound)}</span> · ${count} 个阶段`
+      + (target ? ` · <span class="pill ${pillClass(target.status)}">${esc(target.status)}</span>` : '')
+      + (plan && plan.plan_id !== bound ? ' · <b style="color:#b45309">已有更新的待审批计划，请点击“从计划载入阶段”</b>' : '');
+  } else {
+    box.textContent = `独立链路 · ${count} 个阶段（保存后生成待审批计划）`;
+  }
 }
 
 function chainModelOptions(agentId, selected) {
@@ -446,57 +887,149 @@ function chainModelOptions(agentId, selected) {
 function renderChain() {
   const box = $('chainStages');
   if (!box) return;
+  ensureChainDraft();
+  // A refresh can finish while the user is mid-edit; rebuilding the whole
+  // chain here is exactly what used to wipe custom stage/model choices.
+  const active = document.activeElement;
+  if (active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)
+      && active.closest && active.closest('#chainStages, #chainGoal, #chainPolicy')) {
+    return;
+  }
   const agents = chainAgentList();
   if (!agents.length) {
     box.innerHTML = '<div class="empty">尚未打开项目或没有 Agent</div>';
     return;
   }
-  const rows = CHAIN_STAGES.map((stage, index) => {
-    const current = (state.chainDraft || [])[index] || {};
-    const agentId = current.agent || stage.agent;
+  const stages = state.chainDraft.stages || [];
+  const rows = stages.map((stage, index) => {
+    const agentId = stage.agent_id || '';
     const agentOptions = agents.map((a) => (
       `<option value="${esc(a.agent_id)}" ${a.agent_id === agentId ? 'selected' : ''}>${esc(a.name)} · ${esc(a.adapter_type || '')}</option>`
-    )).join('');
-    const modelId = current.model || '';
-    return `<div class="row" style="align-items:flex-end;gap:8px;margin-bottom:8px">
-      <div style="min-width:88px"><label>${esc(stage.label)}</label></div>
+    )).join('') + (agentId && !agents.some((a) => a.agent_id === agentId)
+      ? `<option value="${esc(agentId)}" selected>${esc(agentId)}（未探测）</option>` : '');
+    const label = stage.title || `阶段 ${index + 1}`;
+    return `<div class="row chain-row" style="align-items:flex-end;gap:8px;margin-bottom:8px">
+      <div style="min-width:180px;max-width:220px"><label>${esc(label)}</label></div>
       <div class="grow"><label>Agent</label>
         <select id="chainAgent${index}" onchange="onChainAgentChange(${index})">${agentOptions}</select></div>
       <div class="grow"><label>模型（真实清单）</label>
-        <select id="chainModel${index}">${chainModelOptions(agentId, modelId)}</select></div>
+        <select id="chainModel${index}" onchange="chainFieldChanged()">${chainModelOptions(agentId, stage.model || '')}</select></div>
       <div style="min-width:150px"><label>任务类型</label>
-        <select id="chainType${index}">
-          ${['analysis', 'review', 'implementation', 'verification', 'documentation', 'architecture']
-    .map((t) => `<option value="${t}" ${t === (current.type || stage.type) ? 'selected' : ''}>${t}</option>`).join('')}
+        <select id="chainType${index}" onchange="chainFieldChanged()">
+          ${CHAIN_TASK_TYPES.map((t) => `<option value="${t}" ${t === (stage.type || 'analysis') ? 'selected' : ''}>${t}</option>`).join('')}
         </select></div>
+      <button class="del small" title="删除该阶段" onclick="removeChainStage(${index})">×</button>
     </div>`;
   }).join('');
   box.innerHTML = rows;
+  renderChainPlanInfo();
 }
 
 function onChainAgentChange(index) {
   const agentId = $('chainAgent' + index).value;
   $('chainModel' + index).innerHTML = chainModelOptions(agentId, '');
+  chainFieldChanged();
 }
 
 function chainCollect() {
   const stages = [];
-  CHAIN_STAGES.forEach((_, index) => {
+  (state.chainDraft.stages || []).forEach((stage, index) => {
+    const agent = $('chainAgent' + index);
+    const model = $('chainModel' + index);
+    const type = $('chainType' + index);
     stages.push({
-      agent_id: $('chainAgent' + index).value,
-      model: $('chainModel' + index).value,
-      type: $('chainType' + index).value,
+      task_id: stage.task_id || '',
+      title: stage.title || '',
+      agent_id: agent ? agent.value : stage.agent_id,
+      model: model ? model.value : stage.model,
+      type: type ? type.value : stage.type,
     });
   });
   return stages;
 }
 
+function chainFieldChanged() {
+  ensureChainDraft();
+  state.chainDraft.stages = chainCollect();
+  state.chainDraft.goal = $('chainGoal') ? $('chainGoal').value : state.chainDraft.goal;
+  state.chainDraft.policy = $('chainPolicy') ? $('chainPolicy').value : state.chainDraft.policy;
+  try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
+  clearTimeout(state.chainPersistTimer);
+  state.chainPersistTimer = setTimeout(() => {
+    post('/api/chain/draft', { draft: state.chainDraft }).catch(() => { /* draft is also local */ });
+  }, 700);
+}
+
+function loadChainFromPlan(silent = false) {
+  const plan = pendingPlan();
+  if (!plan) { if (!silent) toast('当前没有待审批计划，请先在“生成任务计划”生成计划', true); return false; }
+  state.chainDraft = {
+    plan_id: plan.plan_id, goal: plan.goal || '',
+    policy: ($('chainPolicy') && $('chainPolicy').value) || 'balanced',
+    stages: chainStagesFromPlan(plan),
+  };
+  state.chainHydratedFor = chainProjectKey();
+  if ($('chainGoal')) $('chainGoal').value = state.chainDraft.goal;
+  try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
+  renderChain();
+  chainFieldChanged();
+  if (!silent) toast(`已从计划载入 ${state.chainDraft.stages.length} 个阶段`);
+  return true;
+}
+
+function addChainStage() {
+  ensureChainDraft();
+  if (state.chainDraft.plan_id) {
+    toast('阶段数量由绑定的计划决定；请先在“生成任务计划”生成新计划，或点击“从计划载入阶段”', true);
+    return;
+  }
+  const agent = firstAgentWithModel();
+  const models = agentModels(agent.agent_id || '');
+  state.chainDraft.stages.push({
+    task_id: '', title: `阶段 ${state.chainDraft.stages.length + 1}`,
+    agent_id: agent.agent_id || '', model: models.length ? models[0].name : '',
+    type: 'analysis',
+  });
+  renderChain();
+  chainFieldChanged();
+}
+
+function removeChainStage(index) {
+  ensureChainDraft();
+  if (state.chainDraft.plan_id) {
+    toast('阶段数量由绑定的计划决定，不能单独删除；请先生成新计划', true);
+    return;
+  }
+  if (state.chainDraft.stages.length <= 1) { toast('至少保留一个阶段', true); return; }
+  state.chainDraft.stages.splice(index, 1);
+  renderChain();
+  chainFieldChanged();
+}
+
+function resetChain() {
+  state.chainDraft = null;
+  state.chainHydratedFor = '';
+  const plan = pendingPlan();
+  if (plan) { loadChainFromPlan(true); toast('已重置为当前计划的任务'); }
+  else {
+    state.chainDraft = { plan_id: '', goal: '', policy: 'balanced', stages: defaultChainStages() };
+    state.chainHydratedFor = chainProjectKey();
+    renderChain();
+    chainFieldChanged();
+    toast('已重置为默认三个阶段');
+  }
+}
+
 async function autoSelectChain() {
+  ensureChainDraft();
   $('chainStatus').textContent = '正在计算最省且够用的组合…';
   const reasons = [];
   try {
-    for (let i = 0; i < CHAIN_STAGES.length; i += 1) {
-      const type = $('chainType' + i).value;
+    const count = (state.chainDraft.stages || []).length;
+    for (let i = 0; i < count; i += 1) {
+      const typeEl = $('chainType' + i);
+      if (!typeEl) continue;
+      const type = typeEl.value;
       const policy = ($('chainPolicy') && $('chainPolicy').value) || 'balanced';
       const rec = await api('/api/models/recommend?task_type=' + encodeURIComponent(type)
         + '&limit=8&profile=' + encodeURIComponent(policy));
@@ -507,6 +1040,7 @@ async function autoSelectChain() {
       $('chainModel' + i).value = pick.model;
       reasons.push(`${type}: ${pick.agent_name} / ${pick.model}（成本 ${pick.cost} · ${pick.cost_source}）`);
     }
+    chainFieldChanged();
     $('chainRecommend').innerHTML = reasons.map((r) => `<div>· ${esc(r)}</div>`).join('');
     $('chainStatus').textContent = '已按“质量阈值内最低成本”填好';
     toast('智能选型完成');
@@ -522,6 +1056,9 @@ async function preflightChain() {
     toast('每个阶段都必须选择 Agent 和模型', true);
     return;
   }
+  if (!confirm('预检会把已选 Agent 打开/重启到带程序接口的状态（Trae、WorkBuddy 会被关闭后重新打开）。继续？')) {
+    return;
+  }
   $('chainStatus').textContent = '正在打开 Agent 并绑定工作区/模型…（可能需要 1-3 分钟）';
   $('chainPreflight').innerHTML = '<div class="sub">执行中：会重启 Trae/Qoder 等桌面应用，请勿操作。</div>';
   try {
@@ -529,6 +1066,7 @@ async function preflightChain() {
       stages,
       workspace: (state.workspace && state.workspace.root) || '',
       open_apps: true,
+      full_control: !!($('fullControl') && $('fullControl').checked),
     });
     const rows = (result.agents || []).map((a) => `<tr>
       <td>${esc(a.agent_id)}</td>
@@ -551,31 +1089,147 @@ async function preflightChain() {
   }
 }
 
-async function runChain() {
+async function saveChainConfig() {
+  ensureChainDraft();
   const goal = ($('chainGoal').value || '').trim();
-  if (!goal) { toast('请填写链路目标', true); return; }
   const stages = chainCollect();
-  if (stages.some((s) => !s.agent_id || !s.model)) {
+  if (!goal) { toast('请填写链路目标（或从计划载入）', true); return; }
+  if (!stages.length || stages.some((s) => !s.agent_id || !s.model)) {
     toast('每个阶段都必须选择一个 Agent 和它的真实模型', true);
     return;
   }
-  $('chainStatus').textContent = '正在配置…';
+  let planId = state.chainDraft.plan_id || '';
+  const pending = pendingPlan();
+  if (planId && (!pending || pending.plan_id !== planId)) {
+    if (pending) {
+      toast('当前待审批计划已更新，请先点击“从计划载入阶段”再保存', true);
+      return;
+    }
+    planId = '';
+  }
+  if (!planId && pending) {
+    const planCount = (pending.tasks || []).length;
+    if (stages.length !== planCount) {
+      toast(`当前计划有 ${planCount} 个任务，与 ${stages.length} 个阶段不一致；请先点击“从计划载入阶段”`, true);
+      return;
+    }
+    planId = pending.plan_id;
+  }
+  $('chainStatus').textContent = '正在保存链路配置…';
   try {
     const result = await post('/api/chain', {
-      goal, stages, start: true, background: true,
+      goal, stages, plan_id: planId, save_only: true,
       main_agent_id: ($('mainAgent').value || ''), max_parallel: 1,
+      start: false, approve: false,
     });
-    state.chainDraft = stages;
-    state.chainRunId = result.run_id;
-    $('chainStatus').textContent = `已启动 ${result.run_id}`;
-    toast('链路已配置并启动');
-    renderChainResult(result);
+    state.chainDraft.plan_id = result.plan_id || planId;
+    state.chainDraft.goal = goal;
+    try { localStorage.setItem(chainStorageKey(), JSON.stringify(state.chainDraft)); } catch (e) { /* quota */ }
+    await post('/api/chain/draft', { draft: state.chainDraft }).catch(() => {});
+    $('chainStatus').textContent = `已保存 ${result.plan_id} · ${stages.length} 阶段（待审批）`;
+    toast('链路配置已保存。请到第 4 步批准计划，再点击“开始执行”。');
+    $('chainPlanInfo').textContent = `已保存到 ${result.plan_id}；第 4 步批准后才会开始执行`;
     refresh();
-    pollChain(result.run_id);
   } catch (e) {
-    $('chainStatus').textContent = '配置失败';
-    toast('链路配置失败：' + e.message, true);
+    $('chainStatus').textContent = '保存失败';
+    toast('保存链路配置失败：' + e.message, true);
   }
+}
+
+async function retryNode(uid, runId) {
+  if (!uid) return;
+  try {
+    await post('/api/tasks/' + encodeURIComponent(uid) + '/retry', {});
+    if (runId) {
+      await post('/api/runs/' + encodeURIComponent(runId) + '/resume',
+        { background: true, max_parallel: 1 }).catch(() => {});
+    }
+    toast('节点已重新排队，运行继续');
+    refresh();
+  } catch (e) { toast('重试失败：' + e.message, true); }
+}
+
+function openBindingEditor(uid) {
+  const task = (state.tasks || []).find((t) => t.uid === uid);
+  if (!task) { toast('任务不在当前列表，请先刷新', true); return; }
+  state.bindingTask = task;
+  const agents = chainAgentList();
+  const agentId = task.assigned_agent || (task.spec && task.spec.suggested_agent) || '';
+  const model = (task.spec && task.spec.model) || task.model || '';
+  $('bindingTitle').textContent = `编辑节点 ${task.task_id}`;
+  $('bindingInfo').textContent = `状态 ${task.status} · 修改后对排队/阻塞/等待节点立即生效；正在运行的节点请等结束或重试。`;
+  $('bindingAgent').innerHTML = agents.map((a) => (
+    `<option value="${esc(a.agent_id)}" ${a.agent_id === agentId ? 'selected' : ''}>${esc(a.name)} · ${esc(a.adapter_type || '')}</option>`
+  )).join('') + (agentId && !agents.some((a) => a.agent_id === agentId)
+    ? `<option value="${esc(agentId)}" selected>${esc(agentId)}（未探测）</option>` : '');
+  $('bindingModel').innerHTML = chainModelOptions(agentId, model);
+  const chosen = $('bindingModel').value || model;
+  const profile = modelProfile(agentId, chosen);
+  const spec = task.spec || {};
+  fillProfileInputs('bindingContext', 'bindingCapability', agentId, chosen, {
+    context: spec.context_length || profile.context_length || 0,
+    capability: spec.capability_level || profile.capability_level || '',
+  });
+  $('bindingModal').style.display = 'flex';
+}
+function onBindingAgentChange() {
+  const agentId = $('bindingAgent').value;
+  $('bindingModel').innerHTML = chainModelOptions(agentId, '');
+  fillProfileInputs('bindingContext', 'bindingCapability', agentId,
+    $('bindingModel').value);
+}
+function onBindingModelChange() {
+  const agentId = $('bindingAgent').value;
+  fillProfileInputs('bindingContext', 'bindingCapability', agentId,
+    $('bindingModel').value);
+}
+function closeBindingEditor() {
+  $('bindingModal').style.display = 'none';
+  state.bindingTask = null;
+}
+async function saveBindingEditor() {
+  const task = state.bindingTask;
+  if (!task) return;
+  const contextLength = Math.max(0, Number($('bindingContext').value || 0));
+  const capabilityLevel = $('bindingCapability').value || '';
+  try {
+    validateProfileInputs($('bindingAgent').value, $('bindingModel').value,
+      contextLength, capabilityLevel);
+    await post('/api/tasks/' + encodeURIComponent(task.uid) + '/binding', {
+      agent_id: $('bindingAgent').value,
+      model: $('bindingModel').value,
+      context_length: contextLength,
+      capability_level: capabilityLevel,
+    });
+    closeBindingEditor();
+    toast('节点绑定已更新');
+    refresh();
+  } catch (e) { toast('更新绑定失败：' + e.message, true); }
+}
+
+async function reverifyNode(uid) {
+  if (!uid) return;
+  try {
+    const r = await post('/api/tasks/' + encodeURIComponent(uid) + '/reverify', {});
+    toast(`重新验证完成：${r.status} · ${r.verification_status || ''}`,
+      r.status === 'failed');
+    refresh();
+  } catch (e) { toast('重新验证失败：' + e.message, true); }
+}
+
+async function restartAgentInterface(agentId, uid, runId) {
+  try {
+    const r = await post('/api/agents/' + encodeURIComponent(agentId) + '/interface/restart', {});
+    toast(r.ok ? '程序接口已就绪' : ('重启失败：' + (r.reason || '未知原因')), !r.ok);
+    if (r.ok && uid) {
+      await post('/api/tasks/' + encodeURIComponent(uid) + '/retry', {}).catch(() => {});
+      if (runId) {
+        await post('/api/runs/' + encodeURIComponent(runId) + '/resume',
+          { background: true, max_parallel: 1 }).catch(() => {});
+      }
+    }
+    refresh();
+  } catch (e) { toast('重启失败：' + e.message, true); }
 }
 
 function renderChainResult(payload) {
@@ -658,6 +1312,122 @@ function renderModelSync() {
   const age = (s.age_hours == null) ? '未知' : `${s.age_hours} 小时前`;
   box.innerHTML = `模型目录上次同步：<span class="mono">${esc(s.synced_at)}</span>（${esc(age)}）`
     + (s.stale ? ' <span class="pill warn">已过期，将自动同步</span>' : ' <span class="pill ok">最新</span>');
+}
+
+/* ------------------------------------------------------------------ */
+/* 角色路由                                                            */
+/* ------------------------------------------------------------------ */
+async function loadRoles(force) {
+  if (state.roles && !force) return state.roles;
+  try {
+    state.roles = await api('/api/roles');
+  } catch (e) {
+    state.roles = { error: e.message, roles: [] };
+  }
+  return state.roles;
+}
+
+function solvePins() {
+  const split = (value) => {
+    const text = (value || '').trim();
+    if (!text) return {};
+    const idx = text.indexOf(':');
+    if (idx <= 0) throw new Error('格式应为 agent:model，例如 qoder_cn:DeepSeek-Flash');
+    return { agent: text.slice(0, idx), model: text.slice(idx + 1) };
+  };
+  const ex = split($('solveExecutor').value);
+  const cm = split($('solveCommander').value);
+  return {
+    executor_agent: ex.agent || '', executor_model: ex.model || '',
+    commander_agent: cm.agent || '', commander_model: cm.model || '',
+  };
+}
+
+function roleTableHtml(policy) {
+  const rows = policy.roles || [];
+  if (!rows.length) return `<div class="empty">${esc(policy.error || '当前没有可解析的角色')}</div>`;
+  return `<table class="table"><thead><tr>
+      <th>角色</th><th>任务类型</th><th>可写</th><th>首选候选</th><th>候选数</th><th>状态</th>
+    </tr></thead><tbody>` + rows.map((r) => {
+      const first = (r.resolved || [])[0] || {};
+      return `<tr>
+        <td><b>${esc(r.role)}</b><div class="sub">${esc(r.description || '')}</div></td>
+        <td class="mono">${esc(r.task_type)}</td>
+        <td>${r.write ? '是' : '否'}</td>
+        <td class="mono">${first.agent_id ? esc(first.agent_id) + ' / ' + esc(first.model) : '—'}
+          ${first.tier !== undefined ? `<span class="pill ${first.tier >= 3 ? 'warn' : 'ok'}">tier ${esc(first.tier)} ${esc(first.tier_label || '')}</span>` : ''}</td>
+        <td>${esc(r.resolved_count || 0)}</td>
+        <td><span class="pill ${r.status === 'ready' ? 'ok' : 'bad'}">${esc(r.status)}</span></td>
+      </tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+async function renderRoles() {
+  if (state.view !== 'roles') return;
+  const policy = await loadRoles(false);
+  const box = $('rolePolicy');
+  if (!box) return;
+  box.className = '';
+  box.innerHTML = `<div class="sub" style="margin-bottom:8px">策略 <b>${esc(policy.name || '')}</b>
+      来源 ${esc(policy.source || '')} · premium 档从 tier ${esc(policy.premium_tier)} 起 ·
+      单次最多 ${esc(policy.max_premium_tasks_per_run)} 个贵任务</div>` + roleTableHtml(policy);
+}
+
+async function previewSegment() {
+  const goal = $('solveGoal').value.trim();
+  if (!goal) { toast('请先输入需求', true); return; }
+  try {
+    const body = Object.assign({ goal }, solvePins());
+    const data = await post('/api/segment', body);
+    const tasks = data.tasks || [];
+    const bindings = data.bindings || [];
+    $('segmentResult').className = '';
+    $('segmentResult').innerHTML = `<div class="sub">置信度 ${esc(data.confidence)} ·
+        切出 ${tasks.length} 个任务</div>` + tasks.map((t, i) => {
+      const b = bindings[i] || {};
+      const c = (b.candidates || [])[0] || {};
+      return `<div class="drift" style="border-left-color:#6366f1;background:#eef2ff">
+        <b>${esc(t.task_id)} · ${esc(t.role)} · ${esc(t.type)}</b>
+        <span class="sub">scope ${esc((t.scope || []).join(', ') || '（只读）')} ·
+          候选 ${esc(c.agent_id || '无')} / ${esc(c.model || '无')}
+          ${c.tier !== undefined ? '· tier ' + esc(c.tier) : ''}</span>
+        <div class="sub">${esc(t.objective || '').split('\n').slice(-2).join(' ')}</div>
+      </div>`;
+    }).join('') + ((data.notes || []).length
+      ? `<div class="sub">${esc(data.notes.join('；'))}</div>` : '');
+  } catch (e) { toast(e.message, true); }
+}
+
+async function runSolve() {
+  const goal = $('solveGoal').value.trim();
+  if (!goal) { toast('请先输入需求', true); return; }
+  try {
+    const body = Object.assign({ goal, start: true, background: false }, solvePins());
+    $('solveResult').className = 'muted';
+    $('solveResult').textContent = '运行中（GUI Agent 可能需要 1–5 分钟）…';
+    const out = await post('/api/solve', body);
+    const answer = out.answer || {};
+    const bindings = out.bindings || [];
+    let html = `<div class="sub">run ${esc(out.run_id)} · 置信度 ${esc(out.confidence)} ·
+        premium 任务 ${esc(out.premium_tasks)}/${esc(out.premium_budget)}</div>`;
+    html += `<table class="table"><thead><tr><th>任务</th><th>角色</th><th>Agent</th>
+        <th>模型</th><th>档位</th><th>降级</th></tr></thead><tbody>` + bindings.map((b) => `
+        <tr><td class="mono">${esc(b.task_id)}</td><td>${esc(b.role)}</td>
+        <td>${esc(b.agent_id || '—')}</td><td class="mono">${esc(b.model || '—')}</td>
+        <td>${b.tier !== undefined ? 'tier ' + esc(b.tier) : '—'}</td>
+        <td>${b.downgraded ? '是' : '否'}</td></tr>`).join('') + '</tbody></table>';
+    if (answer.answer_markdown) {
+      html += `<pre style="white-space:pre-wrap;max-height:520px">${esc(answer.answer_markdown)}</pre>`;
+    }
+    $('solveResult').className = '';
+    $('solveResult').innerHTML = html;
+    toast('已生成汇总答案');
+    refresh();
+  } catch (e) {
+    $('solveResult').className = 'muted';
+    $('solveResult').textContent = e.message;
+    toast(e.message, true);
+  }
 }
 
 function renderVersions() {
@@ -1019,7 +1789,7 @@ function connectStream() {
       state.lastSeq = Math.max(state.lastSeq, Number(ev.seq || 0));
       const payload = JSON.stringify(ev.payload || {});
       appendConsole('bus', `[${ev.seq}] ${ev.created_at || ''} ${ev.kind} ${ev.topic} ← ${ev.source} :: ${payload.slice(0, 300)}`);
-      if (['task_state', 'workflow', 'governance', 'agent_status'].includes(ev.kind)) scheduleRefresh();
+      if (['task_state', 'workflow', 'governance', 'agent_status', 'manual_action'].includes(ev.kind)) scheduleRefresh();
     } catch (err) {}
   });
   es.addEventListener('snapshot', (e) => {
@@ -1089,7 +1859,7 @@ async function initWorkspace() {
     $('wsPath').value = p.root || path;
     $('wsPath').dataset.touched = '1';
     toast('项目已初始化并打开');
-    state.lastSeq = 0; clearConsole(); await refresh();
+    state.lastSeq = 0; clearConsole(); await refresh(); loadRecentProjects();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1101,7 +1871,7 @@ async function openWorkspace() {
     $('wsPath').value = (r.workspace || {}).root || path;
     $('wsPath').dataset.touched = '1';
     toast('项目已打开');
-    state.lastSeq = 0; clearConsole(); await refresh();
+    state.lastSeq = 0; clearConsole(); await refresh(); loadRecentProjects();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1141,7 +1911,11 @@ async function requestPlan() {
       toast((job && job.error && job.error.message) || '规划失败', true); return;
     }
     const out = job.result || {};
-    if (out.status === 'pending_approval') { toast('计划已生成，待审批'); refresh(); }
+    if (out.status === 'pending_approval') {
+      toast('计划已生成，待审批；3.5 已载入该计划的阶段');
+      await refresh();
+      loadChainFromPlan(true);
+    }
     else if (out.status === 'waiting_user') {
       $('planResult').innerHTML = `<div class="card"><h3>等待主节点 UI 执行</h3><div class="sub">提示词：${esc(out.prompt_path || '')}</div><pre>${esc(out.message || '')}</pre></div>`;
     } else { toast(out.error || '规划未完成', true); }
@@ -1308,19 +2082,185 @@ async function loadRecovery() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 工作目录选择：本机文件系统浏览（对应 DSH web 版的 browse 能力）      */
+/* ------------------------------------------------------------------ */
+const dirState = { path: '', entries: [], selected: '', hidden: false, seq: 0 };
+
+function dirJoinName(name) {
+  const base = dirState.path || '';
+  if (!base) return name;
+  const sep = base.includes('\\') ? '\\' : '/';
+  return base.endsWith(sep) ? base + name : base + sep + name;
+}
+
+async function loadRecentProjects() {
+  const box = $('recentBox');
+  if (!box) return;
+  try {
+    const data = await api('/api/workspaces/recent');
+    const rows = data.projects || [];
+    if (!rows.length) { box.innerHTML = ''; return; }
+    box.innerHTML = '<span class="sub" style="margin-right:2px">最近打开</span>';
+    rows.forEach((project) => {
+      const chip = document.createElement('span');
+      chip.className = 'recent-chip';
+      chip.title = project.path + (project.exists ? '' : '（目录已不存在）');
+      chip.innerHTML = project.exists ? esc(project.name) : `<span class="miss">${esc(project.name)}</span>`;
+      chip.onclick = () => {
+        $('wsPath').value = project.path;
+        $('wsPath').dataset.touched = '1';
+        toast(project.exists ? '已填入最近项目' : '目录已不存在，请重新选择', !project.exists);
+      };
+      box.appendChild(chip);
+    });
+  } catch (e) { /* 最近列表只是便捷入口，失败不影响主流程 */ }
+}
+
+function openDirPicker() {
+  $('dirModal').style.display = 'flex';
+  const initial = ($('wsPath').value || '').trim();
+  loadDir(initial);
+}
+
+function closeDirPicker() {
+  $('dirModal').style.display = 'none';
+  dirState.seq += 1;
+}
+
+function dirToggleHidden() {
+  dirState.hidden = !dirState.hidden;
+  $('dirHiddenBtn').textContent = dirState.hidden ? '隐藏隐藏项' : '显示隐藏项';
+  if (dirState.last) renderDir(dirState.last);
+}
+
+async function loadDir(path) {
+  const seq = ++dirState.seq;
+  $('dirList').innerHTML = '<div class="empty">加载中…</div>';
+  const url = '/api/fs/list' + (path ? ('?path=' + encodeURIComponent(path)) : '');
+  try {
+    const data = await api(url);
+    if (seq !== dirState.seq) return;  // 已被更晚的一次导航取代
+    dirState.last = data;
+    dirState.path = data.path || '';
+    dirState.entries = data.entries || [];
+    dirState.selected = '';
+    renderDir(data);
+  } catch (e) {
+    if (seq !== dirState.seq) return;
+    $('dirList').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function renderDir(data) {
+  $('dirPathInput').value = data.path || '';
+  $('dirCrumbs').innerHTML = (data.ancestry || []).map((node, index) =>
+    (index ? '<span class="sep">›</span>' : '') +
+    `<a data-path="${esc(node.path)}">${esc(node.name)}</a>`).join('');
+  $('dirCrumbs').querySelectorAll('a').forEach((link) => {
+    link.onclick = () => loadDir(link.dataset.path);
+  });
+  $('dirRoots').innerHTML = (data.roots || []).map((root) =>
+    `<button class="small" data-path="${esc(root.path)}">${esc(root.name)}</button>`).join('');
+  $('dirRoots').querySelectorAll('button').forEach((button) => {
+    button.onclick = () => loadDir(button.dataset.path);
+  });
+
+  const rows = dirState.entries.filter((entry) => dirState.hidden || !entry.hidden);
+  if (!rows.length) {
+    $('dirList').innerHTML = `<div class="empty">${esc(data.error || '空目录')}</div>`;
+  } else {
+    $('dirList').innerHTML = '';
+    rows.forEach((entry) => {
+      const row = document.createElement('div');
+      row.className = 'dirrow' + (entry.is_dir ? '' : ' file');
+      row.innerHTML = `<span>${entry.is_dir ? '📁' : '📄'}</span>
+        <span class="nm">${esc(entry.name)}</span>
+        <span class="meta">${entry.is_dir ? '目录' : (entry.size ? Math.max(1, Math.round(entry.size / 1024)) + ' KB' : '文件')}</span>`;
+      if (entry.is_dir) {
+        row.onclick = () => {
+          dirState.selected = entry.path;
+          $('dirSelected').textContent = entry.name;
+          $('dirList').querySelectorAll('.dirrow').forEach((el) => el.classList.remove('sel'));
+          row.classList.add('sel');
+        };
+        row.ondblclick = () => loadDir(entry.path);
+      } else {
+        row.style.opacity = '.55';
+      }
+      $('dirList').appendChild(row);
+    });
+  }
+  $('dirSelected').textContent = '未选择';
+  if (data.error) toast(data.error, true);
+}
+
+function dirUp() {
+  const parent = (dirState.last || {}).parent;
+  if (parent) loadDir(parent);
+}
+
+function dirHome() {
+  const home = (dirState.last || {}).home;
+  if (home) loadDir(home);
+}
+
+function dirGo() {
+  const value = ($('dirPathInput').value || '').trim();
+  if (value) loadDir(value);
+}
+
+async function dirMkdir() {
+  const name = ($('dirNewName').value || '').trim();
+  if (!name) { toast('请输入文件夹名', true); return; }
+  try {
+    const entry = await post('/api/fs/mkdir', { path: dirState.path, name });
+    $('dirNewName').value = '';
+    await loadDir(dirState.path);
+    dirState.selected = entry.path;
+    $('dirSelected').textContent = entry.name;
+    toast('已创建 ' + entry.name);
+  } catch (e) { toast(e.message, true); }
+}
+
+function dirConfirm() {
+  const chosen = dirState.selected || dirState.path;
+  if (!chosen) { toast('请先选择目录', true); return; }
+  $('wsPath').value = chosen;
+  $('wsPath').dataset.touched = '1';
+  closeDirPicker();
+  toast('已选择工作目录');
+}
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && $('dirModal') && $('dirModal').style.display !== 'none') {
+    closeDirPicker();
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* Render orchestrator / boot                                          */
 /* ------------------------------------------------------------------ */
 function render() {
   renderHeader();
   renderWorkspace();
+  renderFullControl();
+  renderMultiRound();
   if (state.overview) {
     renderCommandAgents();
     renderModelSync();
     renderChain();
     renderCommandApprovals();
     renderCommandRun();
+    renderMainActivity();
+    renderCommandChainNodes();
+    renderBlockAlert();
     renderCommandPlans();
     renderLiveTasks();
+  } else {
+    const alertBox = $('blockAlert');
+    if (alertBox) alertBox.classList.add('hidden');
+  }
+  if (state.overview) {
     const sa = $('sessionAgent');
     const sessionAgents = (state.overview.agents.list || []).filter((a) => a.capabilities && a.capabilities.session_read);
     const current = sa.value;
@@ -1330,6 +2270,7 @@ function render() {
   renderAgents();
   renderSurface();
   renderVersions();
+  renderRoles();
   renderGraph();
   renderTask();
   renderApprovals();
@@ -1344,9 +2285,20 @@ $('budgetTokens').addEventListener('input', () => { $('budgetTokens').dataset.to
 window.addEventListener('hashchange', route);
 route();
 refresh();
+loadRecentProjects();
 setInterval(() => {
   if (state.workspace && state.workspace.open && !state.stream
       && ['agents', 'graph', 'task', 'approvals', 'bus', 'audit', 'versions'].includes(state.view)) {
     refresh();
   }
 }, 12000);
+
+// Command view: keep progress and the blocked-node popup fresh even when the
+// SSE stream is disconnected. scheduleRefresh() skips while a field is focused.
+setInterval(() => {
+  const run = (state.overview || {}).latest_run || {};
+  if (state.workspace && state.workspace.open && state.view === 'command'
+      && ['running', 'waiting_user', 'paused'].includes(run.status)) {
+    scheduleRefresh();
+  }
+}, 4000);
