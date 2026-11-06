@@ -362,6 +362,24 @@ def _newest_workbuddy_session(db: Path, *, started_at: float,
     return None
 
 
+def _workbuddy_session_by_id(db: Path, session_id: str) -> dict[str, Any] | None:
+    if not db.exists() or not session_id:
+        return None
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "select id, cwd, status, mode, model, permission_mode, source_mode, created_at "
+            "from sessions where id=?", (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {"session_id": row[0], "cwd": row[1], "status": row[2],
+            "mode": row[3], "model": row[4], "permission_mode": row[5],
+            "source_mode": row[6], "created_at": row[7], "db": str(db)}
+
+
 def _local_urlopen(url: str, *, timeout: float = 3.0):
     """Loopback probe that ignores HTTP_PROXY (sandbox proxies return 502)."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -496,6 +514,38 @@ def prepare_workbuddy_task(*, workspace: str, model: str, prompt: str,
     )
 
 
+def open_workbuddy_chat(*, session_id: str, launch: Any = None,
+                        config: dict[str, Any] | None = None) -> InterfaceOutcome:
+    """Bring an existing WorkBuddy conversation to the foreground."""
+    from urllib.parse import quote
+
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return InterfaceOutcome(False, "deeplink", {}, {},
+                                reason="session_id 为空",
+                                error_code="MODEL_UNAVAILABLE")
+    row = _workbuddy_session_by_id(workbuddy_db_path(config), session_id)
+    if not row:
+        return InterfaceOutcome(False, "db_read", {"session_id": session_id}, {},
+                                reason="WorkBuddy 中不存在该会话",
+                                error_code="WORKSPACE_MISMATCH")
+    uri = f"workbuddy://chat/{quote(session_id, safe='')}"
+    try:
+        if launch:
+            launch(uri)
+        else:
+            os.startfile(uri)  # type: ignore[attr-defined]
+    except Exception as exc:
+        return InterfaceOutcome(False, "deeplink", {"session_id": session_id}, {},
+                                reason=f"打开既有会话失败: {exc}",
+                                error_code="WORKSPACE_SWITCH_FAILED")
+    return InterfaceOutcome(
+        True, "deeplink", {"session_id": session_id, "workspace": row["cwd"]},
+        {"current_model": row["model"], "current_workspace": row["cwd"]},
+        evidence={"uri": uri, "session_id": session_id, "resumed": True},
+    )
+
+
 def _workbuddy_model_row(model: str,
                          config: dict[str, Any] | None = None) -> dict[str, Any]:
     key = str(model or "").strip().lower()
@@ -509,6 +559,7 @@ def _workbuddy_model_row(model: str,
 
 
 def sync_workbuddy_session_profile(*, workspace: str, started_at: float,
+                                    session_id: str = "",
                                     model: str = "",
                                     context_length: int = 0,
                                     capability_level: str = "",
@@ -522,9 +573,9 @@ def sync_workbuddy_session_profile(*, workspace: str, started_at: float,
     the user's selected values.
     """
     db = workbuddy_db_path(config)
-    session = None
+    session = _workbuddy_session_by_id(db, session_id) if session_id else None
     deadline = time.time() + max(1.0, float(timeout_seconds))
-    while time.time() < deadline:
+    while not session and time.time() < deadline:
         session = _newest_workbuddy_session(db, started_at=started_at,
                                             workspace=workspace)
         if session:
@@ -613,9 +664,11 @@ def sync_workbuddy_session_profile(*, workspace: str, started_at: float,
 def verify_workbuddy_task(*, workspace: str, model: str, started_at: float,
                           welcome_mode: str = "code",
                           permission_mode: str = "fullAccess",
+                          session_id: str = "",
                           config: dict[str, Any] | None = None) -> InterfaceOutcome:
-    row = _newest_workbuddy_session(workbuddy_db_path(config),
-                                    started_at=started_at, workspace=workspace)
+    db = workbuddy_db_path(config)
+    row = _workbuddy_session_by_id(db, session_id) if session_id else \
+        _newest_workbuddy_session(db, started_at=started_at, workspace=workspace)
     expected = {"workspace": workspace, "model": workbuddy_model_key(model),
                 "source_mode": WORKBUDDY_MODE_TO_SOURCE.get(welcome_mode, "craft"),
                 "permission_mode": permission_mode}

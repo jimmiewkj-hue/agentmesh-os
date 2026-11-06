@@ -153,12 +153,33 @@ class PlanningService:
                 "prompt_path": str(prompt_path), "plan_path": str(plan_path),
                 "agent_id": main.agent_id, "message": outcome.text,
             }
+        data = None
         if outcome.status != "completed":
-            return {
-                "status": "failed", "plan_id": "", "error": outcome.error,
-                "prompt_path": str(prompt_path), "plan_path": str(plan_path),
-            }
-        data = read_json(agent_plan_path)
+            # A GUI agent can finish the plan and write plan.json while the
+            # post-reply interface check fails (e.g. the app appended an
+            # effort suffix to the visible model).  Salvage a valid plan
+            # instead of discarding minutes of completed work.
+            if outcome.status == "failed":
+                data = read_json(agent_plan_path)
+                if isinstance(data, dict) and data:
+                    write_json(plan_path, data)
+                    activity.update({
+                        "status": "salvaged",
+                        "salvaged": True,
+                        "original_error": outcome.error[:500],
+                        "finished_at": now_iso(),
+                    })
+                    write_json(activity_path, activity)
+                    self.audit.log(main.agent_id, "plan.salvaged", subject=plan_id,
+                                   payload={"error": outcome.error[:500],
+                                            "plan_path": str(plan_path)})
+            if not isinstance(data, dict) or not data:
+                return {
+                    "status": "failed", "plan_id": "", "error": outcome.error,
+                    "prompt_path": str(prompt_path), "plan_path": str(plan_path),
+                }
+        if data is None:
+            data = read_json(agent_plan_path)
         if not isinstance(data, dict):
             data = outcome.result_payload if isinstance(outcome.result_payload, dict) else None
         if isinstance(data, dict):

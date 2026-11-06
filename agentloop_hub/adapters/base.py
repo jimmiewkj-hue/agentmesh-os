@@ -54,6 +54,10 @@ class ExecutionRequest:
     capability_level: str = ""
     timeout_seconds: int = 1800
     purpose: str = "task"
+    # Run-level chain continuity: for a repeated agent, the control plane
+    # passes the prior completed session and its worktree so the adapter can
+    # continue that conversation instead of opening a new one.
+    resume_session: dict[str, Any] = field(default_factory=dict)
     # When true, GUI adapters switch the target app to its own full-access
     # mode and auto-accept residual permission dialogs via the renderer DOM.
     full_control: bool = True

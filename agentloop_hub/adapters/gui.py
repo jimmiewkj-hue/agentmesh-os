@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from ..control.interfaces import (
-    ensure_workbuddy_cdp, prepare_qoder_session, prepare_workbuddy_task,
-    qoder_model_key, set_model_programmatically, sync_qoder_model_profile,
-    sync_workbuddy_session_profile, verify_qoder_session, verify_workbuddy_task,
-    workbuddy_model_key, workbuddy_user_id,
+    ensure_workbuddy_cdp, open_workbuddy_chat, prepare_qoder_session,
+    prepare_workbuddy_task, qoder_model_key, set_model_programmatically,
+    sync_qoder_model_profile, sync_workbuddy_session_profile,
+    verify_qoder_session, verify_workbuddy_task, workbuddy_model_key,
+    workbuddy_user_id,
 )
 from ..control import trae_interface
 from ..control.zero_input import os_input_allowed
@@ -549,6 +550,23 @@ class GuiAutomationAdapter(BaseAdapter):
         then blocks on a manual action file that the WebUI surfaces.
         """
         method = str(interface_info.get("method") or "")
+        if method == "workbuddy_resume_chat":
+            from ..gui.cdp import send_workbuddy_conversation_prompt
+            session_id = str(interface_info.get("resumed_session_id") or "")
+            result = send_workbuddy_conversation_prompt(
+                session_id, prompt_to_send, port=self.workbuddy_cdp_port,
+                timeout=30,
+            )
+            _log(log_path, "prompt_submitted", marker=marker,
+                 chars=len(prompt_to_send), method="workbuddy-resume-prepare-input",
+                 cdp=result, session_id=session_id)
+            if not result.get("ok"):
+                raise GuiAutomationError(
+                    "GUI_SEND_FAILED",
+                    f"WorkBuddy 续接会话发送失败: {result.get('reason') or result}",
+                    details={"session_id": session_id, "result": result},
+                )
+            return result, None
         if method == "workbuddy_deeplink":
             from ..gui.cdp import send_visible_prompt_via_cdp, submit_composer_via_cdp
             errors: list[str] = []
@@ -762,6 +780,90 @@ class GuiAutomationAdapter(BaseAdapter):
                     cdp.reason or "WorkBuddy CDP 未就绪",
                     details=cdp.to_dict(),
                 )
+            resume = getattr(request, "resume_session", {}) or {}
+            if (resume.get("resume") and resume.get("session_id")
+                    and bool(self.config.get("chain_reuse_agent_sessions", True))):
+                from ..gui.cdp import (switch_workbuddy_conversation,
+                                       wait_for_workbuddy_conversation,
+                                       wait_for_workbuddy_ready)
+                session_id = str(resume["session_id"])
+                # Verified on WorkBuddy 5.9.3: the chat deeplink actually
+                # navigates and updates conversations.currentId; the renderer
+                # setter alone only emits a bus event.
+                opened = open_workbuddy_chat(
+                    session_id=session_id, config=self.config)
+                _log(log_path, "session_resume_deeplink", app=app,
+                     **opened.to_dict())
+                switched: dict[str, Any] = {"ok": False}
+                if opened.ok:
+                    switched = wait_for_workbuddy_conversation(
+                        session_id, port=self.workbuddy_cdp_port,
+                        timeout=float(self.config.get(
+                            "workbuddy_session_switch_timeout_seconds") or 30),
+                    )
+                if not switched.get("ok"):
+                    switched = switch_workbuddy_conversation(
+                        session_id, port=self.workbuddy_cdp_port,
+                        timeout=float(self.config.get(
+                            "workbuddy_session_switch_timeout_seconds") or 30),
+                    )
+                    _log(log_path, "session_resume_switch", app=app,
+                         session_id=session_id, **switched)
+                    if switched.get("ok"):
+                        ready = wait_for_workbuddy_ready(
+                            self.workbuddy_cdp_port,
+                            timeout=float(self.config.get(
+                                "workbuddy_session_switch_timeout_seconds") or 30),
+                        )
+                        switched = {"ok": bool(ready.get("ok")), **ready}
+                if switched.get("ok"):
+                    time.sleep(1.0)
+                verify_resume = verify_workbuddy_task(
+                    workspace=workspace, model=request.model,
+                    started_at=0, welcome_mode=welcome,
+                    permission_mode=permission, session_id=session_id,
+                    config=self.config,
+                ) if switched.get("ok") else None
+                if verify_resume is not None and verify_resume.ok:
+                    profile_sync = sync_workbuddy_session_profile(
+                        workspace=workspace, started_at=0,
+                        session_id=session_id, model=request.model,
+                        context_length=int(getattr(
+                            request, "context_length", 0) or 0),
+                        capability_level=str(getattr(
+                            request, "capability_level", "") or ""),
+                        config=self.config,
+                    )
+                    _log(log_path, "profile_sync", app=app,
+                         **profile_sync.to_dict())
+                    return {
+                        "method": "workbuddy_resume_chat",
+                        "model_key": model_key,
+                        "short_prompt": short_prompt,
+                        "prepare": {
+                            "ok": True,
+                            "method": "cdp_conversation_switch",
+                            "actual": switched,
+                            "evidence": {"session_id": session_id,
+                                         "resumed": True},
+                        },
+                        "prompt_file": str(prompt_copy),
+                        "workspace": workspace,
+                        "welcome_mode": welcome,
+                        "permission_mode": permission,
+                        "resumed_session_id": session_id,
+                        "profile_sync": profile_sync.to_dict(),
+                        "verify": lambda sid=session_id: verify_workbuddy_task(
+                            workspace=workspace, model=request.model,
+                            started_at=0, welcome_mode=welcome,
+                            permission_mode=permission, session_id=sid,
+                            config=self.config,
+                        ),
+                    }
+                _log(log_path, "session_resume_fallback", app=app,
+                     session_id=session_id,
+                     reason=(verify_resume.reason if verify_resume else
+                             switched.get("reason", "")))
             profile_ctx = int(getattr(request, "context_length", 0) or 0)
             profile_cap = str(getattr(request, "capability_level", "") or "")
             selection_sync: dict[str, Any] = {}
@@ -983,7 +1085,7 @@ class GuiAutomationAdapter(BaseAdapter):
             visible = str(model_outcome.actual.get("visible_model") or "")
             _log(log_path, "trae_visible_model", visible=visible,
                  expected=expected_display)
-            if visible.lower() != expected_display.lower():
+            if not trae_interface.visible_model_matches(visible, expected_display):
                 raise GuiAutomationError(
                     "MODEL_MISMATCH",
                     f"Trae 输入框显示模型为 {visible or '(空)'}，期望 {expected_display}",

@@ -55,3 +55,14 @@ def test_conversation_text_falls_back_to_another_page(monkeypatch):
         port=9342, page_id="stale")
     assert result["page_id"] == "chat"
     assert result["text"] == "reply"
+
+
+def test_visible_model_ignores_effort_suffix():
+    assert trae_interface.visible_model_name(
+        "DeepSeek-V4.1-Flash\nMax") == "DeepSeek-V4.1-Flash"
+    assert trae_interface.visible_model_name(
+        "DeepSeek-V4.1-Flash Max") == "DeepSeek-V4.1-Flash"
+    assert trae_interface.visible_model_matches(
+        "DeepSeek-V4.1-Flash\nMax", "DeepSeek-V4.1-Flash")
+    assert not trae_interface.visible_model_matches(
+        "GLM-5.3\nHigh", "DeepSeek-V4.1-Flash")

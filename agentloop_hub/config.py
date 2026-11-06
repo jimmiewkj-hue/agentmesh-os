@@ -57,6 +57,9 @@ class HubConfig:
     summary_timeout_seconds: int = 600
     verify_timeout_seconds: int = 180
     verify_server_probe_seconds: int = 15
+    # Repeated nodes for the same Agent continue that Agent's prior
+    # conversation and worktree instead of starting a fresh one.
+    chain_reuse_agent_sessions: bool = True
 
     default_task_token_budget: int = 30000
     default_project_token_budget: int = 0
@@ -161,6 +164,7 @@ class HubConfig:
             "summary_timeout_seconds": self.summary_timeout_seconds,
             "verify_timeout_seconds": self.verify_timeout_seconds,
             "verify_server_probe_seconds": self.verify_server_probe_seconds,
+            "chain_reuse_agent_sessions": self.chain_reuse_agent_sessions,
             "default_task_token_budget": self.default_task_token_budget,
             "default_project_token_budget": self.default_project_token_budget,
             "default_plan_token_budget": self.default_plan_token_budget,

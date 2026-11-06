@@ -416,3 +416,78 @@ def test_discovery_upgrades_qoder_cn_and_workbuddy_to_gui_automation(tmp_path, m
     assert wb.capabilities["auto_executable"] is True
     assert is_auto_executable(wb) is True
     assert wb.adapter_config["model_item_offset_ratio"]["glm-5.3-flash"]
+
+
+def test_workbuddy_prepare_resumes_existing_session(tmp_path, monkeypatch):
+    from agentloop_hub.adapters import gui as gui_module
+    from agentloop_hub.control.interfaces import InterfaceOutcome
+
+    class FakeReader:
+        def active_sessions(self, **_kwargs):
+            return []
+
+    prepare_calls = []
+    verify_calls = []
+    switch_calls = []
+    open_calls = []
+
+    def fake_switch(session_id, **kwargs):
+        switch_calls.append((session_id, kwargs))
+        return {"ok": True, "current_id": session_id,
+                "ready": {"ok": True}}
+
+    def fake_verify(**kwargs):
+        verify_calls.append(kwargs)
+        return InterfaceOutcome(True, "db_read", {}, {"session_id": kwargs["session_id"]})
+
+    monkeypatch.setattr(gui_module, "create_reader", lambda *a, **k: FakeReader())
+    monkeypatch.setattr(
+        gui_module, "ensure_workbuddy_cdp",
+        lambda **k: InterfaceOutcome(True, "cdp", {"port": 9223}, {}))
+    monkeypatch.setattr(
+        gui_module, "prepare_workbuddy_task",
+        lambda **k: prepare_calls.append(k) or InterfaceOutcome(True, "deeplink", {}, {}))
+    monkeypatch.setattr(
+        gui_module, "sync_workbuddy_session_profile",
+        lambda **k: InterfaceOutcome(True, "db_write", {}, {"session_id": "sess-1"}))
+    monkeypatch.setattr(gui_module, "verify_workbuddy_task", fake_verify)
+    def fake_open(**kwargs):
+        open_calls.append(kwargs)
+        return InterfaceOutcome(True, "deeplink", {}, {},
+                                evidence={"session_id": kwargs["session_id"]})
+
+    monkeypatch.setattr(gui_module, "open_workbuddy_chat", fake_open)
+    monkeypatch.setattr(
+        "agentloop_hub.gui.cdp.switch_workbuddy_conversation", fake_switch)
+    monkeypatch.setattr(
+        "agentloop_hub.gui.cdp.wait_for_workbuddy_conversation",
+        lambda *a, **k: {"ok": True, "current_id": "sess-1",
+                         "composer": True})
+    monkeypatch.setattr(
+        "agentloop_hub.gui.cdp.wait_for_workbuddy_ready",
+        lambda *a, **k: {"ok": True, "ready": True, "composer": True})
+
+    request = make_request(tmp_path)
+    request.model = "GLM-5.3-Flash"
+    request.context_length = 600000
+    request.capability_level = "max"
+    request.resume_session = {
+        "resume": True, "session_id": "sess-1", "model": "GLM-5.3-Flash",
+        "workdir": str(tmp_path / "work"),
+    }
+    adapter = GuiAutomationAdapter(
+        make_agent("workbuddy"),
+        config={"mode": "gui_automation", "gui_app": "workbuddy",
+                "workbuddy_cdp_port": 9223,
+                "chain_reuse_agent_sessions": True},
+    )
+    info = adapter._prepare_interface(
+        adapter._profile(), request, "prompt", "marker",
+        tmp_path / "gui.log", 1000.0,
+    )
+    assert info["method"] == "workbuddy_resume_chat"
+    assert info["resumed_session_id"] == "sess-1"
+    assert open_calls and open_calls[0]["session_id"] == "sess-1"
+    assert not switch_calls
+    assert not prepare_calls
+    assert verify_calls and verify_calls[0]["session_id"] == "sess-1"

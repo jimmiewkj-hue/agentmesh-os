@@ -14,6 +14,8 @@ silently pick an agent the user did not enable.
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 from ..models import AgentRecord, TaskPlan, TaskSpec
@@ -54,12 +56,54 @@ ROLE_TYPE = {
 }
 VALID_APPROVAL = {"auto", "required", "plan_only"}
 VALID_RISK = {"low", "medium", "high", "critical"}
+_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+
+
+def _canonical_role(task: dict[str, Any], kind: str) -> str:
+    """Map planner labels (often Chinese) onto a legal role identifier."""
+    raw = str(task.get("role") or "").strip()
+    if raw and _ROLE_RE.match(raw):
+        return raw.lower()
+    text = f"{task.get('title') or ''} {task.get('objective') or ''}".lower()
+    if kind == "review":
+        return "review"
+    if kind == "verification":
+        return "verify"
+    if kind == "documentation":
+        return "write"
+    if kind == "implementation":
+        return "implement"
+    if kind == "architecture":
+        return "plan"
+    if any(hint.lower() in text for hint in _RESEARCH_HINTS):
+        return "research"
+    return "explore"
 
 
 def normalize_plan_payload(raw: Any) -> Any:
     """Map role words in ``type`` onto legal TaskType values, in place."""
     if not isinstance(raw, dict):
         return raw
+    for key in ("constraints", "requirements", "nonfunctional",
+                "open_questions", "risks"):
+        value = raw.get(key)
+        if not isinstance(value, list):
+            continue
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                risk = str(item.get("risk") or item.get("description") or "").strip()
+                mitigation = str(item.get("mitigation") or "").strip()
+                if key == "risks" and (risk or mitigation):
+                    normalized.append(
+                        f"{risk} — {mitigation}".strip(" —"))
+                else:
+                    normalized.append(json.dumps(item, ensure_ascii=False))
+            elif item is not None:
+                normalized.append(str(item))
+        raw[key] = normalized
     tasks = raw.get("tasks")
     if not isinstance(tasks, list):
         return raw
@@ -72,8 +116,11 @@ def normalize_plan_payload(raw: Any) -> Any:
             mapped = TYPE_BY_ROLE.get(kind) or TYPE_BY_ROLE.get(role)
             if mapped:
                 task["type"] = mapped
+                kind = mapped
         if not task.get("role") and kind in TYPE_BY_ROLE:
             task["role"] = kind
+        else:
+            task["role"] = _canonical_role(task, kind)
         approval = str(task.get("approval_policy") or "auto").strip().lower()
         task["approval_policy"] = approval if approval in VALID_APPROVAL else "required"
         risk = str(task.get("risk_level") or "low").strip().lower()

@@ -192,6 +192,9 @@ Claude Code · Gemini CLI · Codex CLI · Cursor · Aider · REA Studio (MCP) ·
   变化时重载渲染器后再发 deeplink；会话入库后补写 `sessions.context_window/thought_level`。
   Trae 写 `state.vscdb` 思考等级键；Qoder 写 `chat_model_preferences`。
   写后回读，失败抛 `PROFILE_SYNC_FAILED`，不会带着错误配置继续跑。
+- **同 Agent 会话续接**：链路中同一 Agent 的后续节点默认在该 Agent 上一节点的
+  会话与工作树中继续，不再每个节点新开对话；不同 Agent 才新开会话。
+  首节点和主节点规划仍是独立会话；模型变化时保留工作树但新开会话。
 - **运行中节点绑定编辑**：第 4 步链路节点支持修改 Agent、模型、上下文与能力等级；
   排队/阻塞/等待节点即时生效，正在运行节点等结束或重试后生效。
 - **硬停止运行**：第 4 步“停止运行（取消节点）”会取消排队/运行/阻塞节点、置运行 canceled、

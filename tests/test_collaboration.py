@@ -124,3 +124,41 @@ def test_contract_aligns_type_with_role_and_normalizes_enums():
     enforce_plan_contract(plan, contract)
     assert plan.tasks[0].type == "documentation"
     assert plan.tasks[0].suggested_agent == "workbuddy"
+
+
+def test_chinese_planner_roles_are_mapped_before_validation():
+    from agentloop_hub.control.collaboration import normalize_plan_payload
+    raw = {"plan_version": 1, "goal": "g", "tasks": [
+        {"task_id": "T1", "title": "环境与工具核查", "objective": "只读检查",
+         "type": "analysis", "role": "环境核查", "dependencies": [], "scope": []},
+        {"task_id": "T2", "title": "研究参考与考据", "objective": "资料与来源",
+         "type": "analysis", "role": "研究与考据", "dependencies": [], "scope": []},
+        {"task_id": "T3", "title": "前端工程", "objective": "实现页面",
+         "type": "implementation", "role": "前端工程", "dependencies": [],
+         "scope": ["src/**"]},
+        {"task_id": "T4", "title": "验收", "objective": "验证",
+         "type": "verification", "role": "验收检查", "dependencies": [],
+         "scope": []},
+        {"task_id": "T5", "title": "文档", "objective": "说明",
+         "type": "documentation", "role": "文档编写", "dependencies": [],
+         "scope": ["README.md"]},
+    ]}
+    normalize_plan_payload(raw)
+    assert [t["role"] for t in raw["tasks"]] == [
+        "explore", "research", "implement", "verify", "write",
+    ]
+
+
+def test_plan_risk_objects_are_normalized_to_strings():
+    from agentloop_hub.control.collaboration import normalize_plan_payload
+    from agentloop_hub.models import TaskPlan
+    raw = {"plan_version": 1, "goal": "g",
+           "risks": [{"risk": "可能会失败", "mitigation": "先做小样"}],
+           "open_questions": ["是否需要录屏？"],
+           "tasks": [{"task_id": "T1", "title": "a", "objective": "a",
+                      "type": "analysis", "role": "探查", "dependencies": [],
+                      "scope": []}]}
+    normalize_plan_payload(raw)
+    assert raw["risks"] == ["可能会失败 — 先做小样"]
+    plan = TaskPlan.from_dict(raw, project_id="p", plan_id="plan")
+    assert plan.tasks[0].role == "explore"

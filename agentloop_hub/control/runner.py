@@ -84,6 +84,7 @@ class RunService:
         self.prompts = PromptBuilder(paths, project)
         self.leases = LeaseManager(store)
         self._wt_lock = threading.Lock()
+        self._session_lock = threading.Lock()
         self._run_locks: dict[str, threading.Lock] = {}
         self._agent_locks: dict[str, threading.Lock] = {}
         self._agent_locks_guard = threading.Lock()
@@ -481,7 +482,9 @@ class RunService:
         task = self.store.get_task(uid) or task
         task.assigned_agent = task.assigned_agent or agent.agent_id
         task.attempts += 1
-        workdir = self._prepare_workdir(task, run)
+        request_model = self._model_for_agent(agent, task)
+        resume_session = self._resume_session(task, agent, request_model)
+        workdir = self._prepare_workdir(task, run, agent, resume_session)
         upstream = self.context.upstream_results(task)
         if self.cost and upstream:
             saved = 0
@@ -507,7 +510,6 @@ class RunService:
             "router": decision.to_dict() if decision else {},
             "round_context": self._task_round_context(run, task),
         }
-        request_model = self._model_for_agent(agent, task)
         try:
             agent_profile = self._agent_profile(agent, task, request_model)
         except ValidationError as exc:
@@ -612,6 +614,7 @@ class RunService:
             model=request_model,
             context_length=int(agent_profile["context_length"]),
             capability_level=str(agent_profile["capability_level"]),
+            resume_session=resume_session,
             timeout_seconds=task.spec.time_limit_minutes * 60,
             purpose="task", full_control=bool(self.config.full_control),
             notify=lambda payload, _task=task, _agent=agent:
@@ -644,6 +647,8 @@ class RunService:
                                        error="用户停止运行", force=True)
             self.leases.release(uid)
             return
+        if outcome.status == "completed":
+            self._record_agent_session(task, agent, request_model, workdir, outcome)
         interface = (outcome.extras or {}).get("interface") or {}
         verify = interface.get("verify") if isinstance(interface, dict) else {}
         verify = verify if isinstance(verify, dict) else {}
@@ -777,8 +782,68 @@ class RunService:
                                 "base_commit": base_commit or self.project.commit})
         return str(target)
 
-    def _prepare_workdir(self, task: Task, run: dict[str, Any]) -> str:
-        target = self.paths.worktree_dir(task.run_id, task.task_id)
+    def _agent_sessions_path(self, run_id: str) -> Path:
+        return self.paths.run_dir(run_id) / "agent-sessions.json"
+
+    def _load_agent_sessions(self, run_id: str) -> dict[str, dict[str, Any]]:
+        with self._session_lock:
+            data = read_json(self._agent_sessions_path(run_id), {})
+        return data if isinstance(data, dict) else {}
+
+    def _resume_session(self, task: Task, agent: AgentRecord,
+                        model: str) -> dict[str, Any]:
+        if not self.config.chain_reuse_agent_sessions:
+            return {}
+        entry = self._load_agent_sessions(task.run_id).get(agent.agent_id)
+        if not isinstance(entry, dict):
+            return {}
+        workdir = str(entry.get("workdir") or "")
+        if not workdir or not Path(workdir).exists():
+            return {}
+        resume = bool(entry.get("session_id")) and \
+            str(entry.get("model") or "").lower() == str(model or "").lower()
+        return {**entry, "resume": resume}
+
+    def _record_agent_session(self, task: Task, agent: AgentRecord, model: str,
+                              workdir: str, outcome: Any) -> None:
+        session_id = str(getattr(outcome, "session_id", "") or "")
+        if not session_id or not workdir:
+            return
+        path = self._agent_sessions_path(task.run_id)
+        with self._session_lock:
+            data = read_json(path, {})
+            if not isinstance(data, dict):
+                data = {}
+            entry = {
+                "session_id": session_id,
+                "model": str(model or ""),
+                "workdir": str(workdir),
+                "task_id": task.task_id,
+                "updated_at": now_iso(),
+            }
+            previous = data.get(agent.agent_id)
+            tasks = list((previous or {}).get("tasks") or [])
+            if task.task_id not in tasks:
+                tasks.append(task.task_id)
+            entry["tasks"] = tasks
+            data[agent.agent_id] = entry
+            write_json(path, data)
+        self.audit.log("control-plane", "agent.session_recorded",
+                       subject=task.uid, payload={
+                           "agent_id": agent.agent_id, "session_id": session_id,
+                           "workdir": workdir, "model": model,
+                           "reused": bool(getattr(outcome, "extras", {})
+                                          .get("interface", {})
+                                          .get("resumed_session_id")),
+                       })
+
+    def _prepare_workdir(self, task: Task, run: dict[str, Any],
+                         agent: AgentRecord,
+                         resume_session: dict[str, Any] | None = None) -> str:
+        session = resume_session or {}
+        remembered = str(session.get("workdir") or "")
+        target = Path(remembered) if remembered and Path(remembered).exists() \
+            else self.paths.worktree_dir(task.run_id, task.task_id)
         with self._wt_lock:
             reused = False
             if Path(target).exists():
@@ -791,6 +856,11 @@ class RunService:
             if not reused:
                 create_worktree(self.project.root, target, run["base_commit"])
             ensure_dir(target)
+        if remembered and Path(target) == Path(remembered):
+            self.audit.log("control-plane", "task.workdir_reused", subject=task.uid,
+                           payload={"agent_id": agent.agent_id,
+                                    "workdir": str(target),
+                                    "session_id": session.get("session_id", "")})
         self._apply_upstream_patches(task, str(target))
         return str(target)
 
@@ -1084,6 +1154,30 @@ class RunService:
                        payload={"change_id": change.change_id, "files": files,
                                 "before": change.before_hash, "after": change.after_hash})
 
+    def _commit_task_worktree(self, task: Task) -> None:
+        """Freeze a completed node so the next same-agent node diffs from it."""
+        if not task.spec.writable or not task.workdir or not task.patch_path:
+            return
+        files = patch_files(task.patch_path)
+        if not files:
+            return
+        spec_file = Path(task.task_dir) / "commit-files.txt"
+        spec_file.write_text("\n".join(files), encoding="utf-8")
+        identity = ["-c", "user.name=AgentMesh",
+                    "-c", "user.email=agentmesh@localhost"]
+        added = run_git(["add", "-A", "--pathspec-from-file", str(spec_file)],
+                        cwd=task.workdir, check=False)
+        committed = run_git([*identity, "commit", "-m",
+                             f"task {task.task_id}: {task.spec.title[:80]}"],
+                            cwd=task.workdir, check=False)
+        self.audit.log("control-plane", "task.worktree_committed",
+                       subject=task.uid, payload={
+                           "workdir": task.workdir, "files": len(files),
+                           "add_code": added.returncode,
+                           "commit_code": committed.returncode,
+                           "commit": (committed.stdout_text or "").strip()[:200],
+                       })
+
     def _finish_verification(self, task: Task, agent: AgentRecord,
                              result: ResultPackage) -> None:
         """Finish verification without ever leaving a task stuck in verifying."""
@@ -1150,6 +1244,7 @@ class RunService:
             except Exception as exc:
                 self.audit.log("control-plane", "task.cache_store_failed", subject=task.uid,
                                payload={"error": str(exc)[:300]})
+        self._commit_task_worktree(task)
         self.store.set_task_status(task.uid, TaskStatus.COMPLETED.value)
         self.leases.release(task.uid)
         self.checkpoints.create("task_completed", run_id=task.run_id, task_uid=task.uid,

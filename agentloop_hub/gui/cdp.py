@@ -332,6 +332,143 @@ def composer_text_via_cdp(port: int = 9223, *, timeout: float = 10.0,
             transport.close()
 
 
+def switch_workbuddy_conversation(session_id: str, port: int = 9223, *,
+                                  timeout: float = 30.0) -> dict[str, Any]:
+    """Select an existing WorkBuddy conversation through its renderer API."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {"ok": False, "reason": "EMPTY_SESSION_ID"}
+    page = _pick_page(_targets(port))
+    if not page:
+        return {"ok": False, "reason": "NO_CDP_PAGE"}
+    transport = WebSocketTransport(
+        page["webSocketDebuggerUrl"],
+        origin=f"http://127.0.0.1:{int(port)}", timeout=timeout)
+    try:
+        expression = """(async () => {
+  const sessionId = %s;
+  const api = globalThis.wb?.conversations;
+  if (!api || typeof api.setCurrentConversation !== 'function') {
+    return {ok: false, reason: 'NO_CONVERSATION_API'};
+  }
+  let error = '';
+  for (const value of [sessionId, {id: sessionId},
+                       {conversationId: sessionId}]) {
+    try {
+      await api.setCurrentConversation(value);
+      await new Promise(resolve => setTimeout(resolve, 700));
+      const current = typeof api.currentId === 'string' ? api.currentId : '';
+      if (!current || current === sessionId) {
+        return {ok: true, current_id: current || sessionId};
+      }
+    } catch (err) {
+      error = String(err);
+    }
+  }
+  return {ok: false, reason: error || 'CONVERSATION_MISMATCH',
+          current_id: api.currentId || ''};
+})()""" % json.dumps(session_id)
+        response = transport.call("Runtime.evaluate", {
+            "expression": expression, "awaitPromise": True,
+            "returnByValue": True,
+        }, timeout)
+        value = response.get("result", {}).get("result", {}).get("value") or {}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
+    finally:
+        transport.close()
+    if value.get("ok"):
+        ready = wait_for_workbuddy_ready(port, timeout=timeout)
+        value["ready"] = ready
+        if not ready.get("ok"):
+            return {**value, "ok": False, "reason": "APP_NOT_READY"}
+    return value
+
+
+def send_workbuddy_conversation_prompt(session_id: str, text: str,
+                                       port: int = 9223, *,
+                                       timeout: float = 30.0) -> dict[str, Any]:
+    """Send a prompt into an existing WorkBuddy conversation via prepareInput.
+
+    The renderer's ``prepareInput`` with ``submitMode: 'blocks'`` updates the
+    conversation draft through the app's own state and submits it.  Merely
+    inserting text into the contenteditable leaves the send button disabled.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {"ok": False, "reason": "EMPTY_SESSION_ID"}
+    page = _pick_page(_targets(port))
+    if not page:
+        return {"ok": False, "reason": "NO_CDP_PAGE"}
+    transport = WebSocketTransport(
+        page["webSocketDebuggerUrl"],
+        origin=f"http://127.0.0.1:{int(port)}", timeout=timeout)
+    try:
+        expression = """(async () => {
+  const sessionId = %s, text = %s;
+  const api = globalThis.wb?.conversations;
+  if (!api || typeof api.prepareInput !== 'function') {
+    return {ok: false, reason: 'NO_PREPARE_INPUT'};
+  }
+  if (api.currentId && api.currentId !== sessionId) {
+    return {ok: false, reason: 'CONVERSATION_MISMATCH',
+            current_id: api.currentId};
+  }
+  try {
+    await api.prepareInput({
+      target: {type: 'active'},
+      contentBlocks: [{type: 'text', text}],
+      submitMode: 'blocks',
+    });
+  } catch (err) {
+    return {ok: false, reason: String(err)};
+  }
+  return {ok: true, path: 'workbuddy-conversation-prepare-input',
+          session_id: sessionId, current_id: api.currentId || ''};
+})()""" % (json.dumps(session_id), json.dumps(text, ensure_ascii=False))
+        response = transport.call("Runtime.evaluate", {
+            "expression": expression, "awaitPromise": True,
+            "returnByValue": True,
+        }, timeout)
+        return response.get("result", {}).get("result", {}).get("value") or \
+            {"ok": False, "reason": "EMPTY_RESPONSE"}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
+    finally:
+        transport.close()
+
+
+def wait_for_workbuddy_conversation(session_id: str, port: int = 9223, *,
+                                    timeout: float = 30.0) -> dict[str, Any]:
+    """Wait until WorkBuddy's renderer reports the requested conversation."""
+    deadline = time.time() + max(1.0, float(timeout))
+    last: dict[str, Any] = {"ok": False, "reason": "NOT_SWITCHED"}
+    while time.time() < deadline:
+        try:
+            page = _pick_page(_targets(port))
+            if page:
+                transport = WebSocketTransport(
+                    page["webSocketDebuggerUrl"],
+                    origin=f"http://127.0.0.1:{int(port)}", timeout=5)
+                try:
+                    value = _evaluate(transport, """(() => {
+                      const current = globalThis.wb?.conversations?.currentId || '';
+                      return {current_id: current,
+                              composer: !!document.querySelector(
+                                '[contenteditable="true"]')};
+                    })()""", 5) or {}
+                finally:
+                    transport.close()
+                last = {"ok": str(value.get("current_id") or "") == session_id
+                        and bool(value.get("composer")), **value}
+                if last["ok"]:
+                    return last
+        except Exception as exc:
+            last = {"ok": False, "reason": str(exc)}
+        time.sleep(0.5)
+    return last
+
+
 def wait_for_workbuddy_ready(port: int = 9223, *,
                              timeout: float = 60.0) -> dict[str, Any]:
     """Wait for the WorkBuddy renderer after its own page reload."""

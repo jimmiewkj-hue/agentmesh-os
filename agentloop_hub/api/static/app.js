@@ -533,6 +533,8 @@ function renderCommandRun() {
     .forEach((t) => { counts[t.status] = (counts[t.status] || 0) + 1; });
   const manualSubmit = (((state.overview || {}).manual_actions) || []).some(
     (a) => ((a.manual_action || {}).kind === 'manual_submit'));
+  const pendingHighRisk = (((state.overview || {}).pending_approvals) || []).filter(
+    (a) => a.status === 'pending' && a.kind === 'high_risk');
   $('commandRun').innerHTML = `<dl class="kv">
     <dt>运行 ID</dt><dd class="mono">${esc(run.run_id)}</dd>
     <dt>状态</dt><dd><span class="pill ${pillClass(run.status)}">${esc(run.status)}</span></dd>
@@ -546,8 +548,9 @@ function renderCommandRun() {
     ${run.status === 'running' ? `<button class="danger" onclick="pauseRun('${esc(run.run_id)}')">暂停运行</button><button onclick="refresh()">刷新进度</button>` : ''}
     ${['running', 'waiting_user', 'paused'].includes(run.status)
       ? `<button class="danger" onclick="cancelRun('${esc(run.run_id)}')">停止运行（取消节点）</button>` : ''}
-    ${['waiting_user', 'paused'].includes(run.status) && !manualSubmit ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
+    ${['waiting_user', 'paused'].includes(run.status) && !manualSubmit && !pendingHighRisk.length ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
     ${manualSubmit ? '<span class="sub">已阻塞：请按弹窗提示在 Agent 应用中点击发送，完成后会自动继续</span>' : ''}
+    ${pendingHighRisk.length ? '<span class="sub">存在待批准的高风险操作，请在上方弹窗点击“批准高风险并继续”</span>' : ''}
     ${run.status === 'pending_acceptance' ? `<button onclick="location.hash='#approvals'">验收确认</button>` : ''}
     ${run.status === 'pending_merge' ? `<button class="primary" onclick="mergeRun('${esc(run.run_id)}')">批准并合并</button>` : ''}
     ${run.status === 'completed' ? `<button class="primary" onclick="releaseRun('${esc(run.run_id)}')">申请发布审批</button>` : ''}
@@ -631,19 +634,37 @@ function renderBlockAlert() {
   const box = $('blockAlert');
   if (!box) return;
   const actions = ((state.overview || {}).manual_actions) || [];
-  if (!actions.length) {
+  const highRisk = (((state.overview || {}).pending_approvals) || []).filter(
+    (a) => a.status === 'pending' && a.kind === 'high_risk');
+  if (!actions.length && !highRisk.length) {
     box.classList.add('hidden');
     box.innerHTML = '';
     if (document.title.startsWith('⚠')) document.title = 'AgentMesh OS 指挥中心';
     return;
   }
   const run = state.overview.latest_run || {};
-  const key = actions.map((a) => `${a.task_uid}:${(a.manual_action || {}).kind}:${(a.manual_action || {}).since}`).join('|');
+  const key = actions.map((a) => `${a.task_uid}:${(a.manual_action || {}).kind}:${(a.manual_action || {}).since}`).join('|')
+    + '||' + highRisk.map((a) => a.approval_id).join(',');
   if (key !== state.manualAlertKey) {
     state.manualAlertKey = key;
-    toast('链路已阻塞：请处理弹窗中的 Agent 节点', true);
+    toast('链路已阻塞：请处理弹窗中的审批或 Agent 节点', true);
     document.title = '⚠ 链路阻塞 - AgentMesh OS';
   }
+  const approvalItems = highRisk.map((a) => {
+    const d = a.details || {};
+    return `<div class="item" style="border-left:3px solid #b45309;padding-left:10px">
+      <div><b>${esc(a.task_uid || a.subject || a.approval_id)}</b>
+        <span class="pill warn">高风险操作待批准</span></div>
+      <div class="sub"><b>将要执行：</b>${esc(d.what || a.subject || '')}</div>
+      <div class="sub"><b>风险：</b>${esc(d.why || '')} ${esc(d.risk_level || '')}</div>
+      ${(d.files || []).length ? `<div class="sub mono">文件范围：${esc((d.files || []).join(', '))}</div>` : ''}
+      <div class="row" style="margin-top:6px">
+        <button class="primary small" onclick="approveHighRiskAndResume('${esc(a.approval_id)}','${esc(run.run_id || '')}')">批准高风险并继续</button>
+        <button class="danger small" onclick="decideApproval('${esc(a.approval_id)}',false)">拒绝</button>
+        <button class="small" onclick="refresh()">刷新状态</button>
+      </div>
+    </div>`;
+  }).join('');
   const items = actions.map((a) => {
     const manual = a.manual_action || {};
     const kind = manual.kind || '';
@@ -664,9 +685,22 @@ function renderBlockAlert() {
       </div>
     </div>`;
   }).join('');
-  box.innerHTML = `<h3>链路已阻塞：需要人工处理 ${actions.length} 个节点</h3>
-    <div class="sub">阻塞期间不会启动下一个节点；该节点完成后自动继续。</div>${items}`;
+  box.innerHTML = `<h3>链路已阻塞：需要人工处理 ${actions.length + highRisk.length} 项</h3>
+    <div class="sub">阻塞期间不会启动下一个节点；批准高风险或完成应用内操作后自动继续。</div>${approvalItems}${items}`;
   box.classList.remove('hidden');
+}
+
+async function approveHighRiskAndResume(approvalId, runId) {
+  try {
+    await post('/api/approvals/' + encodeURIComponent(approvalId),
+      { approve: true, note: 'WebUI 高风险审批弹窗确认' });
+    if (runId) {
+      await post('/api/runs/' + encodeURIComponent(runId) + '/resume',
+        { background: true, max_parallel: 1 }).catch(() => {});
+    }
+    toast('高风险审批已批准，运行继续');
+    refresh();
+  } catch (e) { toast('批准高风险失败：' + e.message, true); }
 }
 
 function renderCommandPlans() {

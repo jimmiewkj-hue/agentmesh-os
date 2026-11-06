@@ -658,7 +658,7 @@ def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
     finally:
         transport.close()
     visible = trae_visible_model(port, page_id=page_id)
-    ok = visible.lower() == display.lower()
+    ok = visible_model_matches(visible, display)
     return InterfaceOutcome(
         ok, "cdp-input", {"model": display},
         {"visible_model": visible, "clicked": target["text"]},
@@ -688,6 +688,30 @@ def trae_visible_model(port: int = CDP_DEFAULT_PORT, *,
         return ""
     finally:
         transport.close()
+
+
+_EFFORT_SUFFIXES = (
+    "extra high", "extra_high", "xhigh", "max", "high", "medium",
+    "low", "light", "minimal", "none",
+)
+
+
+def visible_model_name(value: str) -> str:
+    """Strip the thinking-effort line Trae appends below the model name."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    first = text.splitlines()[0].strip()
+    lowered = first.lower()
+    for suffix in _EFFORT_SUFFIXES:
+        if lowered.endswith(" " + suffix):
+            return first[:-(len(suffix) + 1)].strip()
+    return first
+
+
+def visible_model_matches(visible: str, expected: str) -> bool:
+    want = visible_model_name(expected).lower()
+    return bool(want) and visible_model_name(visible).lower() == want
 
 
 def verify_trae_session(*, workspace: str, model: str, dev_mode: str = "code",
@@ -737,7 +761,7 @@ def verify_trae_session(*, workspace: str, model: str, dev_mode: str = "code",
         expected_display = resolved["display_name"] if resolved else model
         actual["visible_model"] = visible
         evidence["visible_model"] = visible
-        if not visible or visible.lower() != expected_display.lower():
+        if not visible or not visible_model_matches(visible, expected_display):
             return InterfaceOutcome(
                 False, "cdp+state_read", {**expected, "visible_model": expected_display},
                 actual, evidence=evidence,
