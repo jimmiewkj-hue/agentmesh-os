@@ -20,7 +20,7 @@ Verified entry points on this machine (2026-11-03):
   its ``workspace-directories`` event is the authoritative workspace and the
   last ``runtime-config`` event carries the model key (``dfmodel`` =
   DeepSeek-Flash, ``gfmodel`` = GLM-5.3-Flash).  A probe moved a transcript to
-  ``J--qoder-agent-hub-logs-qoder-probe-ws`` and the next turn wrote
+  ``D--qoder-agent-hub-logs-qoder-probe-ws`` and the next turn wrote
   ``workspace-directories=[D:\\qoder\\agent-hub\\logs\\qoder-probe-ws]`` with
   ``model=dfmodel``.
 
@@ -315,7 +315,7 @@ def qoder_sites_root(config: dict[str, Any] | None = None) -> Path:
 
 
 def qoder_project_slug(path: str | Path) -> str:
-    """Qoder's project folder name: ``D:\\a\\b`` -> ``J--a-b``.
+    """Qoder's project folder name: ``D:\\a\\b`` -> ``D--a-b``.
 
     Qoder replaces every non-alphanumeric separator (``\\``, ``.``, ``_``,
     space) with ``-`` individually, so ``...\\.agentloop\\plan_x`` becomes
