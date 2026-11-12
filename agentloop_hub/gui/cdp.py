@@ -790,6 +790,194 @@ def send_prompt_via_cdp(text: str, *, port: int = 9222, timeout: float = 10.0,
 
 
 
+_QODER_MODEL_STATE_JS = r"""
+(() => {
+  const trigger = document.querySelector('button[aria-label="模型"]')
+    || document.querySelector('button[aria-label^="模型"]');
+  const items = [...document.querySelectorAll('[role="menuitem"][data-model-value]')]
+    .filter((el) => el.getClientRects().length > 0)
+    .map((el) => {
+      const r = el.getBoundingClientRect();
+      return {key: el.getAttribute('data-model-value') || '',
+              label: ((el.innerText || '').trim().split('\n')[0] || ''),
+              selected: el.getAttribute('data-model-selected') === 'true',
+              rect: [r.x, r.y, r.width, r.height]};
+    });
+  const t = trigger ? trigger.getBoundingClientRect() : null;
+  return {open: items.length > 0,
+          trigger: t ? [t.x, t.y, t.width, t.height] : null,
+          trigger_text: trigger ? (trigger.innerText || '').trim() : '',
+          items};
+})()
+"""
+
+_QODER_ITEM_JS = r"""
+((key) => {
+  const el = [...document.querySelectorAll('[role="menuitem"][data-model-value]')]
+    .find((node) => node.getAttribute('data-model-value') === key);
+  if (!el) return null;
+  el.scrollIntoView({block: 'center'});
+  const r = el.getBoundingClientRect();
+  return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+          w: r.width, h: r.height,
+          label: ((el.innerText || '').trim().split('\n')[0] || '')};
+})(%s)
+"""
+
+
+def _cdp_click(transport: CdpTransport, x: float, y: float,
+               timeout: float = 10.0) -> None:
+    """Renderer-only pointer click (no OS input events)."""
+    transport.call("Input.dispatchMouseEvent",
+                   {"type": "mouseMoved", "x": x, "y": y,
+                    "button": "none", "buttons": 0}, timeout)
+    transport.call("Input.dispatchMouseEvent",
+                   {"type": "mousePressed", "x": x, "y": y, "button": "left",
+                    "clickCount": 1, "buttons": 1}, timeout)
+    transport.call("Input.dispatchMouseEvent",
+                   {"type": "mouseReleased", "x": x, "y": y, "button": "left",
+                    "clickCount": 1, "buttons": 0}, timeout)
+
+
+def _remember_qoder_catalog(items: list[dict[str, Any]]) -> None:
+    """Persist the live menu so offline label resolution matches the app."""
+    if not items:
+        return
+    try:
+        from ..config import default_home
+        path = default_home() / "qoder-models.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "captured_at": time.time(),
+            "items": [{"key": item.get("key", ""), "label": item.get("label", ""),
+                       "selected": bool(item.get("selected"))}
+                      for item in items if item.get("key")],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _close_qoder_menu(transport: CdpTransport, timeout: float = 10.0) -> None:
+    _evaluate(transport, """
+(() => {
+  document.body.dispatchEvent(new KeyboardEvent('keydown',
+    {key: 'Escape', keyCode: 27, which: 27, bubbles: true}));
+  return 'ok';
+})()
+""", timeout)
+
+
+def qoder_model_catalog_via_cdp(*, port: int = 9222, timeout: float = 12.0,
+                                page_id: str = "",
+                                transport: CdpTransport | None = None) -> dict[str, Any]:
+    """Read Qoder's own model menu (key + label) from the renderer.
+
+    ``data-model-value`` is the runtime key and the item text is exactly what
+    the desktop renders, so this is the authoritative catalog while the app is
+    running.  The menu is opened and closed again; nothing is selected.
+    """
+    own = transport is None
+    tr = transport
+    if own:
+        page = _pick_page(_targets(port), page_id)
+        if not page:
+            return {"ok": False, "reason": "NO_PAGE", "items": []}
+        tr = WebSocketTransport(page["webSocketDebuggerUrl"],
+                                origin=f"http://127.0.0.1:{int(port)}",
+                                timeout=timeout)
+    try:
+        state = _evaluate(tr, _QODER_MODEL_STATE_JS, timeout) or {}
+        if not state.get("open"):
+            rect = state.get("trigger")
+            if not rect:
+                return {"ok": False, "reason": "NO_MODEL_BUTTON", "items": []}
+            _cdp_click(tr, rect[0] + rect[2] / 2, rect[1] + rect[3] / 2, timeout)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                time.sleep(0.25)
+                state = _evaluate(tr, _QODER_MODEL_STATE_JS, timeout) or {}
+                if state.get("open"):
+                    break
+        items = state.get("items") or []
+        if items:
+            _remember_qoder_catalog(items)
+        _close_qoder_menu(tr, timeout)
+        return {"ok": bool(items), "items": items,
+                "trigger_text": state.get("trigger_text", ""),
+                "reason": "" if items else "MENU_EMPTY"}
+    finally:
+        if own and tr is not None:
+            tr.close()
+
+
+def select_qoder_model_via_cdp(model_key: str, *, port: int = 9222,
+                               timeout: float = 15.0,
+                               page_id: str = "",
+                               transport: CdpTransport | None = None) -> dict[str, Any]:
+    """Select ``model_key`` in Qoder's composer through its own menu.
+
+    The desktop ignores the session row's model when it opens a fresh chat, so
+    the model has to be chosen before the prompt is submitted.  Menu items
+    carry the runtime key in ``data-model-value``; the click is a renderer
+    pointer event, never OS mouse input.
+    """
+    key = str(model_key or "").strip()
+    if not key:
+        return {"ok": False, "reason": "EMPTY_MODEL"}
+    own = transport is None
+    tr = transport
+    if own:
+        page = _pick_page(_targets(port), page_id)
+        if not page:
+            return {"ok": False, "reason": "NO_PAGE"}
+        tr = WebSocketTransport(page["webSocketDebuggerUrl"],
+                                origin=f"http://127.0.0.1:{int(port)}",
+                                timeout=timeout)
+    try:
+        state = _evaluate(tr, _QODER_MODEL_STATE_JS, timeout) or {}
+        if not state.get("open"):
+            rect = state.get("trigger")
+            if not rect:
+                return {"ok": False, "reason": "NO_MODEL_BUTTON"}
+            _cdp_click(tr, rect[0] + rect[2] / 2, rect[1] + rect[3] / 2, timeout)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                time.sleep(0.25)
+                state = _evaluate(tr, _QODER_MODEL_STATE_JS, timeout) or {}
+                if state.get("open"):
+                    break
+        items = state.get("items") or []
+        if not items:
+            return {"ok": False, "reason": "MENU_NOT_OPEN",
+                    "trigger_text": state.get("trigger_text", "")}
+        _remember_qoder_catalog(items)
+        target = next((item for item in items if item.get("key") == key), None)
+        if not target:
+            return {"ok": False, "reason": "MODEL_NOT_IN_MENU", "model": key,
+                    "available": [item.get("key") for item in items]}
+        label = str(target.get("label") or "")
+        if target.get("selected"):
+            _close_qoder_menu(tr, timeout)
+            return {"ok": True, "already": True, "model": key, "label": label}
+        point = _evaluate(tr, _QODER_ITEM_JS % json.dumps(key), timeout) or {}
+        if not point.get("x") and not point.get("y"):
+            return {"ok": False, "reason": "ITEM_NOT_VISIBLE", "model": key}
+        _cdp_click(tr, float(point["x"]), float(point["y"]), timeout)
+        time.sleep(0.5)
+        after = _evaluate(tr, _QODER_MODEL_STATE_JS, timeout) or {}
+        expected = str(point.get("label") or label)
+        actual = str(after.get("trigger_text") or "").strip().split("\n")[0]
+        if after.get("open"):
+            _close_qoder_menu(tr, timeout)
+        return {"ok": bool(expected) and actual == expected,
+                "model": key, "label": expected, "trigger_text": actual,
+                "reason": "" if actual == expected else "TRIGGER_TEXT_MISMATCH"}
+    finally:
+        if own and tr is not None:
+            tr.close()
+
+
 def stop_workbuddy_task(port: int = 9223, *, timeout: float = 6.0,
                         page_id: str = "", session_id: str = "") -> dict[str, Any]:
     """Click WorkBuddy's own visible stop control (no OS input).

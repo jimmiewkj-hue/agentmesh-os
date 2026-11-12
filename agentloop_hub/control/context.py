@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..config import HubConfig
@@ -11,6 +12,11 @@ from ..util import estimate_tokens, read_text, truncate
 
 
 LEVELS = ("summary", "findings", "evidence", "raw")
+
+
+def task_round_id(task_id: str) -> int:
+    match = re.match(r"^R(\d+)_", str(task_id or ""))
+    return int(match.group(1)) if match else 1
 
 
 class ContextBuilder:
@@ -157,33 +163,57 @@ class ContextBuilder:
     def summary_context(self, *, run: dict[str, Any], plan: dict[str, Any],
                         tasks: list[Task], verification_by_task: dict[str, dict[str, Any]] | None = None,
                         changes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        # 2026-11-07 defect #8: the summary prompt was capped by dropping list
+        # tails, so the newest round's tasks/changes (R2_T001/R2_REVIEW) were
+        # removed first and the main node judged on round-1 evidence.  Latest
+        # round now comes first, per-entry fields are bounded, and _cap drops
+        # the oldest entries first.
+        ordered = sorted(tasks, key=lambda t: (-task_round_id(t.task_id),
+                                               str(t.task_id)))
+        rounds_present = sorted({task_round_id(t.task_id) for t in ordered},
+                                reverse=True)
         results = []
-        for task in tasks:
+        for task in ordered:
             result = self.store.get_result(task.uid)
             payload = (result or {}).get("payload", {})
             verification = (verification_by_task or {}).get(task.uid) or self.store.latest_verification(task.uid)
             results.append({
                 "task_id": task.task_id,
+                "round": task_round_id(task.task_id),
                 "title": task.spec.title,
                 "status": task.status,
                 "agent": task.assigned_agent,
                 "attempts": task.attempts,
-                "summary": payload.get("summary", ""),
-                "files_changed": payload.get("files_changed", []),
-                "risks": payload.get("risks", []),
-                "unresolved_items": payload.get("unresolved_items", []),
-                "tests": payload.get("tests", []),
+                "summary": str(payload.get("summary") or "")[:1500],
+                "files_changed": [str(p) for p in (payload.get("files_changed") or [])][:30],
+                "risks": [str(p) for p in (payload.get("risks") or [])][:10],
+                "unresolved_items": [str(p) for p in
+                                     (payload.get("unresolved_items") or [])][:12],
+                "tests": (payload.get("tests") or [])[:10],
                 "verification": {
                     "status": (verification or {}).get("status", "pending"),
-                    "warnings": (verification or {}).get("warnings", []),
+                    "warnings": [str(w) for w in
+                                 (verification or {}).get("warnings", [])][:10],
                 },
             })
+
+        def _change_round(row: dict[str, Any]) -> int:
+            return task_round_id(str(row.get("task_uid") or "").rsplit(":", 1)[-1])
+
+        change_rows = sorted(list(changes or []), key=_change_round, reverse=True)
+        compact_changes = [
+            {**row, "files": [str(p) for p in (row.get("files") or [])][:40]}
+            for row in change_rows[:60]
+        ]
         ctx = {
             "goal": plan.get("goal"),
             "constraints": plan.get("constraints", []),
             "run_id": run.get("run_id"),
+            "latest_round": rounds_present[0] if rounds_present else 1,
+            "rounds_present": rounds_present,
+            "ordering": "tasks/changes 按最新轮次优先排列；预算不足时先丢弃最旧轮次",
             "tasks": results,
-            "changes": changes or [],
+            "changes": compact_changes,
             "instructions": "只依据下列摘要、证据索引和验证结论给出最终判断；不得假设未提供的事实。",
         }
         return self._cap(ctx, self.config.context_summary_tokens)
@@ -191,6 +221,31 @@ class ContextBuilder:
     def handoff_context(self, *, build_handoff_fn) -> dict[str, Any]:
         # Kept separate in handoff.py; this hook avoids duplicating DB queries here.
         return build_handoff_fn()
+
+    @staticmethod
+    def _shrink_list_entry(item: list) -> bool:
+        """Shrink nested fields of the oldest dict entry in place.
+
+        Returns True when something was reduced.  Summary contexts order
+        newest rounds first; shrinking the tail entry keeps the newest round
+        intact while the budget shrinks.
+        """
+        for entry in reversed(item):
+            if not isinstance(entry, dict):
+                continue
+            for key, value in entry.items():
+                if isinstance(value, list) and len(value) > 1:
+                    value.pop()
+                    return True
+                if isinstance(value, str) and len(value) > 200:
+                    entry[key] = truncate(value, max(200, len(value) // 2))
+                    return True
+                if isinstance(value, dict):
+                    for inner_key, inner in value.items():
+                        if isinstance(inner, list) and len(inner) > 1:
+                            inner.pop()
+                            return True
+        return False
 
     @staticmethod
     def _cap(value: Any, token_limit: int) -> Any:
@@ -214,8 +269,16 @@ class ContextBuilder:
                 break
             item = out[key]
             if isinstance(item, list):
-                while item and estimate_tokens(json.dumps(out, ensure_ascii=False, default=str)) > token_limit:
-                    item.pop()
+                # Never drop the first entry (newest round / primary subject);
+                # shrink nested fields of the tail first, then drop tail items.
+                while item and estimate_tokens(
+                        json.dumps(out, ensure_ascii=False, default=str)) > token_limit:
+                    if ContextBuilder._shrink_list_entry(item):
+                        continue
+                    if len(item) > 1:
+                        item.pop()
+                    else:
+                        break
             elif isinstance(item, str) and len(item) > 200:
                 out[key] = truncate(item, max(200, len(item) // 2))
             elif isinstance(item, dict):

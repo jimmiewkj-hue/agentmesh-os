@@ -359,6 +359,11 @@ class PromptBuilder:
 {upstream}
 ```
 
+## 可用工具（控制平面提供）
+- 联网检索：若你具备终端能力，需要联网查询时调用控制平面内置搜索（无需 API key）：
+  `python -m agentloop_hub search "<关键词>" --max-results 5`（输出 JSON：title/url/snippet），
+  或 `GET /api/tools/web_search?q=<关键词>`。不要假设离线知识足够；检索失败时如实写入 risks。
+
 ## 输出要求（强制）
 将符合 `result-schema.json` 的 JSON 对象写入：
 
@@ -457,10 +462,22 @@ class PromptBuilder:
 """
         round_block = ""
         if round_context:
+            constraints = [str(item) for item in
+                           (round_context.get("plan_constraints") or []) if str(item)]
+            delivery = [str(item) for item in
+                        (round_context.get("delivery_rules") or []) if str(item)]
+            constraint_text = ("\n计划约束（强制）：\n"
+                               + "\n".join(f"- {item}" for item in constraints)) \
+                if constraints else ""
+            delivery_text = ("\n交付机制（强制）：\n"
+                             + "\n".join(f"- {item}" for item in delivery)) \
+                if delivery else ""
             round_block = f"""## 多轮续跑上下文（强制）
 这是第 {round_context.get('round', '?')} / {round_context.get('max_rounds', '?')} 轮。
 上一轮没有满足目标，不要重复已经完成的工作。只规划解决下列未解决项所需的最小任务图；
 可写任务必须给出最小必要 scope，并依赖上一轮相关任务（系统会自动补上上轮补丁依赖）。
+{constraint_text}{delivery_text}
+不要把与约束冲突的历史建议写成任务指令；确有冲突时在任务中写明“按约束执行”。
 
 ```json
 {json.dumps(round_context, ensure_ascii=False, indent=2)}
@@ -502,6 +519,8 @@ class PromptBuilder:
 - 每个任务给出 token_budget、time_limit_minutes、retry_limit、acceptance_criteria 与 verification_commands。
 - analysis 任务只做只读检查：verification_commands 只能包含只读命令（如 grep/git status）或留空；禁止携带 pytest/unittest/npm test 等测试类命令，测试命令只能放在 implementation 或 verification 任务。
 - 优先把大规模扫描/检索/试错交给子节点，把判断与验收留在主节点。
+- 重任务（Blender/GLB/三维重建/实机性能验收/大规模扫描等）不得绑定 free 档模型；免费档只适合轻量、只读或格式类任务。
+- 任务说明不得要求 git commit/push 或 `git rm --cached`：成果通过工作区文件变更交付，补丁由控制平面采集与验证。
 - 不虚构项目事实；不确定时在任务中写明“先核实”。
 
 ## 输出（强制）

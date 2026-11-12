@@ -28,6 +28,16 @@ from ..util import new_id, now_iso
 
 PRIOR_SUCCESS = 0.5
 
+# The signature capability that distinguishes a specialist for each task type.
+# An Agent that *explicitly* declares it (not merely derives it from write_files)
+# scores higher; measured per-type history then dominates as evidence accrues.
+TASK_SIGNATURE_CAPABILITY = {
+    "analysis": "analysis", "explore": "analysis", "research": "web_search",
+    "review": "code_review", "implementation": "code_generation", "write": "code_generation",
+    "documentation": "documentation", "verification": "testing", "verify": "testing",
+    "architecture": "architecture", "plan": "architecture",
+}
+
 
 @dataclass
 class RoutingDecision:
@@ -120,6 +130,7 @@ class CapabilityRouter:
         required = required_capabilities_for(spec)
         agents = self.store.list_agents()
         stats = self._agent_stats()
+        type_stats = self._agent_type_stats()
         main = self.store.get_main_node(self.project.project_id)
         main_id = (main or {}).get("agent_id", "")
         eligible: list[tuple[AgentRecord, dict[str, Any]]] = []
@@ -145,7 +156,8 @@ class CapabilityRouter:
                 rejected.append({"agent_id": agent.agent_id, "score": 0.0,
                                  "rejected": ["主节点保留用于决策与汇总"]})
                 continue
-            score, breakdown = self._score(agent, spec, stats.get(agent.agent_id, {}))
+            score, breakdown = self._score(agent, spec, stats.get(agent.agent_id, {}),
+                                           type_stats.get((agent.agent_id, spec.type), {}))
             if agent.agent_id == spec.suggested_agent:
                 score += 0.03
                 breakdown["suggested_bonus"] = 0.03
@@ -179,13 +191,13 @@ class CapabilityRouter:
         )
 
     def _score(self, agent: AgentRecord, spec: TaskSpec,
-               stats: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+               stats: dict[str, Any], type_stats: dict[str, Any] | None = None) -> tuple[float, dict[str, Any]]:
         weights = self.config.router_weights or {}
         success = self._success_score(stats)
         verification = self._verification_score(stats)
         speed = self._speed_score(stats)
         cost = self._cost_score(stats)
-        capability = 1.0  # eligibility already enforced all required capabilities
+        capability, cap_detail = self._capability_score(agent, spec, type_stats or {})
         access = {"L0": 0.0, "L1": 0.25, "L2": 0.5, "L3": 0.85, "L4": 1.0}.get(agent.access_level, 0.0)
         score = (
             float(weights.get("capability", 0.40)) * capability
@@ -198,6 +210,9 @@ class CapabilityRouter:
         score += 0.02 * access
         breakdown = {
             "capability": round(capability, 4),
+            "capability_specialization": cap_detail["specialization"],
+            "capability_type_fitness": cap_detail["fitness"],
+            "type_tasks_total": cap_detail["type_tasks_total"],
             "success": round(success, 4),
             "verification": round(verification, 4),
             "speed": round(speed, 4),
@@ -209,6 +224,36 @@ class CapabilityRouter:
             "avg_cost": round(float(stats.get("avg_cost", 0) or 0), 6),
         }
         return score, breakdown
+
+    def _capability_score(self, agent: AgentRecord, spec: TaskSpec,
+                          type_stats: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+        """Task-type fitness: explicit specialization + measured per-type history.
+
+        Replaces the former constant 1.0. Eligibility already gates the required
+        capabilities; this ranks *how well* an Agent fits this specific type,
+        using declared specialization and the Agent's observed success on tasks
+        of the same type (Laplace-smoothed, neutral prior when untested).
+        """
+        signature = TASK_SIGNATURE_CAPABILITY.get(spec.type, "")
+        declared = {name for name, enabled in (agent.capabilities or {}).items() if enabled}
+        derived = set(derive_capability_list(agent))
+        if signature and signature in declared:
+            specialization = 1.0
+        elif signature and signature in derived:
+            specialization = 0.7
+        else:
+            specialization = 0.5
+        total = int(type_stats.get("tasks_total", 0) or 0)
+        if total > 0:
+            completed = int(type_stats.get("completed", 0) or 0)
+            observed = (completed + PRIOR_SUCCESS) / (total + 1.0)
+            confidence = total / (total + max(1, int(self.config.router_sample_strength)))
+            fitness = 0.5 + confidence * (observed - 0.5)
+        else:
+            fitness = float(self.config.router_untested_prior)
+        capability = 0.5 * specialization + 0.5 * fitness
+        return capability, {"specialization": round(specialization, 4),
+                            "fitness": round(fitness, 4), "type_tasks_total": total}
 
     def _agent_stats(self) -> dict[str, dict[str, Any]]:
         tasks = self.store.list_tasks_by_project(self.project.project_id, limit=2000)
@@ -245,6 +290,22 @@ class CapabilityRouter:
             denominator = max(1, item["tasks_total"] or records)
             item["avg_cost"] = total_cost / denominator
             item["avg_tokens"] = total_tokens / denominator
+        return out
+
+    def _agent_type_stats(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """Per (agent, task_type) outcomes — the evidence for capability fitness."""
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for task in self.store.list_tasks_by_project(self.project.project_id, limit=2000):
+            agent_id = task.assigned_agent
+            if not agent_id:
+                continue
+            item = out.setdefault((agent_id, task.spec.type),
+                                  {"tasks_total": 0, "completed": 0, "failed": 0})
+            item["tasks_total"] += 1
+            if task.status == "completed":
+                item["completed"] += 1
+            elif task.status in ("failed", "blocked", "rejected"):
+                item["failed"] += 1
         return out
 
     def _success_score(self, stats: dict[str, Any]) -> float:

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-04T14:18:57",
+  "generated_at": "2026-11-07T07:42:10",
   "policy": {
     "os_input": "blocked (AGENTMESH_DISABLE_GUI_INPUT=1)",
     "vendor_http_api": "never used; all channels are the applications' own stores/CLI/CDP/deeplinks",
@@ -129,20 +129,20 @@
         "3059310181236400_AI.agent.soloAgent.autoModeDisabled",
         "3059310181236400_ai-chat:sessionRelation:globalModeMap",
         "3059310181236400_ai-chat:sessionRelation:globalModelMap",
+        "3059310181236400_ai-chat:sessionRelation:modelMaxModeMap",
+        "3059310181236400_ai-chat:sessionRelation:modelReasoningEffortLevelMap:v2",
         "ADD_MODEL_HAS_BEEN_SEEN",
         "AI.agent.model",
         "AI.agent.modelList",
         "AI.model",
         "AI.modelList",
         "AI.modelSelectionReset.boot.v1",
-        "AI.toolcall.acceptMode.migrated.completed",
-        "BUILDER_MODEL_HAS_NEW_BADGE",
-        "CHAT_MODEL_HAS_NEW_BADGE",
-        "chat.workspaceTransfer",
-        "content.trust.model.key",
-        "localModelData_3059310181236400_6944cc76b3556d2bde76830b",
-        "localModelData_3059310181236400_695f707765a1eb607beab502",
-        "localModelModeList_3059310181236400_6944cc76b3556d2bde76830b"
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"22d7f783f820cc380e3c643a38d81a3c\"]",
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"627fdea1bbff00804d82168ad406be04\"]",
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"6b56e595f647a8c950c7411d80679600\"]",
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"6cede910495075d6d9c355c3a52b4638\"]",
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"7ac3383c2f5d2988de798e76a15d60d1\"]",
+        "AI.modelSelectionReset.state.v1:[\"3059310181236400\",\"__default__profile__\",\"legacy_ai_chat\",\"a378c8e234f15d752f6906474541f719\"]"
       ],
       "model_catalog": {
         "source": "<uid>:AI.agent.model.model_list_map (ItemTable)",
@@ -166,6 +166,14 @@
         "selected": {
           "solo_agent": {
             "modelId": "solo_agent_1__deepseek-v4.1-flash",
+            "mode": 0
+          },
+          "agent": {
+            "modelId": "agent_1_-_DeepSeek-V4-Pro",
+            "mode": 0
+          },
+          "solo_coder": {
+            "modelId": "solo_coder_1_-_deepseek-v4.1-flash",
             "mode": 0
           }
         }
@@ -346,28 +354,28 @@
       "state_db_plain_sqlite": true,
       "model_catalog": {
         "source": "~/.workbuddy/local_storage/*.info product manifest",
-        "count": 59,
+        "count": 32,
         "ids": [
           "auto",
           "balanced-model",
-          "codewise-completions",
-          "codewise-jump",
-          "codewise-nes-a4-027-aide",
-          "codewise-rewrite",
-          "completion-gf",
           "deep-model",
-          "deepseek-r1-0528",
           "deepseek-r1-0528-lkeap",
-          "deepseek-v3-0324",
           "deepseek-v3-0324-lkeap",
-          "deepseek-v3-0324-taco-completion",
           "deepseek-v3-1",
           "deepseek-v3-1-lkeap",
           "deepseek-v3-1-volc",
           "deepseek-v3-2-volc",
           "deepseek-v4-flash",
           "deepseek-v4-pro",
-          "deepseek-v4.1-flash"
+          "deepseek-v4.1-flash",
+          "fast-model",
+          "glm-4.6",
+          "glm-4.6v",
+          "glm-5.3-flash",
+          "hunyuan-image-alpha",
+          "hunyuan-image-alpha-edit",
+          "kimi-k2-instruct-taiji",
+          "kimi-k2-thinking"
         ]
       },
       "workspace_channel": "workbuddy://task?action=start&cwd=&model=&welcomeMode=&permissionMode=&mode=",
@@ -388,7 +396,7 @@
       "adapter": "opencode",
       "model_catalog": {
         "source": "opencode CLI models output",
-        "count": 41,
+        "count": 43,
         "glm_5_3_flash_free": true,
         "sample": [
           "opencode-go/glm-5.2",
@@ -449,21 +457,24 @@
           "glm-5.3-flash"
         ]
       },
-      "workspace_channel": "cli/db/db.sqlite session.directory / session.path / project_id (plain SQLite)",
-      "dev_mode_channel": "cli/db/db.sqlite local_setting(permission.mode=yolo) + session.permission",
-      "chat_channel": "NOT FOUND (Electron GUI, no verified IPC/CLI send path)",
-      "readback_channel": "cli/db/db.sqlite session.* + model_usage.model_id + rollout jsonl",
+      "workspace_channel": "--cwd <dir> (headless CLI) + cli/db/db.sqlite session.directory (plain SQLite)",
+      "dev_mode_channel": "-p default permission mode yolo; --mode build|edit|plan|yolo|guarded",
+      "chat_channel": "VERIFIED headless CLI: ELECTRON_RUN_AS_NODE=1 ZCode.exe resources/glm/zcode.cjs -p \"<task>\" --cwd <dir> --json; model pinned via temp provider config copy (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE + ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, providerOrder/modelOrder first); ZCODE_MODEL_RETRY_MAX_RETRIES caps the retry loop; --resume <sess_...> continues a session",
+      "readback_channel": "cli/db/db.sqlite session.* + model_usage(provider/model/status) + rollout jsonl",
       "evidence": [
         "~/.zcode/cli/db/db.sqlite tables session/local_setting/model_usage",
         "~/.zcode/cli/rollout/model-io-sess_*.jsonl",
-        "C:/Program Files/ZCode/resources app bundle"
+        "C:/Program Files/ZCode/resources/glm/zcode.cjs --help (zcode CLI 0.17.1)",
+        "real run: -p returned exact expected text via deepseek-v4-pro (2.85s)",
+        "verification/verify_zcode_real.py end-to-end chain"
       ],
-      "status": "partial"
+      "status": "verified"
     },
     "dsh": {
       "product": "DeepSeek Harness",
-      "installed": false,
-      "settings": "C:\\Users\\<user>\\.dsh\\settings.yaml",
+      "installed": true,
+      "settings": "C:\\Users\\<user>\\.dsh\\settings.yaml.imported",
+      "settings_active": false,
       "catalog": "C:\\Users\\<user>\\.dsh\\.workbuddy-catalog.json",
       "catalog_exists": true,
       "sessions_dir": "C:\\Users\\<user>\\.dsh\\sessions",

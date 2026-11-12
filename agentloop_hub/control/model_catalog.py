@@ -60,8 +60,8 @@ def _display_name(agent_id: str, model: str) -> str:
         except Exception:
             return name
     if agent_id in ("qoder", "qoder_cn"):
-        from .interfaces import QODER_MODEL_LABELS
-        return QODER_MODEL_LABELS.get(name, name)
+        from .interfaces import qoder_model_labels
+        return qoder_model_labels().get(name, name)
     if agent_id == "workbuddy":
         from .interfaces import WORKBUDDY_MODEL_LABELS
         row = _workbuddy_map().get(name)
@@ -160,9 +160,14 @@ class ModelCatalogService:
                     {"model": name, "source": "registered", "note": "Agent 登记模型"}
                     for name in agent.models
                 ]
+            if entries and agent.agent_id in ("qoder", "qoder_cn"):
+                keep = set(self._drop_qoder_aliases([e["model"] for e in entries]))
+                entries = [entry for entry in entries if entry["model"] in keep]
             extra = agent.extra or {}
             profiles = extra.get("model_profiles") if isinstance(
                 extra.get("model_profiles"), dict) else {}
+            model_health = extra.get("model_health") if isinstance(
+                extra.get("model_health"), dict) else {}
             selected = str(extra.get("selected_model") or "")
             if not selected and main_id == agent.agent_id and main:
                 selected = str(main.get("model") or "")
@@ -181,6 +186,7 @@ class ModelCatalogService:
                     "source": entry["source"],
                     "source_label": SOURCE_LABELS.get(entry["source"], entry["source"]),
                     "note": entry.get("note", ""),
+                    "health": model_health.get(entry["model"]) or {},
                     "context_length": int(saved.get("context_length") or 0),
                     "capability_level": str(
                         saved.get("capability_level")
@@ -242,6 +248,20 @@ class ModelCatalogService:
                 detected.extend([row["id"] for row in list_workbuddy_models()])
             elif agent.agent_id == "qoder_cn":
                 detected.extend([row["id"] for row in list_qoder_models()])
+                if source != "sync":
+                    # Explicit refresh: read the desktop's own model menu so
+                    # keys and labels match exactly.  Background sync skips
+                    # this because it would pop the menu open.
+                    try:
+                        from ..gui.cdp import qoder_model_catalog_via_cdp
+                        port = int((agent.adapter_config or {}).get(
+                            "qoder_cdp_port") or 9222)
+                        live = qoder_model_catalog_via_cdp(port=port, timeout=6)
+                        if live.get("ok"):
+                            detected.extend(item["key"] for item in
+                                            (live.get("items") or []))
+                    except Exception:
+                        pass
             detected = sorted({str(item) for item in detected if str(item).strip()})
             if detected:
                 self.store.replace_discovered_models(
@@ -250,15 +270,79 @@ class ModelCatalogService:
                 )
             rows = self.store.list_agent_models(self.project.project_id, agent_id=agent.agent_id)
             models = sorted({row["model"] for row in rows} | set(agent.models or []))
+            if agent.agent_id in ("qoder", "qoder_cn"):
+                models = self._drop_qoder_aliases(models)
             if models != sorted(set(agent.models or [])):
                 self.store.set_agent_models(agent.agent_id, models)
+            probed = self._probe_model_health(agent, models) if source == "sync" else {}
             refreshed.append({
                 "agent_id": agent.agent_id,
                 "detected": detected,
                 "total": len(models),
+                "health_probed": probed,
             })
         return {"status": "refreshed", "agents": refreshed,
                 "catalog": self.catalog()}
+
+    def _drop_qoder_aliases(self, models: list[str]) -> list[str]:
+        """Keep real model keys only: labels are presentation, not choices.
+
+        Older runs registered display labels (``DeepSeek-Flash``) next to the
+        real runtime key (``dfmodel``), and session scraping produced
+        ``<synthetic>``.  Both made the picker disagree with Qoder's own menu.
+        """
+        from .interfaces import qoder_model_labels
+        label_to_key = {label: key for key, label in qoder_model_labels().items()}
+        present = set(models)
+        kept: list[str] = []
+        for model in models:
+            if model == "<synthetic>":
+                continue
+            key = label_to_key.get(model)
+            if key and key != model and key in present:
+                continue
+            kept.append(model)
+        return kept
+
+    def _probe_model_health(self, agent: AgentRecord,
+                            models: list[str]) -> dict[str, dict[str, Any]]:
+        """Sync-time subscription probe (currently ZCode's headless CLI).
+
+        2026-11-07 defect #3: expired provider subscriptions were invisible to
+        the catalog, so the planner kept binding dead models.  Only agents
+        with a real probe channel are probed; results are evidence-backed
+        (ok/degraded), never guessed.  ``adapter_config.probe_on_sync=false``
+        opts out.
+        """
+        if agent.adapter_type != "zcode" or not models:
+            return {}
+        cfg = agent.adapter_config or {}
+        if str(cfg.get("probe_on_sync", "true")).strip().lower() in ("false", "0", "no", "off"):
+            return {}
+        from ..adapters.zcode import ZcodeAdapter
+        from .model_health import degraded_entry, ok_entry
+        adapter = ZcodeAdapter(agent)
+        timeout = float(cfg.get("probe_timeout_seconds") or 60)
+        fresh = self.store.get_agent(agent.agent_id) or agent
+        extra = dict(fresh.extra or {})
+        health = dict(extra.get("model_health") or {})
+        results: dict[str, dict[str, Any]] = {}
+        for model in models:
+            probe = adapter.probe_model(model, timeout=timeout)
+            status = str(probe.get("status") or "")
+            if status == "ok":
+                health[model] = ok_entry(source="probe")
+            elif status == "degraded":
+                health[model] = degraded_entry(
+                    str(probe.get("reason") or "probe_failed"),
+                    str(probe.get("error") or ""), source="probe")
+            else:
+                continue  # unknown probe keeps the previous evidence
+            results[model] = health[model]
+        if results:
+            extra["model_health"] = health
+            self.store.update_agent_extra(agent.agent_id, extra)
+        return results
 
     def sync_all(self, *, agent_id: str = "") -> dict[str, Any]:
         """Refresh every agent's real catalog and report per-agent coverage."""
@@ -349,6 +433,8 @@ class ModelCatalogService:
     def _sync_agent_models(self, agent: AgentRecord) -> None:
         rows = self.store.list_agent_models(self.project.project_id, agent_id=agent.agent_id)
         models = sorted({row["model"] for row in rows} | set(agent.models or []))
+        if agent.agent_id in ("qoder", "qoder_cn"):
+            models = self._drop_qoder_aliases(models)
         self.store.set_agent_models(agent.agent_id, models)
 
     def _agent(self, agent_id: str) -> AgentRecord:

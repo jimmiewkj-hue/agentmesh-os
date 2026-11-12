@@ -1997,15 +1997,21 @@ class Store:
 
     def semantic_set(self, cache_key: str, project_id: str, task_type: str, signature: str,
                      objective: str, file_hash: str, payload: dict[str, Any],
-                     expires_at: str = "") -> None:
+                     expires_at: str = "", embedding: list[float] | None = None) -> None:
         self.db.execute(
             "INSERT INTO semantic_cache(cache_key, project_id, task_type, signature, objective, "
-            "file_hash, payload, hits, created_at, last_hit_at, expires_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET "
+            "file_hash, payload, embedding, hits, created_at, last_hit_at, expires_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET "
             "signature=excluded.signature, objective=excluded.objective, payload=excluded.payload, "
-            "expires_at=excluded.expires_at",
+            "embedding=excluded.embedding, expires_at=excluded.expires_at",
             (cache_key, project_id, task_type, signature, objective, file_hash, _dumps(payload),
-             0, now_iso(), "", expires_at),
+             _dumps(embedding or []), 0, now_iso(), "", expires_at),
+        )
+
+    def semantic_set_embedding(self, cache_key: str, embedding: list[float]) -> None:
+        self.db.execute(
+            "UPDATE semantic_cache SET embedding=? WHERE cache_key=?",
+            (_dumps(embedding), cache_key),
         )
 
     def semantic_hit(self, cache_key: str) -> None:

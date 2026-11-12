@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,8 @@ class PlanningService:
         self.cost = cost
         self.governance = governance
         self.prompts = PromptBuilder(paths, project)
+        self._watches_lock = threading.Lock()
+        self._watches: dict[str, dict[str, Any]] = {}
 
     # -- request ----------------------------------------------------------
     def request_plan(self, goal: str, *, main_agent_id: str = "", model: str = "",
@@ -83,6 +87,7 @@ class PlanningService:
         if self.cost:
             ctx = self.cost.compress_context(
                 ctx, self.config.context_summary_tokens, kind="context_compression",
+                model=model or self._main_model(),
             )
         workspace = self._plan_workspace(plan_id)
         canonical_plan_path = self.paths.planning / plan_id / "plan.json"
@@ -171,18 +176,32 @@ class PlanningService:
                 "has_plan": (plan_path.exists()),
             }, source=main.agent_id, correlation_id=plan_id)
         if outcome.status in ("waiting_user", "waiting_agent"):
+            manual_action = (outcome.extras or {}).get("manual_action") or {}
+            watch = None
+            if persist:
+                watch = self._register_plan_watch(
+                    plan_id=plan_id, goal=goal, main=main, model=request.model,
+                    prompt_path=prompt_path, agent_plan_path=agent_plan_path,
+                    plan_path=plan_path, activity_path=activity_path,
+                    manual_action=manual_action,
+                )
             return {
-                "status": "waiting_user", "plan_id": "",
+                "status": "waiting_user", "plan_id": plan_id,
                 "prompt_path": str(prompt_path), "plan_path": str(plan_path),
-                "agent_id": main.agent_id, "message": outcome.text,
+                "result_path": str(agent_plan_path),
+                "agent_id": main.agent_id,
+                "message": outcome.text or outcome.error,
+                "manual_action": manual_action,
+                "watch": watch,
             }
         data = None
         if outcome.status != "completed":
             # A GUI agent can finish the plan and write plan.json while the
-            # post-reply interface check fails (e.g. the app appended an
-            # effort suffix to the visible model).  Salvage a valid plan
-            # instead of discarding minutes of completed work.
-            if outcome.status == "failed":
+            # post-reply interface check fails or the reply readback times
+            # out (Trae's global session state does not track turn status).
+            # Salvage a valid plan instead of discarding minutes of completed
+            # work.
+            if outcome.status in ("failed", "timeout"):
                 data = read_json(agent_plan_path)
                 if isinstance(data, dict) and data:
                     write_json(plan_path, data)
@@ -205,24 +224,46 @@ class PlanningService:
             data = read_json(agent_plan_path)
         if not isinstance(data, dict):
             data = outcome.result_payload if isinstance(outcome.result_payload, dict) else None
-        if isinstance(data, dict):
-            write_json(plan_path, data)
-        else:
+        if not isinstance(data, dict):
             return {"status": "failed", "plan_id": "", "error": "主节点没有写出计划文件",
                     "prompt_path": str(prompt_path), "plan_path": str(plan_path)}
+        return self._finalize_plan_data(
+            data, plan_id=plan_id, main=main, model=request.model,
+            contract=contract, prompt_path=prompt_path, plan_path=plan_path,
+            persist=persist, round_context=round_context,
+            repair_ctx=(adapter, request, synthetic),
+        )
+
+    def _finalize_plan_data(self, data: dict[str, Any], *, plan_id: str,
+                            main: AgentRecord, model: str, contract: dict[str, Any],
+                            prompt_path: Path, plan_path: Path,
+                            persist: bool = True,
+                            round_context: dict[str, Any] | None = None,
+                            repair_ctx: tuple | None = None) -> dict[str, Any]:
+        """Validate, pin the collaboration contract and persist a plan payload.
+
+        Shared by the synchronous request path and the completion watcher so a
+        plan written after a manual GUI wait lands in exactly the same
+        approval pipeline.  ``repair_ctx`` is only set for the synchronous
+        path: the watcher must never start a new agent generation on its own.
+        """
+        write_json(plan_path, data)
         try:
             plan = TaskPlan.from_dict(normalize_plan_payload(data),
                                       project_id=self.project.project_id, plan_id=plan_id)
         except ValidationError as exc:
-            repaired = self._repair_plan_with_agent(
-                adapter, main, request, synthetic, prompt_path, plan_path, exc.message
-            )
+            repaired = None
+            if repair_ctx is not None:
+                adapter, request, synthetic = repair_ctx
+                repaired = self._repair_plan_with_agent(
+                    adapter, main, request, synthetic, prompt_path, plan_path, exc.message
+                )
             if repaired is None:
                 return {"status": "failed", "plan_id": "", "error": f"计划校验失败: {exc.message}",
                         "prompt_path": str(prompt_path), "plan_path": str(plan_path)}
             plan = repaired
         plan.main_agent_id = main.agent_id
-        plan.model = request.model
+        plan.model = model
         contract_notes = enforce_plan_contract(plan, contract)
         plan.validate()
         if not persist:
@@ -263,6 +304,218 @@ class PlanningService:
             "plan": plan.to_dict(),
             "prompt_path": str(prompt_path), "plan_path": str(plan_path),
         }
+
+    # -- completion watches -----------------------------------------------
+    def _register_plan_watch(self, *, plan_id: str, goal: str, main: AgentRecord,
+                             model: str, prompt_path: Path, agent_plan_path: Path,
+                             plan_path: Path, activity_path: Path,
+                             manual_action: dict[str, Any]) -> dict[str, Any]:
+        """Persist a watch so a manually completed GUI plan is still picked up.
+
+        The GUI adapter returns waiting_user as soon as the app needs a human
+        (empty model menu, workspace switch, manual submit).  The agent may
+        finish minutes or days later — even after a server restart — so the
+        watch lives on disk next to the plan and is resumed on startup.
+        """
+        self._supersede_watches(
+            reason="replanned",
+            match=lambda w: w.get("agent_id") == main.agent_id,
+        )
+        manual_timeout = float(manual_action.get("timeout_seconds") or 0)
+        watch_seconds = max(float(self.config.plan_watch_seconds), manual_timeout)
+        started = time.time()
+        watch = {
+            "plan_id": plan_id, "status": "watching", "goal": goal,
+            "agent_id": main.agent_id, "model": model,
+            "agent_plan_path": str(agent_plan_path), "plan_path": str(plan_path),
+            "prompt_path": str(prompt_path), "activity_path": str(activity_path),
+            "created_at": now_iso(), "started_epoch": started,
+            "deadline_epoch": started + watch_seconds,
+        }
+        write_json(activity_path.parent / "watch.json", watch)
+        self.audit.log("control-plane", "plan.watch_started", subject=plan_id,
+                       payload={"agent_id": main.agent_id,
+                                "result_path": str(agent_plan_path),
+                                "deadline_epoch": watch["deadline_epoch"]})
+        self._start_watch_thread(watch)
+        return {"status": "watching", "plan_id": plan_id,
+                "deadline_epoch": watch["deadline_epoch"],
+                "result_path": str(agent_plan_path)}
+
+    def _start_watch_thread(self, watch: dict[str, Any]) -> None:
+        stop = threading.Event()
+        with self._watches_lock:
+            self._watches[watch["plan_id"]] = {"watch": watch, "stop": stop}
+        thread = threading.Thread(
+            target=self._watch_plan_loop, args=(watch, stop),
+            name=f"plan-watch-{watch['plan_id']}", daemon=True)
+        thread.start()
+
+    def _watch_plan_loop(self, watch: dict[str, Any], stop: threading.Event) -> None:
+        started = time.time()
+        try:
+            while not stop.is_set():
+                if self._poll_watch_once(watch):
+                    return
+                interval = 3.0 if time.time() - started < 600 else 15.0
+                stop.wait(interval)
+        except Exception as exc:
+            self._finish_watch(watch, "failed", error=str(exc)[:300])
+        finally:
+            with self._watches_lock:
+                self._watches.pop(watch.get("plan_id", ""), None)
+
+    def _poll_watch_once(self, watch: dict[str, Any]) -> bool:
+        """One watch iteration; True once the watch reached a terminal state."""
+        plan_id = str(watch.get("plan_id") or "")
+        if time.time() > float(watch.get("deadline_epoch") or 0):
+            self._finish_watch(watch, "expired",
+                               error="超过监视期限，计划文件仍未写出；可手动导入计划 JSON")
+            return True
+        if self.store.get_plan(plan_id):
+            self._finish_watch(watch, "completed", note="计划已入库")
+            return True
+        data = read_json(watch.get("agent_plan_path", ""))
+        if not isinstance(data, dict) or not data.get("tasks"):
+            return False
+        main = self.store.get_agent(str(watch.get("agent_id") or ""))
+        if main is None:
+            self._finish_watch(watch, "failed", error="主节点 Agent 不存在，无法接收计划")
+            return True
+        activity = read_json(watch.get("activity_path", ""), {}) or {}
+        contract = build_contract(self.store, self.project, main.agent_id,
+                                  str(watch.get("model") or ""))
+        result = self._finalize_plan_data(
+            data, plan_id=plan_id, main=main, model=str(watch.get("model") or ""),
+            contract=contract, prompt_path=Path(watch.get("prompt_path", "")),
+            plan_path=Path(watch.get("plan_path", "")),
+            persist=True,
+        )
+        if result.get("status") == "pending_approval":
+            activity.update({"status": "pending_approval", "watched": True,
+                             "finished_at": now_iso()})
+            write_json(watch.get("activity_path", ""), activity)
+            self._finish_watch(watch, "completed", plan_id=plan_id)
+        else:
+            self._finish_watch(watch, "invalid", error=result.get("error", ""))
+        return True
+
+    def _finish_watch(self, watch: dict[str, Any], status: str, **extra: Any) -> None:
+        updated = {**watch, "status": status, "finished_at": now_iso(), **extra}
+        try:
+            write_json(Path(watch.get("activity_path", "")).parent / "watch.json",
+                       updated)
+        except Exception:
+            pass
+        self.audit.log("control-plane", f"plan.watch_{status}",
+                       subject=str(watch.get("plan_id") or ""),
+                       payload={k: str(v)[:300] for k, v in extra.items()})
+        if self.bus and status == "completed":
+            self.bus.publish("response", {
+                "purpose": "plan", "plan_id": watch.get("plan_id"),
+                "agent_id": watch.get("agent_id"), "status": "completed",
+                "error": "", "plan_path": watch.get("plan_path", ""),
+                "has_plan": True, "watched": True,
+            }, source=str(watch.get("agent_id") or ""),
+                correlation_id=str(watch.get("plan_id") or ""))
+
+    def _supersede_watches(self, *, reason: str,
+                           match: Any = None) -> None:
+        with self._watches_lock:
+            entries = list(self._watches.items())
+        for plan_id, entry in entries:
+            watch = entry["watch"]
+            if match is not None and not match(watch):
+                continue
+            entry["stop"].set()
+            self._finish_watch(watch, "superseded", reason=reason)
+            with self._watches_lock:
+                self._watches.pop(plan_id, None)
+
+    def resume_watches(self) -> int:
+        """Restart persisted watches after a server restart."""
+        resumed = 0
+        for path in sorted(Path(self.paths.planning).glob("*/watch.json")):
+            watch = read_json(path, {}) or {}
+            if watch.get("status") != "watching" or not watch.get("plan_id"):
+                continue
+            with self._watches_lock:
+                if watch["plan_id"] in self._watches:
+                    continue
+            if self.store.get_plan(watch["plan_id"]):
+                self._finish_watch(watch, "completed", note="计划已入库")
+                continue
+            if time.time() > float(watch.get("deadline_epoch") or 0):
+                self._finish_watch(watch, "expired")
+                continue
+            self._start_watch_thread(watch)
+            resumed += 1
+        return resumed
+
+    def stop_watches(self) -> None:
+        with self._watches_lock:
+            entries = list(self._watches.values())
+            self._watches.clear()
+        for entry in entries:
+            entry["stop"].set()
+
+    def list_watches(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for path in Path(self.paths.planning).glob("*/watch.json"):
+            watch = read_json(path, {}) or {}
+            if not watch.get("plan_id"):
+                continue
+            if watch.get("status") == "watching":
+                watch["remaining_seconds"] = max(
+                    0, int(float(watch.get("deadline_epoch") or 0) - time.time()))
+            out.append(watch)
+        out.sort(key=lambda w: str(w.get("created_at") or ""), reverse=True)
+        return out[:limit]
+
+    # -- import helpers ----------------------------------------------------
+    def _load_plan_payload(self, data: Any) -> dict[str, Any]:
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, Path):
+            data = str(data)
+        if not isinstance(data, str) or not data.strip():
+            raise ValidationError("计划内容为空：请粘贴计划 JSON 或填写文件路径")
+        text = data.strip()
+        if text.startswith("{") or text.startswith("[") or text.startswith("```"):
+            return self._parse_plan_text(text, origin="粘贴内容")
+        candidates = [Path(text)]
+        if not Path(text).is_absolute():
+            candidates.append(Path(self.project.root) / text)
+        for path in candidates:
+            try:
+                raw_text = path.read_text(encoding="utf-8-sig")
+            except OSError:
+                continue
+            return self._parse_plan_text(raw_text, origin=str(path))
+        raise ValidationError(
+            f"无法读取计划文件: {text}（文件不存在或不可读；相对路径按工作区根目录解析）")
+
+    def _parse_plan_text(self, text: str, *, origin: str) -> dict[str, Any]:
+        stripped = self._strip_json_fences(text)
+        try:
+            raw = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"计划 JSON 解析失败（{origin}）: {exc.msg}（行 {exc.lineno} 列 {exc.colno}）")
+        if not isinstance(raw, dict):
+            raise ValidationError(f"计划 JSON 必须是对象（{origin}）")
+        return raw
+
+    @staticmethod
+    def _strip_json_fences(text: str) -> str:
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+        lines = stripped.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
 
     def request_round_plan(self, *, goal: str, base_plan: TaskPlan, round_number: int,
                            round_context: dict[str, Any]) -> dict[str, Any]:
@@ -402,9 +655,7 @@ class PlanningService:
     # -- import / approve --------------------------------------------------
     def import_plan(self, data: dict[str, Any] | str | Path, *, main_agent_id: str = "",
                     model: str = "") -> dict[str, Any]:
-        raw = read_json(data) if isinstance(data, (str, Path)) else data
-        if raw is None:
-            raise ValidationError(f"无法读取计划文件: {data}")
+        raw = self._load_plan_payload(data)
         plan_id = new_id("plan")
         plan = TaskPlan.from_dict(normalize_plan_payload(raw),
                                   project_id=self.project.project_id, plan_id=plan_id)
@@ -416,6 +667,7 @@ class PlanningService:
         plan.validate()
         plan.status = "pending_approval"
         self.store.save_plan(plan)
+        self._supersede_watches(reason="imported")
         architecture = self.governance.ensure_architecture_approval(plan) if self.governance else None
         approval = self.approvals.ensure_plan_approval(plan)
         self.checkpoints.create("plan_generated", extra={"plan_id": plan.plan_id})

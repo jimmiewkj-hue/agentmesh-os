@@ -142,6 +142,27 @@ class TraeReader:
                     usage={"source": "cdp-dom+state.vscdb", "message_ids": messages},
                     finished_at=now_iso(),
                 )
+            # Trae 1.107.1 keeps the global solo-lite session as a shell:
+            # messageIds stays 0 and assistant_task_status is never written
+            # (observed 2026-11-11 while the window had long finished).  When
+            # the app provides no turn state at all, fall back to evidence it
+            # does produce: the rendered turn summary / a complete result
+            # file, plus a stable conversation containing this turn's marker
+            # and reply.  Never applies while the app reports real state.
+            state_available = bool(messages) or bool(session.get("assistant_task_status"))
+            if (not state_available and marker_seen and saw_reply and stable
+                    and (_json_file_ready(self.completion_path) or "思考用时" in text)):
+                return GuiReply(
+                    session_id=str(session.get("sessionId") or ""),
+                    text=(reply or text)[-60000:],
+                    model=model or expected_model,
+                    transcript_path=str(state.db),
+                    events=0,
+                    usage={"source": "cdp-dom+result-file",
+                           "message_ids": messages,
+                           "result_path": self.completion_path},
+                    finished_at=now_iso(),
+                )
             if stall_seconds and time.monotonic() - last_change > stall_seconds \
                     and not saw_reply:
                 raise GuiAutomationError(
@@ -157,10 +178,31 @@ class TraeReader:
         )
 
     def has_marker(self, marker: str, *, started_at: float = 0.0) -> dict[str, Any]:
-        """Trae's visible body also contains the composer, so a marker there
-        does not prove the message was sent.  Report unsupported rather than
-        inventing an acceptance receipt."""
-        return {"ok": False, "reason": "NO_TRANSCRIPT_RECEIPT"}
+        """Read-only delivery receipt from two unforgeable signals.
+
+        1. A complete result package at the attempt-specific result path:
+           that path is disclosed only inside the delivered prompt, so a
+           valid file there proves the request reached the agent (acceptance,
+           not completion — verification still judges the result).
+        2. The marker rendered in the visible conversation outside every
+           composer control.  A marker only in the composer proves nothing.
+
+        The encrypted transcript database is still never read.
+        """
+        if self.completion_path and _json_file_ready(self.completion_path):
+            return {"ok": True, "source": "attempt-result-file",
+                    "path": self.completion_path}
+        try:
+            probe = trae.trae_marker_in_transcript(
+                self.port, marker, page_id=self.page_id)
+        except Exception as exc:
+            return {"ok": False, "reason": f"RECEIPT_PROBE_FAILED: {str(exc)[:200]}"}
+        if probe.get("found"):
+            return {"ok": True, "source": "cdp-transcript", **probe}
+        if probe.get("in_composer_only"):
+            return {"ok": False, "reason": "MARKER_ONLY_IN_COMPOSER", **probe}
+        return {"ok": False,
+                "reason": str(probe.get("reason") or "MARKER_NOT_FOUND"), **probe}
 
     @staticmethod
     def _after_marker(text: str, marker: str) -> str:

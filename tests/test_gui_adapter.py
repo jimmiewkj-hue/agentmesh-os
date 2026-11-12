@@ -316,7 +316,7 @@ def test_set_model_qoder_uses_db_transcript_path(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_prepare(*, workspace, model, config=None):
+    def fake_prepare(*, workspace, model, config=None, **kwargs):
         calls.append((workspace, model))
         return InterfaceOutcome(True, "db_write", {"workspace": workspace, "model": model},
                                 {"model": model}, evidence={"session_id": "sess-db"})
@@ -484,7 +484,9 @@ def test_discovery_upgrades_qoder_cn_and_workbuddy_to_gui_automation(tmp_path, m
     assert qoder_cn.adapter_config["gui_app"] == "qoder_cn"
     assert qoder_cn.access_level == "L3"
     assert qoder_cn.version == "0.5.1"
-    assert {"dfmodel", "DeepSeek-Flash"}.issubset(set(qoder_cn.models))
+    assert "dfmodel" in qoder_cn.models
+    # Display labels are presentation-only; the picker stores real keys.
+    assert "DeepSeek-Flash" not in qoder_cn.models
     assert qoder_cn.capabilities["auto_executable"] is True
     assert is_auto_executable(qoder_cn) is True
 

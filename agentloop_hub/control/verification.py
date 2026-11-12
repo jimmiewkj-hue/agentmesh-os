@@ -395,15 +395,40 @@ class Verifier:
         else:
             checks["tests_claimed_consistent"] = "skipped"
 
-        # 6. Evidence references exist when they name files.
-        missing_evidence = []
+        # 6. Evidence references exist when they name files.  Harness draft
+        # paths (.agentloop-task/**) are excluded from patches by design, so
+        # they resolve against the execution worktree where the agent wrote
+        # them; the frozen verification tree can never contain them.
+        missing_evidence: list[str] = []
+        draft_evidence: list[str] = []
         evidence_root = Path(test_workdir) if test_workdir else (
             Path(task.workdir) if task.workdir else Path(self.project.root))
         for item in result.payload.get("evidence") or []:
-            if isinstance(item, dict) and item.get("file"):
-                path = evidence_root / str(item["file"])
-                if not path.exists():
-                    missing_evidence.append(str(item["file"]))
+            if not (isinstance(item, dict) and item.get("file")):
+                continue
+            raw = str(item["file"])
+            rel = normalize_scope_path(raw)
+            draft = rel == ".agentloop-task" or rel.startswith(".agentloop-task/") \
+                or ".agentloop-task" in Path(raw.replace("\\", "/")).parts
+            roots = [evidence_root]
+            if draft and task.workdir:
+                exec_root = Path(task.workdir)
+                if exec_root.resolve() != evidence_root.resolve():
+                    roots.insert(0, exec_root)
+            found = False
+            for root in roots:
+                try:
+                    resolved = (root / raw).resolve()
+                    base = root.resolve()
+                except (OSError, ValueError):
+                    continue
+                if resolved.is_relative_to(base) and resolved.exists():
+                    found = True
+                    if draft and base != evidence_root.resolve():
+                        draft_evidence.append(resolved.relative_to(base).as_posix())
+                    break
+            if not found:
+                missing_evidence.append(raw)
         if missing_evidence:
             checks["evidence_files"] = "failed"
             warnings.append(f"证据引用的文件不存在: {missing_evidence[:10]}")
@@ -417,11 +442,14 @@ class Verifier:
             status = VerificationStatus.WARNING.value
         else:
             status = VerificationStatus.PASSED.value
+        report_evidence: dict[str, Any] = {"patch": patch_path, "commands": command_results}
+        if draft_evidence:
+            report_evidence["draft_evidence_from_execution_worktree"] = draft_evidence
         report = VerificationReport(
             task_id=task.task_id, verifier_agent="control-plane",
             status=status, checks=checks, warnings=warnings,
             summary=f"控制平面验证：{status}",
-            evidence=[{"patch": patch_path, "commands": command_results}],
+            evidence=[report_evidence],
             created_at=now_iso(), source="control_plane",
         )
         report_path = str(self.paths.report_path(f"verification-{task.uid.replace(':', '_')}.json"))

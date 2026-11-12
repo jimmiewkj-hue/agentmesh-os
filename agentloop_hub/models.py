@@ -85,6 +85,8 @@ class AccessLevel(str, Enum):
 class AdapterType(str, Enum):
     CLI = "cli"
     OPENCODE = "opencode"
+    ZCODE = "zcode"
+    DSH = "dsh"
     FILE_RELAY = "file_relay"
     MANUAL = "manual"
     SESSION_ONLY = "session_only"

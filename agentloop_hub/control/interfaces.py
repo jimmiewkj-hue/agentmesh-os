@@ -42,6 +42,7 @@ import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -89,14 +90,152 @@ WORKBUDDY_MODEL_LABELS: dict[str, str] = {
     "Space-Bunny": "space-bunny",
 }
 
+# Fallback labels; the authoritative names come from Qoder's downloaded
+# dynamic text (``~/.qoder-cn/.auth/dynamic-texts.json``) and the labels
+# bundled in the installed app.
 QODER_MODEL_LABELS: dict[str, str] = {
+    "auto": "Auto",
+    "fast": "快速",
+    "efficient": "经济",
+    "lite": "轻量",
+    "performance": "性能",
+    "ultimate": "极致",
+    "cmodel": "Cantus",
     "dfmodel": "DeepSeek-Flash",
-    "gfmodel": "GLM-5.3-Flash",
+    "dmodel": "DeepSeek-V4-Pro",
+    "gm51model": "GLM-5.2",
     "gmodel": "GLM-5.3",
-    "kmodel": "Kimi-K3.1-Pro",
+    "gfmodel": "GLM-5.3-Flash",
+    "jmodel": "Step-5-Preview",
+    "kmodel": "Kimi-K2.8-Preview",
     "kmodel_latest": "Kimi-K3.1-Pro",
-    "mmodel": "Qwen3.8-Max",
+    "mmodel": "MiniMax-M3.1-Flash",
+    "qmodel": "Qwen3.7-Plus",
+    "qmodel_latest": "Qwen4-Max-Preview",
+    "qmodel_preview": "Qwen3.8-Max-Preview",
+    "qmodel_38max": "Qwen3.8-Max",
+    "q37fmodel": "Qwen3.7-Flash",
+    "qfmodel": "Qwen3.8-Flash",
 }
+
+_QODER_ITEM_LABEL = re.compile(r"^modelSelector\.item\.([A-Za-z0-9_\-]+)$")
+
+
+def qoder_dynamic_text_paths(config: dict[str, Any] | None = None) -> list[Path]:
+    """Locations of Qoder CN's model labels, lowest priority first.
+
+    ``dynamic-texts.json`` is downloaded from the service and is newer than
+    the copy shipped inside the installed app; it is what currently names
+    ``qmodel_latest`` "Qwen4-Max-Preview".
+    """
+    cfg = dict(config or {})
+    appdata = Path(os.environ.get("APPDATA") or _home() / "AppData" / "Roaming")
+    paths: list[Path] = [appdata / "QoderCN" / "User" / "dynamic-text-cache.json"]
+    exe = str(cfg.get("executable") or
+              r"C:\Program Files\Qoder\Qoder CN\Qoder CN.exe")
+    if exe:
+        paths.append(Path(exe).parent / "resources" / "dynamic-text" / "qoder-cn.json")
+    paths.append(_home() / ".qoder-cn" / ".auth" / "dynamic-texts.json")
+    configured = str(cfg.get("qoder_dynamic_text") or "").strip()
+    if configured:
+        paths.append(Path(configured))
+    return paths
+
+
+@lru_cache(maxsize=8)
+def _qoder_labels_from(path: str) -> tuple[tuple[str, str], ...]:
+    file = Path(path)
+    if not file.is_file():
+        return ()
+    try:
+        data = json.loads(file.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ()
+    out: dict[str, str] = {}
+
+    def collect(entries: dict[str, Any]) -> None:
+        for key, value in entries.items():
+            if not isinstance(value, str):
+                continue
+            if key.startswith("model.") and key.endswith(".label"):
+                out.setdefault(key[len("model."):-len(".label")], value)
+                continue
+            match = _QODER_ITEM_LABEL.match(key)
+            if match:
+                out.setdefault(match.group(1), value)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if any(isinstance(value, str) for value in node.values()):
+                collect(node)
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    if isinstance(data, dict):
+        locales = data.get("locales") if isinstance(data.get("locales"), dict) else {}
+        found = False
+        for lang in ("zh-CN", "zh", "en"):
+            entries = locales.get(lang)
+            if not isinstance(entries, dict):
+                entries = data.get(lang)
+            if isinstance(entries, dict):
+                collect(entries)
+                found = True
+        if not found:
+            walk(data)
+    return tuple(sorted(out.items()))
+
+
+def qoder_catalog_cache_path(config: dict[str, Any] | None = None) -> Path:
+    cfg = dict(config or {})
+    configured = str(cfg.get("qoder_catalog_cache") or "").strip()
+    if configured:
+        return Path(configured)
+    from ..config import default_home
+    return default_home() / "qoder-models.json"
+
+
+def qoder_catalog_cache(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """The last model menu captured from a live Qoder renderer (CDP)."""
+    path = qoder_catalog_cache_path(config)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    captured = float((data or {}).get("captured_at") or 0)
+    if captured and time.time() - captured > 7 * 24 * 3600:
+        return []
+    return [item for item in items
+            if isinstance(item, dict) and str(item.get("key") or "").strip()]
+
+
+def qoder_model_labels(config: dict[str, Any] | None = None) -> dict[str, str]:
+    """Model keys -> the labels Qoder CN renders.
+
+    Priority: live catalog capture > verified defaults > downloaded/bundled
+    text (used only for keys the defaults do not know).  The bundled and
+    downloaded texts disagree with the menu on some models, so they must not
+    overwrite a verified name.
+    """
+    labels = dict(QODER_MODEL_LABELS)
+    for path in qoder_dynamic_text_paths(config):
+        for key, label in _qoder_labels_from(str(path)):
+            labels.setdefault(key, label)
+    for item in qoder_catalog_cache(config):
+        key = str(item.get("key") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if key and label:
+            labels[key] = label
+    return labels
 
 
 def workbuddy_model_key(model: str) -> str:
@@ -115,10 +254,11 @@ def qoder_model_key(model: str) -> str:
     if not text:
         return ""
     lower = text.lower()
-    for key, label in QODER_MODEL_LABELS.items():
+    labels = qoder_model_labels()
+    for key, label in labels.items():
         if label.lower() == lower or key.lower() == lower:
             return key
-    if lower in QODER_MODEL_LABELS:
+    if lower in labels:
         return lower
     return lower
 
@@ -261,8 +401,91 @@ def list_workbuddy_models(config: dict[str, Any] | None = None) -> list[dict[str
             for label, key in WORKBUDDY_MODEL_LABELS.items()]
 
 
+def qoder_local_storage_root(config: dict[str, Any] | None = None) -> Path:
+    cfg = dict(config or {})
+    configured = str(cfg.get("qoder_local_storage") or "").strip()
+    if configured:
+        return Path(configured)
+    appdata = Path(os.environ.get("APPDATA") or _home() / "AppData" / "Roaming")
+    return appdata / "com.qodercn.app.stable" / "Local Storage" / "leveldb"
+
+
+def qoder_catalog_keys(config: dict[str, Any] | None = None) -> list[str]:
+    """Model keys the Qoder CN renderer last received from its catalog.
+
+    The desktop keeps ``qoder.chatModelUpdates.v1:<uid>`` in Chromium Local
+    Storage; it is the only readable copy of the account catalog (the
+    ``catalog-v7`` file itself is QMC-encrypted).  Falling back to the sqlite
+    preferences alone hid every model the user had never selected.
+    """
+    root = qoder_local_storage_root(config)
+    if not root.is_dir():
+        return []
+    files = sorted((p for p in root.iterdir() if p.is_file() and p.suffix in
+                    (".log", ".ldb")), key=lambda p: p.stat().st_mtime,
+                   reverse=True)
+    pattern = re.compile(r'\\"([A-Za-z0-9_.:\-]{2,64})\\",\\"(?:model|new|free)\\"')
+    keys: set[str] = set()
+    for file in files[:4]:
+        try:
+            raw = file.read_bytes()[:4 * 1024 * 1024]
+        except OSError:
+            continue
+        text = raw.decode("latin-1")
+        if "qoder.chatModelUpdates.v1:" not in text:
+            continue
+        for hit in pattern.findall(text):
+            if hit.startswith(("runtime:", "byok:")):
+                continue
+            keys.add(hit)
+        if keys:
+            break
+    return sorted(keys)
+
+
+def _qoder_byok_models(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """User-added BYOK models are part of the app's menu but not of prefs."""
+    try:
+        rows = conn.execute(
+            "select model_key, model_display_name, provider_display_name, "
+            "default_context_window, available_context_windows_json, efforts_json "
+            "from byok_model_profiles").fetchall()
+    except sqlite3.Error:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row[0] or "").strip()
+        if not key:
+            continue
+        contexts = []
+        try:
+            raw = json.loads(row[4] or "[]")
+            contexts = sorted({int(value) for value in raw
+                               if isinstance(value, (int, float)) and int(value) > 0})
+        except Exception:
+            contexts = []
+        efforts = []
+        try:
+            raw = json.loads(row[5] or "[]")
+            efforts = [str(value) for value in raw if str(value or "").strip()]
+        except Exception:
+            efforts = []
+        label = str(row[1] or "").strip() or key
+        provider = str(row[2] or "").strip()
+        out[key] = {
+            "name": label,
+            "provider": provider,
+            "context_default": int(row[3] or 0),
+            "context_options": contexts,
+            "context_max": max(contexts or [0]),
+            "capability_options": efforts,
+            "capability_default": "",
+        }
+    return out
+
+
 def list_qoder_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Read Qoder model keys and their real context/effort preferences."""
+    """Read Qoder's real model keys with the labels its own UI renders."""
     db = qoder_db_path(config)
     if not db.exists():
         return []
@@ -271,6 +494,7 @@ def list_qoder_models(config: dict[str, Any] | None = None) -> list[dict[str, An
     except sqlite3.Error:
         return []
     prefs: dict[str, dict[str, Any]] = {}
+    byok: dict[str, dict[str, Any]] = {}
     try:
         for row in conn.execute(
                 "select model_key, context_window, reasoning_effort "
@@ -285,29 +509,43 @@ def list_qoder_models(config: dict[str, Any] | None = None) -> list[dict[str, An
             if row and row[0]:
                 prefs.setdefault(str(row[0]), {"context_window": 0,
                                                "reasoning_effort": ""})
+        byok = _qoder_byok_models(conn)
     except sqlite3.Error:
         pass
     finally:
         conn.close()
+    labels = qoder_model_labels(config)
+    catalog = qoder_catalog_keys(config)
+    cached = {str(item["key"]) for item in qoder_catalog_cache(config)}
+    keys = (set(cached) | set(byok)) if cached else (set(prefs) | set(byok) | set(catalog))
+    if not keys:
+        return []
     observed_max = max((int(item.get("context_window") or 0)
                         for item in prefs.values()), default=0)
     out = []
-    for key in sorted(prefs):
-        profile = prefs[key]
-        context = int(profile.get("context_window") or 0)
+    for key in sorted(keys):
+        profile = prefs.get(key) or {}
+        custom = byok.get(key) or {}
+        context = int(profile.get("context_window") or custom.get("context_default") or 0)
+        source = ("byok_model_profiles" if custom else
+                  "qoder_model_menu" if key in cached else
+                  "chat_model_preferences" if key in prefs else
+                  "local_storage_catalog")
         out.append({
-            "id": key, "name": QODER_MODEL_LABELS.get(key, key),
-            "source": "chat_model_preferences", "evidence": str(db),
+            "id": key, "name": labels.get(key) or custom.get("name") or key,
+            "source": source, "evidence": str(db),
             "context_default": context,
             # Qoder persists the selected value but does not publish a
             # supportedLengths list in its local store, so no hard upper
             # bound is invented here.  The largest value observed across the
             # installed model preferences is reported as evidence only.
-            "context_options": [],
-            "context_max": 0,
+            "context_options": list(custom.get("context_options") or []),
+            "context_max": int(custom.get("context_max") or 0),
             "context_observed_max": observed_max,
-            "capability_options": list(QODER_EFFORT_OPTIONS),
-            "capability_default": str(profile.get("reasoning_effort") or ""),
+            "capability_options": list(custom.get("capability_options")
+                                       or QODER_EFFORT_OPTIONS),
+            "capability_default": str(profile.get("reasoning_effort")
+                                      or custom.get("capability_default") or ""),
             "current_context_length": context,
             "current_capability_level": str(profile.get("reasoning_effort") or ""),
         })
@@ -929,6 +1167,224 @@ def sync_qoder_model_profile(*, model_key: str, context_length: int = 0,
     )
 
 
+def qoder_app_running(config: dict[str, Any] | None = None) -> bool:
+    return _process_running(qoder_process_image(config))
+
+
+def qoder_active_session(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The session the desktop would show (newest standard chat row)."""
+    db = qoder_db_path(config)
+    if not db.exists():
+        return {}
+    try:
+        return _qoder_current_session(db) or {}
+    except Exception:
+        return {}
+
+
+def _qoder_upsert_workspace(conn: sqlite3.Connection, workspace: str) -> str:
+    """Reuse or create the workspace row for ``workspace``."""
+    for row in conn.execute("select workspace_id, root_paths_json from workspaces"):
+        try:
+            roots = json.loads(row["root_paths_json"] or "[]")
+        except Exception:
+            continue
+        if any(_norm_path(item) == _norm_path(workspace) for item in roots):
+            workspace_id = str(row["workspace_id"])
+            conn.execute("update workspaces set updated_at=? where workspace_id=?",
+                         (int(time.time() * 1000), workspace_id))
+            return workspace_id
+    workspace_id = "ws_" + uuid.uuid4().hex
+    stamp = int(time.time() * 1000)
+    conn.execute(
+        "insert into workspaces (workspace_id, name, workspace_source, "
+        "root_paths_json, extra_json, created_at, updated_at, archived, product_mode) "
+        "values (?,?,?,?,?,?,?,?,?)",
+        (workspace_id, Path(workspace).name, "local",
+         json.dumps([workspace]), "{}", stamp, stamp, 0, "coding"),
+    )
+    return workspace_id
+
+
+def _qoder_reset_route_cache(db: Path) -> dict[str, Any]:
+    """Drop the renderer's cached route so the app re-reads main.sqlite."""
+    evidence: dict[str, Any] = {}
+    try:
+        local = db.parent / "Local Storage" / "leveldb"
+        if local.exists():
+            backup = db.parent / "Local Storage" / f"leveldb.agentmesh-{int(time.time())}"
+            if not backup.exists():
+                shutil.copytree(local, backup)
+            shutil.rmtree(local, ignore_errors=True)
+            evidence["local_storage_reset"] = str(backup)
+    except Exception as exc:
+        evidence["local_storage_reset_error"] = str(exc)
+    return evidence
+
+
+def _qoder_point_site_sessions(*, config: dict[str, Any], session_id: str,
+                               workspace: str, workspace_id: str) -> list[str]:
+    """Keep only ``session_id`` in the agent-panel route files."""
+    sites = qoder_sites_root(config)
+    ensure_dir(sites)
+    kept: list[str] = []
+    for path in sorted(sites.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        location = data.get("location") if isinstance(data, dict) else None
+        if not isinstance(location, dict):
+            continue
+        if str(location.get("sessionId") or "") != session_id:
+            backup = path.with_suffix(".json.agentmesh-old")
+            if not backup.exists():
+                shutil.copyfile(path, backup)
+            path.unlink()
+            continue
+        location["projectRoot"] = workspace
+        location["workspaceId"] = workspace_id
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        kept.append(str(path))
+    if not kept:
+        name = hashlib.sha256(session_id.encode()).hexdigest() + ".json"
+        path = sites / name
+        path.write_text(json.dumps({
+            "version": 2, "profile": "desktop", "productId": "qoder-cn",
+            "environment": "prod",
+            "location": {"sessionId": session_id,
+                         "workspaceId": workspace_id, "projectRoot": workspace},
+        }, ensure_ascii=False), encoding="utf-8")
+        kept.append(str(path))
+    return kept
+
+
+def _qoder_insert_session(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Insert a session row using only the columns this build really has."""
+    columns = {item[1] for item in conn.execute("pragma table_info(chat_sessions)")}
+    fields = [key for key in row if key in columns]
+    conn.execute(
+        f"insert into chat_sessions ({', '.join(fields)}) "
+        f"values ({', '.join('?' for _ in fields)})",
+        tuple(row[key] for key in fields),
+    )
+
+
+def create_qoder_session(*, workspace: str, model: str,
+                         config: dict[str, Any] | None = None,
+                         permission_mode: str = "",
+                         title: str = "",
+                         stop_process: Any = None,
+                         start_app: Any = None) -> InterfaceOutcome:
+    """Create a fresh Qoder session bound to ``workspace``.
+
+    The user's own chat rows and transcripts are never touched.  The desktop
+    restores the most recent route, so it is restarted with the new session
+    row, transcript and site route in place.
+    """
+    config = dict(config or {})
+    key = qoder_model_key(model)
+    if not key:
+        return InterfaceOutcome(False, "db_write", {"model": model}, {},
+                                reason="model is empty", error_code="MODEL_UNAVAILABLE")
+    db = qoder_db_path(config)
+    if not db.exists():
+        return InterfaceOutcome(False, "db_write", {"workspace": workspace, "model": key},
+                                {}, reason=f"Qoder 数据库不存在: {db}",
+                                error_code="WORKSPACE_SWITCH_FAILED")
+    projects = qoder_projects_root(config)
+    ensure_dir(Path(workspace))
+    session_id = str(uuid.uuid4())
+    stamp = int(time.time() * 1000)
+    evidence: dict[str, Any] = {"session_id": session_id, "db": str(db),
+                                "workspace": workspace, "new_session": True}
+    conn = _qoder_connect(db)
+    try:
+        workspace_id = _qoder_upsert_workspace(conn, workspace)
+        ws_hash = "ws_" + hashlib.sha256(
+            str(Path(workspace)).encode("utf-8")).hexdigest()
+        target_json = {
+            "mode": "local",
+            "host": {"id": "local", "kind": "local", "label": "Local"},
+            "workspace": {"id": ws_hash, "path": workspace},
+        }
+        _qoder_insert_session(conn, {
+            "session_id": session_id,
+            "session_kind": "standard",
+            "conversation_mode": "normal",
+            "product_mode": "coding",
+            "title": title or f"AgentMesh · {Path(workspace).name}",
+            "cwd": workspace,
+            "execution_kind": "local",
+            "workspace_id": workspace_id,
+            "model": key,
+            "permission_mode": permission_mode or None,
+            "additional_direcotries": "{}",
+            "extra_json": json.dumps({"source": "agentmesh"}),
+            "created_at": stamp,
+            "updated_at": stamp,
+            "execution_target_json": json.dumps(target_json, ensure_ascii=False),
+            "archived": 0,
+            "unread": 0,
+            "message_envelope_version": 1,
+        })
+        conn.commit()
+    except Exception as exc:
+        return InterfaceOutcome(False, "db_write", {"workspace": workspace, "model": key},
+                                {}, evidence=evidence,
+                                reason=f"创建 Qoder 独立会话失败: {exc}",
+                                error_code="WORKSPACE_SWITCH_FAILED")
+    finally:
+        conn.close()
+    evidence["workspace_id"] = workspace_id
+
+    transcript = _transcript_for(projects, workspace, session_id)
+    ensure_dir(transcript.parent)
+    events = [
+        {"type": "workspace-directories", "sessionId": session_id,
+         "directories": [workspace]},
+        {"type": "runtime-config", "sessionId": session_id, "model": key,
+         "reasoningEffort": None, "contextWindow": None, "generation": None,
+         "timestamp": stamp},
+    ]
+    transcript.write_text(
+        "\n\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+        encoding="utf-8")
+    evidence["transcript"] = str(transcript)
+
+    # Stop first: the running renderer flushes its route back into Local
+    # Storage, so resetting the cache before the process exits is lost.
+    image = qoder_process_image(config)
+    try:
+        (stop_process or _stop_process)(image)
+        time.sleep(1.0)
+    except Exception as exc:
+        return InterfaceOutcome(False, "db_write", {"workspace": workspace, "model": key},
+                                {}, evidence=evidence, reason=f"停止 Qoder 失败: {exc}",
+                                error_code="WORKSPACE_SWITCH_FAILED")
+    evidence.update(_qoder_reset_route_cache(db))
+    try:
+        evidence["site_sessions"] = _qoder_point_site_sessions(
+            config=config, session_id=session_id, workspace=workspace,
+            workspace_id=workspace_id)
+    except Exception as exc:
+        evidence["site_session_error"] = str(exc)
+
+    try:
+        exe = str(config.get("executable") or
+                  r"C:\Program Files\Qoder\Qoder CN\Qoder CN.exe")
+        (start_app or _start_app)(exe)
+    except Exception as exc:
+        return InterfaceOutcome(False, "db_write", {"workspace": workspace, "model": key},
+                                {}, evidence=evidence, reason=f"Qoder 启动失败: {exc}",
+                                error_code="WORKSPACE_SWITCH_FAILED")
+    return InterfaceOutcome(
+        True, "db_write", {"workspace": workspace, "model": key}, {},
+        evidence={**evidence,
+                  "source": "independent main.sqlite session + transcript"},
+    )
+
+
 def prepare_qoder_session(*, workspace: str, model: str,
                           config: dict[str, Any] | None = None,
                           permission_mode: str = "",
@@ -937,6 +1393,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
                           timeout_seconds: float = 30.0,
                           allow_restart: bool = False,
                           allow_history_migration: bool = False,
+                          allow_new_session: bool = False,
                           owned_session_id: str = "") -> InterfaceOutcome:
     """Move the current Qoder session onto ``workspace`` and set its model.
 
@@ -945,11 +1402,12 @@ def prepare_qoder_session(*, workspace: str, model: str,
     rewritten.  The app is restarted because it restores the last session at
     startup.
 
-    This operation stops every Qoder process and rewrites the user's current
-    transcript.  It is therefore only allowed when the caller explicitly
-    authorises a restart *and* history migration (the preflight/restart action
-    in the UI).  A normal task preparation gets a structured block instead of
-    silently touching the user's own session.
+    Migrating history stops every Qoder process and rewrites the user's
+    current transcript.  It is therefore only allowed when the caller
+    explicitly authorises a restart *and* history migration (the preflight
+    action in the UI).  Normal execution passes ``allow_new_session`` instead:
+    a fresh independent session is created and the user's own chat is left
+    untouched.
     """
     config = dict(config or {})
     key = qoder_model_key(model)
@@ -957,6 +1415,13 @@ def prepare_qoder_session(*, workspace: str, model: str,
         return InterfaceOutcome(False, "db_write", {"model": model}, {},
                                 reason="model is empty", error_code="MODEL_UNAVAILABLE")
     if not (allow_restart and allow_history_migration):
+        if allow_new_session:
+            return create_qoder_session(
+                workspace=workspace, model=key, config=config,
+                permission_mode=permission_mode, stop_process=stop_process,
+                start_app=start_app,
+                title=f"AgentMesh · {Path(workspace).name}",
+            )
         return InterfaceOutcome(
             False, "blocked", {"workspace": workspace, "model": key}, {},
             evidence={"owned_session_id": owned_session_id},
@@ -1019,32 +1484,9 @@ def prepare_qoder_session(*, workspace: str, model: str,
                                         model_key=key)
     evidence["rewritten_events"] = changed
 
-    workspace_id = ""
     conn = _qoder_connect(db)
     try:
-        existing = None
-        for row in conn.execute("select workspace_id, root_paths_json from workspaces"):
-            try:
-                roots = json.loads(row["root_paths_json"] or "[]")
-            except Exception:
-                continue
-            if any(_norm_path(item) == _norm_path(workspace) for item in roots):
-                existing = row
-                break
-        if existing:
-            workspace_id = str(existing["workspace_id"])
-            conn.execute("update workspaces set updated_at=? where workspace_id=?",
-                         (int(time.time() * 1000), workspace_id))
-        else:
-            workspace_id = "ws_" + uuid.uuid4().hex
-            stamp = int(time.time() * 1000)
-            conn.execute(
-                "insert into workspaces (workspace_id, name, workspace_source, "
-                "root_paths_json, extra_json, created_at, updated_at, archived, product_mode) "
-                "values (?,?,?,?,?,?,?,?,?)",
-                (workspace_id, Path(workspace).name, "local",
-                 json.dumps([workspace]), "{}", stamp, stamp, 0, "coding"),
-            )
+        workspace_id = _qoder_upsert_workspace(conn, workspace)
         target_row = conn.execute(
             "select execution_target_json from chat_sessions where session_id=?",
             (current["session_id"],),
@@ -1087,16 +1529,7 @@ def prepare_qoder_session(*, workspace: str, model: str,
     # The app restores its last route from Local Storage.  Drop that cache
     # (after a backup) so the next launch reads the new cwd/workspace from
     # main.sqlite instead of the old in-memory route.
-    try:
-        local = db.parent / "Local Storage" / "leveldb"
-        if local.exists():
-            backup = db.parent / "Local Storage" / f"leveldb.agentmesh-{int(time.time())}"
-            if not backup.exists():
-                shutil.copytree(local, backup)
-            shutil.rmtree(local, ignore_errors=True)
-            evidence["local_storage_reset"] = str(backup)
-    except Exception as exc:
-        evidence["local_storage_reset_error"] = str(exc)
+    evidence.update(_qoder_reset_route_cache(db))
 
     # Remove every stale copy of this session transcript so neither the
     # reader nor the runtime can resume an older workspace.
@@ -1140,38 +1573,9 @@ def prepare_qoder_session(*, workspace: str, model: str,
     # restore its agent panel.  Point it at the new workspace and keep only
     # this session so a stale route cannot win.
     try:
-        sites = qoder_sites_root(config)
-        ensure_dir(sites)
-        kept = []
-        for path in sorted(sites.glob("*.json")):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            location = data.get("location") if isinstance(data, dict) else None
-            if not isinstance(location, dict):
-                continue
-            if str(location.get("sessionId") or "") != current["session_id"]:
-                backup = path.with_suffix(".json.agentmesh-old")
-                if not backup.exists():
-                    shutil.copyfile(path, backup)
-                path.unlink()
-                continue
-            location["projectRoot"] = workspace
-            location["workspaceId"] = workspace_id
-            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            kept.append(str(path))
-        if not kept:
-            name = hashlib.sha256(current["session_id"].encode()).hexdigest() + ".json"
-            path = sites / name
-            path.write_text(json.dumps({
-                "version": 2, "profile": "desktop", "productId": "qoder-cn",
-                "environment": "prod",
-                "location": {"sessionId": current["session_id"],
-                             "workspaceId": workspace_id, "projectRoot": workspace},
-            }, ensure_ascii=False), encoding="utf-8")
-            kept.append(str(path))
-        evidence["site_sessions"] = kept
+        evidence["site_sessions"] = _qoder_point_site_sessions(
+            config=config, session_id=str(current["session_id"]),
+            workspace=workspace, workspace_id=workspace_id)
     except Exception as exc:
         evidence["site_session_error"] = str(exc)
 
@@ -1384,8 +1788,11 @@ __all__ = [
     "InterfaceOutcome", "WORKBUDDY_MODEL_LABELS", "QODER_MODEL_LABELS",
     "WORKBUDDY_MODE_TO_SOURCE", "build_workbuddy_deeplink",
     "prepare_workbuddy_task", "verify_workbuddy_task",
-    "prepare_qoder_session", "verify_qoder_session",
+    "prepare_qoder_session", "create_qoder_session", "verify_qoder_session",
+    "qoder_app_running", "qoder_active_session",
     "list_workbuddy_models", "list_qoder_models",
+    "qoder_model_labels", "qoder_catalog_keys", "qoder_dynamic_text_paths",
+    "qoder_catalog_cache", "qoder_catalog_cache_path",
     "workbuddy_model_key", "qoder_model_key", "set_model_programmatically",
     "qoder_project_slug", "qoder_db_path", "workbuddy_db_path",
     "qoder_projects_root", "qoder_process_image", "qoder_sites_root",

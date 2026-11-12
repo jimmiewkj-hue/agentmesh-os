@@ -18,8 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from ..control.interfaces import (
+    InterfaceOutcome,
     ensure_workbuddy_cdp, open_workbuddy_chat, prepare_qoder_session,
-    prepare_workbuddy_task, qoder_model_key, set_model_programmatically,
+    prepare_workbuddy_task, qoder_active_session, qoder_app_running,
+    qoder_model_key, set_model_programmatically,
     sync_qoder_model_profile, sync_workbuddy_session_profile,
     verify_qoder_session, verify_workbuddy_task, workbuddy_model_key,
     workbuddy_user_id,
@@ -183,8 +185,42 @@ class GuiAutomationAdapter(BaseAdapter):
             interface_info["process"] = identity
             _log(log_path, "attached", window=window, process=identity,
                  method=interface_info.get("method"))
+            if interface_info.get("method") == "qoder_db_transcript":
+                expected = str(((interface_info.get("prepare") or {}).get(
+                    "evidence") or {}).get("session_id") or "")
+                if expected:
+                    current = str(qoder_active_session(self.config).get(
+                        "session_id") or "")
+                    if current and current != expected:
+                        # Never type a run prompt into the user's own chat.
+                        raise GuiAutomationError(
+                            "WORKSPACE_MISMATCH",
+                            f"Qoder 没有打开本次独立会话（当前 {current}，期望 {expected}）",
+                            details={"expected": expected, "current": current},
+                        )
             model_key = interface_info.get("model_key") or \
                 resolve_model_key(request.model, profile.model_aliases)
+
+            if interface_info.get("method") == "qoder_db_transcript" and model_key:
+                # Qoder ignores the session row's model when it opens a fresh
+                # chat; pick the model in its own menu before typing.
+                from ..gui.cdp import select_qoder_model_via_cdp
+                try:
+                    picked = select_qoder_model_via_cdp(
+                        model_key, port=self.qoder_cdp_port,
+                        page_id=str(interface_info.get("cdp_target") or ""),
+                    )
+                except Exception as exc:
+                    picked = {"ok": False, "reason": str(exc)[:300]}
+                interface_info["model_cdp"] = picked
+                _log(log_path, "model_cdp_select", model=model_key, **picked)
+                if not picked.get("ok"):
+                    raise GuiAutomationError(
+                        "GUI_MODEL_SWITCH_FAILED",
+                        f"Qoder 未能切换到模型 {model_key}: "
+                        f"{picked.get('reason') or picked}",
+                        details=picked,
+                    )
 
             if interface_info.get("method") == "qoder_db_transcript":
                 # prepare_qoder_session already wrote the model into main.sqlite
@@ -425,6 +461,7 @@ class GuiAutomationAdapter(BaseAdapter):
             blocking_codes = {
                 "APP_RESTART_REQUIRED", "GUI_SEND_FAILED", "GUI_DRIVER_ERROR",
                 "WORKSPACE_SWITCH_FAILED", "WORKSPACE_MISMATCH",
+                "WORKSPACE_TRUST_REQUIRED",
                 "INTERFACE_WRITE_FAILED", "MODEL_UNAVAILABLE", "MODEL_MISMATCH",
                 "GUI_MODEL_SWITCH_FAILED", "GUI_MODE_MISMATCH",
                 "MODEL_GUI_FORBIDDEN", "GUI_INPUT_FORBIDDEN", "APP_BUSY",
@@ -460,6 +497,13 @@ class GuiAutomationAdapter(BaseAdapter):
                     instructions = (
                         f"{app} 当前未登录，AI 模型不可用。请切换到 {app} 完成登录，"
                         "确认输入框可正常使用后，点击“重试该节点”。"
+                    )
+                elif exc.code == "WORKSPACE_TRUST_REQUIRED":
+                    kind = "workspace_trust"
+                    instructions = (
+                        f"{app} 弹出工作区信任对话框且无法自动确认。请在应用内点击"
+                        "“是，我信任此作者”，然后点击“重试该节点”；"
+                        "控制平面在下次派发前也会再次尝试自动确认。"
                     )
                 else:
                     kind = "agent_not_running"
@@ -842,6 +886,11 @@ class GuiAutomationAdapter(BaseAdapter):
         if not callable(checker):
             return {"status": "acceptance_unknown", "reason": "NO_TRANSCRIPT_RECEIPT",
                     "marker": marker, "reconciled_at": now_iso()}
+        result_path = str(attempt.get("result_path") or "")
+        if hasattr(reader, "completion_path") and result_path:
+            # The attempt-specific result path is disclosed only in the
+            # delivered prompt; readers may use it as delivery evidence.
+            reader.completion_path = result_path
         try:
             found = checker(marker, started_at=0)
         except Exception as exc:
@@ -853,7 +902,6 @@ class GuiAutomationAdapter(BaseAdapter):
         if not found.get("ok"):
             receipt["reason"] = str(found.get("reason") or "MARKER_NOT_FOUND")
         package = None
-        result_path = str(attempt.get("result_path") or "")
         if result_path:
             loaded = read_json(result_path)
             if isinstance(loaded, dict) and loaded:
@@ -1172,10 +1220,37 @@ class GuiAutomationAdapter(BaseAdapter):
                 f"{plan_hint}\n"
                 f"<!-- {MARKER_PREFIX}: {marker} -->\n"
             )
-            outcome = prepare_qoder_session(
-                workspace=workspace, model=model_key, config=self.config,
-                permission_mode=("bypassPermissions" if self.full_control else ""),
-            )
+            try:
+                reuse = verify_qoder_session(
+                    workspace=workspace, model=request.model, started_at=0,
+                    config=self.config, strict_daemon=False)
+                active = qoder_active_session(self.config)
+                running = qoder_app_running(self.config)
+            except Exception as exc:
+                # A missing/locked Qoder store must fall through to the
+                # structured prepare error instead of crashing the turn.
+                _log(log_path, "interface_probe_failed", app=app, error=str(exc)[:300])
+                reuse, active, running = None, {}, False
+            if reuse is not None and reuse.ok and running and \
+                    str(active.get("session_id") or "") == str(
+                        reuse.actual.get("session_id") or ""):
+                # Qoder is already showing this exact run workspace/model (a
+                # retry of the same attempt).  Reuse it without a restart.
+                outcome = InterfaceOutcome(
+                    True, "qoder_db_transcript",
+                    {"workspace": workspace, "model": model_key},
+                    {"session_id": reuse.actual.get("session_id", "")},
+                    evidence={**reuse.evidence,
+                              "reused_session_id": reuse.actual.get(
+                                  "session_id", "")})
+                _log(log_path, "interface_reuse", app=app,
+                     session_id=reuse.actual.get("session_id", ""))
+            else:
+                outcome = prepare_qoder_session(
+                    workspace=workspace, model=model_key, config=self.config,
+                    permission_mode=("bypassPermissions" if self.full_control else ""),
+                    allow_new_session=True,
+                )
             _log(log_path, "interface_prepare", app=app, **outcome.to_dict())
             if outcome.ok:
                 profile_sync = sync_qoder_model_profile(
@@ -1272,12 +1347,17 @@ class GuiAutomationAdapter(BaseAdapter):
             # Pin one renderer for model selection, prompt submission and
             # reply polling.  Trae can have several windows (folder CLI), and
             # a freshly launched window needs time to mount the workbench.
+            # Prefer the page the workspace-open step proved belongs to this
+            # folder; several plan worktrees are all named "workspace".
+            trae_page_hint = str((cdp.evidence or {}).get("trae_page_id") or "")
             trae_page = trae_interface.wait_for_trae_chat(
                 self.trae_cdp_port,
                 timeout_seconds=float(
                     self.config.get("trae_chat_ready_timeout_seconds") or 30
                 ),
-            ) or trae_interface.pick_trae_page(self.trae_cdp_port)
+                page_id=trae_page_hint,
+            ) or trae_interface.pick_trae_page(self.trae_cdp_port,
+                                               page_id=trae_page_hint)
             trae_page_id = str((trae_page or {}).get("id") or "")
             _log(log_path, "trae_page_pinned", page_id=trae_page_id,
                  title=str((trae_page or {}).get("title") or ""))
@@ -1383,7 +1463,8 @@ class GuiAutomationAdapter(BaseAdapter):
                         "Qoder 程序化模型切换需要 workspace（用于迁移会话）",
                     )
                 outcome = prepare_qoder_session(workspace=target, model=key,
-                                                config=self.config)
+                                                config=self.config,
+                                                allow_new_session=True)
                 evidence.update({"path": "db+transcript", "actual": key,
                                  "session_id": outcome.evidence.get("session_id", ""),
                                  "evidence": outcome.evidence})

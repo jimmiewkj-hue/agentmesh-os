@@ -618,6 +618,13 @@ def select_trae_model_via_cdp(model: str, *, port: int = CDP_DEFAULT_PORT,
     opened: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
     for attempt in range(12):
+        trust = dismiss_trae_trust_dialog(port, page_id=page_id, timeout_seconds=0)
+        if not trust.get("ok") and trust.get("reason") in (
+                "TRUST_DIALOG_NO_CONFIRM", "TRUST_CLICK_INEFFECTIVE"):
+            return InterfaceOutcome(
+                False, "cdp-input", {"model": display}, trust,
+                reason="Trae 工作区信任对话框无法自动确认，请在应用内点击信任后重试",
+                error_code="WORKSPACE_TRUST_REQUIRED")
         opened = open_trae_model_menu(port, page_id=page_id)
         if opened.get("ok") and opened.get("menu_visible", True):
             # The menu can render before its model rows arrive; poll instead
@@ -838,9 +845,138 @@ def current_trae_workspace(app: str = "trae_cn",
     return ""
 
 
+TRAE_TRUST_PROBE_JS = r"""(() => {
+  const boxes = Array.from(document.querySelectorAll(
+    '.monaco-dialog-box, [role="dialog"], .dialog-box'));
+  for (const box of boxes) {
+    const rect = box.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const text = (box.innerText || box.textContent || '');
+    if (!/信任|trust/i.test(text)) continue;
+    const parsed = [];
+    for (const el of box.querySelectorAll(
+        '.monaco-button, a, button, [role="button"]')) {
+      const label = String(el.innerText || el.textContent || '')
+        .replace(/\s+/g, ' ').trim();
+      const r = el.getBoundingClientRect();
+      if (!label || r.width <= 0 || r.height <= 0) continue;
+      parsed.push({label, x: r.x + r.width / 2, y: r.y + r.height / 2});
+    }
+    const target = parsed.find(b =>
+      /我信任|信任此文件夹|信任此作者|trust the authors|trust this folder|^trust$|^信任$/i
+        .test(b.label));
+    return {found: true, text: text.slice(0, 400), buttons: parsed,
+            target: target || null};
+  }
+  return {found: false};
+})()"""
+
+TRAE_TRUST_CLICK_JS = r"""((label) => {
+  const boxes = Array.from(document.querySelectorAll(
+    '.monaco-dialog-box, [role="dialog"], .dialog-box'));
+  for (const box of boxes) {
+    const text = (box.innerText || box.textContent || '');
+    if (!/信任|trust/i.test(text)) continue;
+    const btn = Array.from(box.querySelectorAll(
+        '.monaco-button, a, button, [role="button"]')).find(el =>
+      String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() === label);
+    if (!btn) continue;
+    const o = {bubbles: true, cancelable: true};
+    btn.dispatchEvent(new PointerEvent('pointerdown', o));
+    btn.dispatchEvent(new MouseEvent('mousedown', o));
+    btn.dispatchEvent(new PointerEvent('pointerup', o));
+    btn.dispatchEvent(new MouseEvent('mouseup', o));
+    btn.dispatchEvent(new MouseEvent('click', o));
+    return {ok: true, label};
+  }
+  return {ok: false, reason: 'NO_TRUST_BUTTON'};
+})(%s)"""
+
+
+def dismiss_trae_trust_dialog(port: int = CDP_DEFAULT_PORT, *,
+                              page_id: str = "",
+                              timeout_seconds: float = 0.0) -> dict[str, Any]:
+    """Click Trae's own workspace-trust confirmation through CDP DOM.
+
+    Every freshly opened folder raises "是否信任此文件夹"; its modal mask
+    blocks the model menu and workspace registration (2026-11-07 real-chain
+    test: five manual clicks were needed).  The probe/click sequence mirrors
+    the operator action verified in that test (.monaco-dialog-box ->
+    .monaco-button "是，我信任此作者" -> DOM event dispatch).  Only the
+    affirmative trust control is ever clicked; a dialog without one is
+    reported for human action instead of clicking "不信任".
+    """
+    from ..gui.cdp import WebSocketTransport, _evaluate, _targets
+    deadline = time.time() + max(0.0, float(timeout_seconds))
+    last: dict[str, Any] = {"ok": True, "dismissed": False,
+                            "reason": "NO_TRUST_DIALOG"}
+    while True:
+        try:
+            targets = _targets(port)
+        except Exception as exc:
+            return {"ok": False, "dismissed": False,
+                    "reason": f"CDP_UNAVAILABLE: {exc}"}
+        pages = [t for t in targets if t.get("type") == "page"]
+        if page_id:
+            pages.sort(key=lambda t: 0 if t.get("id") == page_id else 1)
+        pending: dict[str, Any] | None = None
+        for page in pages:
+            try:
+                transport = WebSocketTransport(
+                    page["webSocketDebuggerUrl"],
+                    origin=f"http://127.0.0.1:{int(port)}", timeout=6)
+            except Exception:
+                continue
+            try:
+                probe = _evaluate(transport, TRAE_TRUST_PROBE_JS, 6) or {}
+                if not probe.get("found"):
+                    continue
+                target = probe.get("target")
+                if not target:
+                    pending = {"ok": False, "dismissed": False,
+                               "reason": "TRUST_DIALOG_NO_CONFIRM",
+                               "page_id": str(page.get("id", "")),
+                               "buttons": probe.get("buttons", [])}
+                    continue
+                clicked = _evaluate(
+                    transport,
+                    TRAE_TRUST_CLICK_JS % json.dumps(
+                        str(target.get("label", "")), ensure_ascii=False),
+                    6) or {}
+                if not clicked.get("ok"):
+                    pending = {"ok": False, "dismissed": False,
+                               "reason": "TRUST_DIALOG_NO_CONFIRM",
+                               "page_id": str(page.get("id", "")),
+                               "click": clicked}
+                    continue
+                time.sleep(0.8)
+                after = _evaluate(transport, TRAE_TRUST_PROBE_JS, 6) or {}
+                if after.get("found"):
+                    pending = {"ok": False, "dismissed": False,
+                               "reason": "TRUST_CLICK_INEFFECTIVE",
+                               "page_id": str(page.get("id", "")),
+                               "label": target.get("label", "")}
+                    continue
+                return {"ok": True, "dismissed": True,
+                        "page_id": str(page.get("id", "")),
+                        "label": target.get("label", ""),
+                        "dialog_text": str(probe.get("text", ""))[:200],
+                        "source": "CDP DOM event dispatch (no OS input)"}
+            except Exception:
+                continue
+            finally:
+                transport.close()
+        if pending is not None:
+            last = pending
+        if time.time() >= deadline:
+            return last
+        time.sleep(1.0)
+
+
 def open_trae_workspace(*, app: str = "trae_cn", workspace: str,
                         executable: str = "", config: dict[str, Any] | None = None,
-                        timeout_seconds: float = 20.0) -> InterfaceOutcome:
+                        timeout_seconds: float = 20.0,
+                        cdp_port: int = CDP_DEFAULT_PORT) -> InterfaceOutcome:
     """Ask an already-running Trae to open a folder through its CLI protocol.
 
     This is the reuse path: no process is killed and the user's other windows
@@ -865,13 +1001,28 @@ def open_trae_workspace(*, app: str = "trae_cn", workspace: str,
                                 error_code="GUI_DRIVER_ERROR")
     uri = root.as_uri()
     from .apps import launch_detached
+    known_pages: set[str] = set()
+    try:
+        from ..gui.cdp import _targets
+        known_pages = {str(item.get("id") or "") for item in _targets(cdp_port)
+                       if item.get("type") == "page"}
+    except Exception:
+        known_pages = set()
     pid = launch_detached(
         [str(exe), "--new-window", f"--folder-uri={uri}"],
         env=clean_launch_env(),
     )
     deadline = time.time() + float(timeout_seconds)
     folder_id = hashlib.sha256(str(root).lower().encode("utf-8")).hexdigest()[:24]
+    trust_info: dict[str, Any] = {}
+    title_prefix = f"{root.name.lower()} - trae"
     while time.time() < deadline:
+        # The trust dialog's mask blocks folder registration; clear it through
+        # the app's own dialog while polling (best effort, zero OS input).
+        if _cdp_alive(cdp_port):
+            cleared = dismiss_trae_trust_dialog(cdp_port, timeout_seconds=0)
+            if cleared.get("dismissed") or not cleared.get("ok"):
+                trust_info = cleared
         try:
             state = read_state(app, config)
             folders = state.get("solo-lite.project-workspace-cache", {})
@@ -881,17 +1032,51 @@ def open_trae_workspace(*, app: str = "trae_cn", workspace: str,
                     True, "cli_folder", {"workspace": str(root)},
                     {"workspace": str(root), "folder_registered": True},
                     evidence={"source": "state.vscdb", "pid": pid,
-                              "folder_uri": uri, "reused": True},
+                              "folder_uri": uri, "reused": True,
+                              "trust_dialog": trust_info},
                 )
         except Exception:
             pass
+        # A plain folder window never writes the solo-lite project cache on
+        # its own (observed 2026-11-11: the window was open and its composer
+        # mounted, yet the global cache stayed on the previous workspace).
+        # A newly appeared renderer whose title matches the folder is proof
+        # the window opened; bind the state keys the verifier reads and pin
+        # that page for the caller.
+        if _cdp_alive(cdp_port):
+            try:
+                from ..gui.cdp import _targets
+                for page in _targets(cdp_port):
+                    if page.get("type") != "page":
+                        continue
+                    page_id = str(page.get("id") or "")
+                    title = str(page.get("title") or "").lower()
+                    if page_id in known_pages or not title.startswith(title_prefix):
+                        continue
+                    binding = set_trae_workspace(
+                        workspace=str(root), app=app,
+                        dev_mode=str((config or {}).get("trae_dev_mode") or "code"),
+                        config=config)
+                    return InterfaceOutcome(
+                        True, "cli_folder+cdp_page", {"workspace": str(root)},
+                        {"workspace": str(root), "folder_registered": False,
+                         "cdp_page": True, "page_id": page_id,
+                         "page_title": str(page.get("title") or "")},
+                        evidence={"source": "cdp/json/list + state_write",
+                                  "pid": pid, "folder_uri": uri, "reused": True,
+                                  "trust_dialog": trust_info,
+                                  "workspace_binding": binding.to_dict()},
+                    )
+            except Exception:
+                pass
         time.sleep(0.8)
     return InterfaceOutcome(
         False, "cli_folder", {"workspace": str(root)},
         {"workspace": current, "folder_registered": False},
         reason=f"Trae 未在 {timeout_seconds:.0f}s 内登记工作区 {root}",
         error_code="WORKSPACE_MISMATCH",
-        evidence={"source": "state.vscdb", "pid": pid, "folder_uri": uri},
+        evidence={"source": "state.vscdb", "pid": pid, "folder_uri": uri,
+                  "trust_dialog": trust_info},
     )
 
 
@@ -975,7 +1160,8 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
         opened: dict[str, Any] = {}
         if workspace:
             outcome = open_trae_workspace(app=app, workspace=workspace,
-                                          executable=executable, config=config)
+                                          executable=executable, config=config,
+                                          cdp_port=port)
             opened = outcome.to_dict()
             if not outcome.ok:
                 # A live DevTools endpoint does not prove the requested
@@ -990,12 +1176,16 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
                     evidence={"port": port, "reused": True,
                               "workspace_open": opened},
                 )
+        trust = dismiss_trae_trust_dialog(port, timeout_seconds=0)
+        page_hint = str((opened.get("actual") or {}).get("page_id") or "")
         return InterfaceOutcome(True, "cdp", {"port": port, "reused": True,
                                               "workspace": workspace},
                                 {"source": f"http://127.0.0.1:{port}/json/version",
                                  "workspace_open": opened},
                                 evidence={"port": port, "reused": True,
-                                          "workspace_open": opened})
+                                          "workspace_open": opened,
+                                          "trae_page_id": page_hint,
+                                          "trust_dialog": trust})
     if allow_restart is None:
         allow_restart = str(os.environ.get("AGENTMESH_ALLOW_APP_RESTART") or "").strip().lower() \
             in ("1", "true", "yes", "on")
@@ -1054,12 +1244,13 @@ def ensure_trae_cdp(*, app: str = "trae_cn", port: int = CDP_DEFAULT_PORT,
             except Exception:
                 time.sleep(1.0)
                 continue
+            trust = dismiss_trae_trust_dialog(port, timeout_seconds=6.0)
             return InterfaceOutcome(
                 True, "cdp", {"port": port, "reused": False, "workspace": workspace},
                 {"source": f"http://127.0.0.1:{port}/json/version"},
                 evidence={"port": port, "reused": False, "executable": str(exe),
                           "backup": backup, "pid": pid,
-                          "close": close_info,
+                          "close": close_info, "trust_dialog": trust,
                           "folder_uri": args[-1] if workspace else ""},
             )
         time.sleep(1.0)
@@ -1198,6 +1389,77 @@ def wait_for_trae_chat(port: int = CDP_DEFAULT_PORT, *,
     return last
 
 
+TRAE_MARKER_PROBE_JS = r"""((marker) => {
+  const editable = Array.from(document.querySelectorAll(
+    '[contenteditable="true"], textarea, [role="textbox"]'));
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node; let outside = 0; let inside = 0;
+  while ((node = walker.nextNode())) {
+    if (!(node.nodeValue || '').includes(marker)) continue;
+    let el = node.parentElement; let inComposer = false;
+    while (el) {
+      if (editable.indexOf(el) >= 0) { inComposer = true; break; }
+      el = el.parentElement;
+    }
+    if (inComposer) inside += 1; else outside += 1;
+  }
+  return {found: outside > 0, in_composer_only: inside > 0 && outside === 0,
+          outside, inside};
+})(%s)"""
+
+
+def trae_marker_in_transcript(port: int = CDP_DEFAULT_PORT, marker: str = "", *,
+                              page_id: str = "") -> dict[str, Any]:
+    """Prove a request marker reached the rendered conversation, not composer.
+
+    Trae's transcript database is encrypted and is never read.  The visible
+    DOM is sufficient: a marker text node outside every composer control can
+    only exist after the application rendered the sent user message.  A
+    marker found only inside the composer proves nothing (it was inserted
+    there before sending).
+    """
+    from ..gui.cdp import WebSocketTransport, _evaluate, _pick_page, _targets
+    marker = str(marker or "").strip()
+    if not marker:
+        return {"found": False, "reason": "EMPTY_MARKER"}
+    try:
+        targets = _targets(port)
+    except Exception as exc:
+        return {"found": False, "reason": f"CDP_UNAVAILABLE: {exc}"}
+    pages = [item for item in targets if item.get("type") == "page"]
+    if page_id:
+        pinned = next((item for item in pages if item.get("id") == page_id), None)
+        if pinned:
+            pages = [pinned] + [item for item in pages
+                                if item.get("id") != page_id]
+    elif pages:
+        preferred = _pick_page(targets)
+        if preferred:
+            pages = [preferred] + [item for item in pages
+                                   if item.get("id") != preferred.get("id")]
+    last: dict[str, Any] = {"found": False, "reason": "NO_PAGE"}
+    expression = TRAE_MARKER_PROBE_JS % json.dumps(marker, ensure_ascii=False)
+    for page in pages:
+        try:
+            transport = WebSocketTransport(
+                page["webSocketDebuggerUrl"],
+                origin=f"http://127.0.0.1:{int(port)}", timeout=8)
+        except Exception as exc:
+            last = {"found": False, "reason": str(exc)[:200]}
+            continue
+        try:
+            value = _evaluate(transport, expression, 8) or {}
+            value["page_id"] = str(page.get("id", ""))
+            if value.get("found"):
+                return value
+            last = value
+        except Exception as exc:
+            last = {"found": False, "reason": str(exc)[:200]}
+        finally:
+            transport.close()
+    return last
+
+
 def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
                      timeout: float = 15.0,
                      submit_retries: int = 20,
@@ -1210,6 +1472,14 @@ def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
     import time as _time
 
     from ..gui.cdp import WebSocketTransport, _evaluate, send_prompt_via_cdp
+    trust = dismiss_trae_trust_dialog(port, page_id=page_id, timeout_seconds=0)
+    if not trust.get("ok") and trust.get("reason") in (
+            "TRUST_DIALOG_NO_CONFIRM", "TRUST_CLICK_INEFFECTIVE"):
+        from ..gui.base import GuiAutomationError
+        raise GuiAutomationError(
+            "WORKSPACE_TRUST_REQUIRED",
+            "Trae 工作区信任对话框无法自动确认，请在应用内点击信任后重试",
+            details=trust)
     page = pick_trae_page(port, page_id=page_id)
     if not page:
         from ..gui.base import GuiAutomationError
@@ -1224,7 +1494,7 @@ def send_trae_prompt(text: str, *, port: int = CDP_DEFAULT_PORT,
             _time.sleep(0.4 if attempt == 0 else 0.6)
             last = _evaluate(transport, TRAE_SUBMIT_JS, timeout) or {}
             if last.get("ok"):
-                return {"insert": inserted, "page_id": str(page["id"]),
+                return {"ok": True, "insert": inserted, "page_id": str(page["id"]),
                         "submit": {**last, "attempts": attempt + 1}}
             if last.get("reason") not in ("SEND_DISABLED", "NO_SEND_BUTTON"):
                 break
@@ -1333,9 +1603,10 @@ __all__ = [
     "resolve_trae_model", "model_key", "set_trae_model", "set_trae_workspace",
     "verify_trae_session", "build_trae_chat_uri", "clean_launch_env",
     "ensure_trae_cdp", "open_trae_workspace", "current_trae_workspace",
+    "dismiss_trae_trust_dialog",
     "pick_trae_page", "wait_for_trae_chat", "trae_login_required",
     "set_trae_reasoning_effort",
-    "send_trae_prompt", "trae_conversation_text",
+    "send_trae_prompt", "trae_conversation_text", "trae_marker_in_transcript",
     "trae_visible_model", "open_trae_model_menu", "list_trae_model_items",
     "select_trae_model_via_cdp", "trae_executable", "trae_state_db", "trae_home",
     "variant", "probe",

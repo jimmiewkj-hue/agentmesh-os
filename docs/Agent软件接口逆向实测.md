@@ -22,7 +22,7 @@
 | 4 | Qoder（国际版） | ✅ | 进程启动 | `com.qoder.app.stable/main.sqlite`（明文，同构） | `chat_model_preferences`（含 `gfmodel`） | 未验证 | 未验证 | transcript | **partial** |
 | 5 | WorkBuddy | ✅ | deeplink + 进程 | `workbuddy://task?...&cwd=`（verified） | `...&model=`（verified） | `welcomeMode` → `source_mode=craft` | deeplink 预填 + CDP 点击发送 | `workbuddy.db sessions` | **verified** |
 | 6 | OpenCode | ✅ | CLI | 进程 cwd / `--dir` | `-m opencode/glm-5.3-flash-free`（verified） | 非交互无模式 | `opencode run` stdio | stdout JSON 事件 | **verified** |
-| 7 | ZCode | ✅ | 进程启动 | `~/.zcode/cli/db/db.sqlite` `session.directory`（明文） | `local_setting` + `model_usage.model_id`（仅读） | `local_setting permission.mode`（仅读） | 未找到零输入发送通道 | sqlite | **partial** |
+| 7 | ZCode | ✅ | 进程启动 | `--cwd <dir>`（headless CLI，verified） | 临时 provider config 重排 `providerOrder`/`modelOrder`（verified，精确路由到指定 provider/model） | `-p` 默认 `yolo`（verified），`--mode` 可指定 | **headless CLI**：`ELECTRON_RUN_AS_NODE=1 ZCode.exe resources\glm\zcode.cjs -p "<task>" --cwd <dir> --json`（verified，真实修复任务 42s 完成） | `db.sqlite` session/model_usage（verified）+ rollout JSONL | **verified**（2026-11-07） |
 | 8 | DeepSeek Harness | ✅ | 进程启动 | `~/.dsh/sessions/--<path>--/`（目录名编码） | `settings.yaml.imported` + `.workbuddy-catalog.json`（仅读） | 未找到 | 未找到 | `.jsonl.zstd` | **partial** |
 | 9 | Cursor | ✅ | 进程启动 | `--folder-uri` + `workspaceStorage` | `cursor/initialModelState`（仅读） | 未找到 | 未找到 | `conversation-search.db` | **partial** |
 | 10 | REA Studio | ✅ | MCP stdio | 不持有工作区 | 无 LLM 模型 | 不适用 | `tools/call` | JSON-RPC | **verified（工具服务）** |
@@ -186,7 +186,7 @@ opencode run -m opencode/glm-5.3-flash-free "只回复一行..."
 | Qoder 国际版 | 同上（`%APPDATA%\com.qoder.app.stable\main.sqlite`） | 同上（`chat_model_preferences` 含 `gfmodel`） |
 | WorkBuddy | `workbuddy://task?action=start&cwd=<path>` | `...&model=glm-5.3-flash` |
 | OpenCode | 进程 cwd / `--dir` | `-m opencode/glm-5.3-flash-free` |
-| ZCode | `cli/db/db.sqlite` `session.directory/path`（仅读） | `local_setting(namespace=model)`（仅读） |
+| ZCode | `--cwd <path>`（headless CLI）；`session.directory`（回读） | 临时 provider config：`providerOrder` 置顶目标 provider、`personalModelIds`/`modelOrder` 置顶目标模型（详见 [ZCode 自动化触发](ZCode自动化触发.md)） |
 | DSH | `~/.dsh/sessions/--<path>--/`（仅读） | `settings.yaml`（仅读） |
 | Cursor | `--folder-uri` | `cursor/initialModelState`（仅读） |
 
@@ -199,7 +199,7 @@ opencode run -m opencode/glm-5.3-flash-free "只回复一行..."
    消失，会返回 `NO_MODEL_SELECTOR` 并中止。
 2. **CDP 需要重启应用**：Trae/Qoder 只有在带 `--remote-debugging-port` 启动时才可编程；系统会在 `AGENTMESH_ALLOW_APP_RESTART=1` 且先备份状态库后才重启。
 3. **GUI 子进程生命周期**：从工具会话直接启动的 GUI 进程会随父进程结束；生产使用应由常驻的 `agentmesh serve` 进程拉起。
-4. **ZCode / DSH / Cursor**：只做到状态库读取与工作区事实确认，未找到零输入发送通道，未做任何输入合成。
+4. **DSH / Cursor**：只做到状态库读取与工作区事实确认，未找到零输入发送通道，未做任何输入合成。**ZCode 已于 2026-11-07 通过 headless CLI 通道升级为 verified**（见 [ZCode 自动化触发](ZCode自动化触发.md)）。
 5. **未安装的 4 款 CLI**：`claude_code` / `gemini_cli` / `codex_cli` / `aider` 仅登记公开 CLI 参数，未在本机验证。
 
 ---

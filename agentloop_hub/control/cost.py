@@ -3,7 +3,8 @@
 需求整理-v1 模块 6 要求把同样的任务从 100 美元压到 10 美元，手段是：
 
 1. Context Compression —— 主节点/子节点只拿必要上下文，超出预算自动裁剪；
-2. Semantic Cache —— 只读任务在同一文件基线下按意图相似度复用成果；
+2. Semantic Cache —— 只读任务在同一文件基线下按意图相似度复用成果；默认用本地
+   EmbeddingGemma 向量余弦（真语义），模型/依赖不可用时回退词袋 Jaccard（如实标注 method）；
 3. Intermediate Result Reuse —— 依赖任务只接收上游成果摘要，不复制全上下文；
 4. Agent Benchmark —— 用真实任务数据评估成功率、验证通过率、速度与成本。
 
@@ -70,11 +71,52 @@ class CostOptimizer:
             normalize_intent(" ".join(spec.out_of_scope)),
         ])
 
+    def semantic_text(self, task: Task) -> str:
+        """Intent-only text for embeddings.
+
+        The full signature (with type/scope) keys the exact cache; scope and type
+        are already pinned by the file-hash baseline and the task_type filter, so
+        including them would inflate similarity between unrelated intents that
+        share the same files.
+        """
+        spec = task.spec
+        return normalize_intent(" ".join([spec.objective, *spec.acceptance_criteria]))
+
+    def _embedder(self):
+        """Return a usable local embedder, or None to use lexical fallback."""
+        backend = str(self.config.semantic_cache_backend or "auto").strip().lower()
+        if backend not in ("auto", "embedding"):
+            return None
+        from .embeddings import get_embedder
+        embedder = get_embedder(
+            self.config.embedding_model_path,
+            max_length=int(self.config.embedding_max_length),
+            device=str(self.config.embedding_device or "cpu"),
+        )
+        return embedder if embedder.available() else None
+
+    @staticmethod
+    def _stored_embedding(entry: dict[str, Any]) -> list[float] | None:
+        raw = entry.get("embedding")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(value, list) or not value:
+            return None
+        try:
+            return [float(x) for x in value]
+        except (TypeError, ValueError):
+            return None
+
     def semantic_reference(self, task: Task, file_hash: str) -> dict[str, Any] | None:
         """Return a similar prior result as a *reference*, never as a result.
 
-        Approximate similarity cannot prove the same intent (``>0`` and ``<0``
-        normalize identically), so a match is not recorded as a hit or a
+        With the local embedding backend the match is true-semantic (cosine over
+        EmbeddingGemma vectors); when the model/libs are unavailable it degrades
+        to lexical similarity. Either way a match is not recorded as a hit or a
         saving and is never returned as a successful payload.
         """
         if task.spec.writable or not file_hash:
@@ -83,18 +125,49 @@ class CostOptimizer:
             self.project.project_id, task.spec.type, file_hash,
             limit=int(self.config.semantic_cache_max_entries),
         )
+        if not entries:
+            return None
         signature = self.signature(task)
+        semantic_text = self.semantic_text(task)
+        embedder = self._embedder()
+        query_vec = None
+        if embedder is not None:
+            vectors = embedder.embed([semantic_text])
+            query_vec = vectors[0] if vectors else None
         best: tuple[float, dict[str, Any]] | None = None
-        for entry in entries:
-            score = similarity(signature, entry.get("signature", ""))
-            if best is None or score > best[0]:
-                best = (score, entry)
-        if not best or best[0] < float(self.config.semantic_cache_threshold):
+        if query_vec is not None:
+            from .embeddings import cosine
+            method = "embedding"
+            threshold = float(self.config.semantic_cache_embedding_threshold)
+            for entry in entries:
+                vec = self._stored_embedding(entry)
+                if vec is None:
+                    # Pre-embedding rows: approximate intent from the stored
+                    # objective, then persist the vector for future lookups.
+                    stored_semantic = normalize_intent(str(entry.get("objective") or ""))
+                    computed = embedder.embed([stored_semantic])
+                    vec = computed[0] if computed else None
+                    if vec is not None:
+                        self.store.semantic_set_embedding(entry["cache_key"], vec)
+                if vec is None:
+                    continue
+                score = cosine(query_vec, vec)
+                if best is None or score > best[0]:
+                    best = (score, entry)
+        else:
+            method = "jaccard"
+            threshold = float(self.config.semantic_cache_threshold)
+            for entry in entries:
+                score = similarity(signature, entry.get("signature", ""))
+                if best is None or score > best[0]:
+                    best = (score, entry)
+        if not best or best[0] < threshold:
             return None
         score, entry = best
         return {
             "cache_key": entry["cache_key"],
             "similarity": round(score, 4),
+            "method": method,
             "payload": entry.get("payload", {}),
             "source_task": entry.get("objective", ""),
             "reference_only": True,
@@ -110,11 +183,17 @@ class CostOptimizer:
             "signature": signature,
             "file_hash": file_hash,
         }))
+        embedding = None
+        embedder = self._embedder()
+        if embedder is not None:
+            vectors = embedder.embed([self.semantic_text(task)])
+            embedding = vectors[0] if vectors else None
         self.store.semantic_set(
             cache_key, self.project.project_id, task.spec.type, signature,
-            task.spec.objective[:500], file_hash, payload,
+            task.spec.objective[:500], file_hash, payload, embedding=embedding,
         )
-        return {"cache_key": cache_key, "similarity": 1.0}
+        return {"cache_key": cache_key, "similarity": 1.0,
+                "method": "embedding" if embedding else "jaccard"}
 
     # ------------------------------------------------------------------
     # Intermediate result reuse
@@ -158,6 +237,7 @@ class CostOptimizer:
                                  - estimate_tokens(json.dumps(item[1]["digest"], ensure_ascii=False)))
             self.record_saving(
                 "intermediate_reuse", saved, task_uid=task.uid, run_id=task.run_id,
+                cost_saved=self.usd_saved(saved, task.spec.model),
                 detail={"hints": [h["task_id"] for h in selected]},
             )
         return selected
@@ -167,12 +247,13 @@ class CostOptimizer:
     # ------------------------------------------------------------------
     def compress_context(self, context: dict[str, Any], token_limit: int, *,
                          kind: str = "context_compression", task_uid: str = "",
-                         run_id: str = "") -> dict[str, Any]:
+                         run_id: str = "", model: str = "") -> dict[str, Any]:
         before = estimate_tokens(json.dumps(context, ensure_ascii=False, default=str))
         compressed = ContextBuilder._cap(context, token_limit)
         after = estimate_tokens(json.dumps(compressed, ensure_ascii=False, default=str))
         if before > after:
             self.record_saving(kind, before - after, task_uid=task_uid, run_id=run_id,
+                               cost_saved=self.usd_saved(before - after, model),
                                detail={"before_tokens": before, "after_tokens": after,
                                        "limit": token_limit})
         return compressed
@@ -190,6 +271,21 @@ class CostOptimizer:
             tokens_saved=max(0, int(tokens_saved)), cost_saved=max(0.0, float(cost_saved)),
             task_uid=task_uid, run_id=run_id, detail=detail or {},
         )
+
+    def usd_saved(self, tokens_saved: int, model: str = "") -> float:
+        """Estimate USD avoided by not sending input-context tokens.
+
+        Compression and result reuse save *input* tokens, so the input price is
+        used. An unknown model price yields 0 (tokens are still ledgered); the
+        estimate is never reported as an exact billing figure.
+        """
+        if int(tokens_saved) <= 0:
+            return 0.0
+        price = self.config.price_for(model)
+        if not price.get("known"):
+            return 0.0
+        per_million = float(price.get("input") or 0.0) or float(price.get("output") or 0.0)
+        return round(int(tokens_saved) / 1_000_000.0 * per_million, 6)
 
     def savings(self) -> dict[str, Any]:
         return {

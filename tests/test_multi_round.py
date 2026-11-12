@@ -320,3 +320,47 @@ def test_collect_unresolved_ignores_nonblocking_notes():
     items = collect_unresolved([task], {"merge_recommendation": "approve"}, results)
     assert len(items) == 1
     assert "登录流程" in items[0]
+
+
+def test_fallback_specs_restate_constraints_and_delivery_rules():
+    from agentloop_hub.control.rounds import (
+        DELIVERY_RULES, RoundDecision, fallback_specs,
+    )
+    from agentloop_hub.models import TaskPlan
+
+    plan = TaskPlan(plan_id="p", project_id="prj", goal="g", tasks=[],
+                    main_agent_id="main", model="m",
+                    constraints=["禁止 git 提交", "只改 src/"])
+    decision = RoundDecision(action="continue", reason="未通过",
+                             unresolved=["清理 6 个临时文件：git rm --cached 并提交"])
+    specs = fallback_specs(plan=plan, tasks=[], summary={}, decision=decision,
+                           round_number=2)
+    objective = specs[0].objective
+    # Constraints and the real delivery mechanism are restated verbatim.
+    assert "禁止 git 提交" in objective
+    assert "只改 src/" in objective
+    for rule in DELIVERY_RULES:
+        assert rule in objective
+    assert "git rm --cached" in objective
+    # The recorded unresolved item is preserved as evidence, not rewritten.
+    assert "git rm --cached 并提交" in objective
+    assert specs[1].task_id.endswith("_REVIEW")
+
+
+def test_continuation_context_carries_plan_constraints(tmp_path):
+    from types import SimpleNamespace
+    from agentloop_hub.control.rounds import RoundDecision
+    from agentloop_hub.models import TaskPlan
+
+    _, hub, _ = make_project(tmp_path)
+    plan = TaskPlan(plan_id="p", project_id="prj", goal="g", tasks=[],
+                    main_agent_id="main", model="m",
+                    constraints=["禁止 git 提交"])
+    decision = RoundDecision(action="continue", reason="r", unresolved=["x"])
+    context = hub.runner._continuation_context(
+        {"round_number": 1, "max_rounds": 3}, plan, [], {},
+        decision, 2, 3)
+    assert context["plan_constraints"] == ["禁止 git 提交"]
+    assert context["delivery_rules"]
+    assert any("git rm --cached" in rule for rule in context["delivery_rules"])
+    hub.close()

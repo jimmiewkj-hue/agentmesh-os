@@ -187,10 +187,12 @@ def _workbuddy() -> dict:
 
 def _zcode() -> dict:
     db = HOME / ".zcode" / "cli" / "db" / "db.sqlite"
+    exe = Path(r"C:\Program Files\ZCode\ZCode.exe")
+    cjs = exe.parent / "resources" / "glm" / "zcode.cjs"
     return {
         "product": "ZCode",
-        "executable": r"C:\Program Files\ZCode\ZCode.exe",
-        "installed": Path(r"C:\Program Files\ZCode\ZCode.exe").exists(),
+        "executable": str(exe),
+        "installed": exe.exists(),
         "state_db": str(db),
         "state_db_plain_sqlite": _plain_sqlite(db),
         "state_tables": _tables(db)[:22],
@@ -199,14 +201,23 @@ def _zcode() -> dict:
             "sample": ["DeepSeek-V4.1-Flash", "GLM-5.3-Flash", "deepseek-v4-pro",
                        "glm-5.2", "glm-5.3", "glm-5.3-flash"],
         },
-        "workspace_channel": "cli/db/db.sqlite session.directory / session.path / project_id (plain SQLite)",
-        "dev_mode_channel": "cli/db/db.sqlite local_setting(permission.mode=yolo) + session.permission",
-        "chat_channel": "NOT FOUND (Electron GUI, no verified IPC/CLI send path)",
-        "readback_channel": "cli/db/db.sqlite session.* + model_usage.model_id + rollout jsonl",
+        "workspace_channel": "--cwd <dir> (headless CLI) + cli/db/db.sqlite session.directory (plain SQLite)",
+        "dev_mode_channel": "-p default permission mode yolo; --mode build|edit|plan|yolo|guarded",
+        "chat_channel": ("VERIFIED headless CLI: ELECTRON_RUN_AS_NODE=1 ZCode.exe"
+                         " resources/glm/zcode.cjs -p \"<task>\" --cwd <dir> --json;"
+                         " model pinned via temp provider config copy"
+                         " (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE +"
+                         " ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,"
+                         " providerOrder/modelOrder first);"
+                         " ZCODE_MODEL_RETRY_MAX_RETRIES caps the retry loop;"
+                         " --resume <sess_...> continues a session"),
+        "readback_channel": "cli/db/db.sqlite session.* + model_usage(provider/model/status) + rollout jsonl",
         "evidence": ["~/.zcode/cli/db/db.sqlite tables session/local_setting/model_usage",
                      "~/.zcode/cli/rollout/model-io-sess_*.jsonl",
-                     "C:/Program Files/ZCode/resources app bundle"],
-        "status": "partial",
+                     "C:/Program Files/ZCode/resources/glm/zcode.cjs --help (zcode CLI 0.17.1)",
+                     "real run: -p returned exact expected text via deepseek-v4-pro (2.85s)",
+                     "verification/verify_zcode_real.py end-to-end chain"],
+        "status": "verified" if (exe.exists() and cjs.exists()) else "partial",
     }
 
 

@@ -10,6 +10,16 @@ from typing import Any
 
 from .util import read_json
 
+# USD per 1M tokens (input/output). Only unambiguous free models are built in;
+# paid-model prices are deliberately NOT guessed (public sources conflict by
+# date/peak/off-peak, and legacy aliases retire). Populate ``pricing`` from the
+# official rate card or your account billing to measure dollar savings; a model
+# absent from both tables is *unknown* (cost_known=False), never assumed free.
+DEFAULT_PRICING: dict[str, dict[str, float]] = {
+    "glm-4-flash": {"input": 0.0, "output": 0.0},
+    "glm-5.3-flash-free": {"input": 0.0, "output": 0.0},
+}
+
 DEFAULT_DANGEROUS_PATTERNS: list[str] = [
     r"rm\s+-rf",
     r"rmdir\s+/s",
@@ -54,6 +64,10 @@ class HubConfig:
     relay_timeout_seconds: int = 1800
     cli_timeout_seconds: int = 3600
     plan_timeout_seconds: int = 900
+    # How long a persisted plan watch keeps polling for a GUI agent that
+    # returned waiting_user (manual submit / workspace switch).  The agent may
+    # finish long after the request job ended, even across server restarts.
+    plan_watch_seconds: int = 7 * 24 * 3600
     summary_timeout_seconds: int = 600
     verify_timeout_seconds: int = 180
     verify_server_probe_seconds: int = 15
@@ -108,6 +122,14 @@ class HubConfig:
     # Cost Optimizer
     semantic_cache_threshold: float = 0.82
     semantic_cache_max_entries: int = 200
+    # True-semantic cache: local EmbeddingGemma via torch/transformers.
+    # "auto" uses embeddings when the model/libs are available, else falls back
+    # to the lexical (bag-of-words) similarity; "embedding"/"jaccard" force one.
+    semantic_cache_backend: str = "auto"
+    embedding_model_path: str = ""
+    embedding_device: str = "cpu"
+    embedding_max_length: int = 512
+    semantic_cache_embedding_threshold: float = 0.85
     benchmark_min_tasks: int = 1
 
     audit_chain_enabled: bool = True
@@ -153,7 +175,8 @@ class HubConfig:
         "target", ".idea", ".vscode", "*.log",
     ])
 
-    # USD per 1M tokens; populated by the user. Unknown models cost 0.
+    # USD per 1M tokens; user overrides take precedence over DEFAULT_PRICING.
+    # A model present in neither table is unknown (cost_known=False), not free.
     pricing: dict[str, dict[str, float]] = field(default_factory=dict)
 
     # Agent-specific overrides keyed by agent_id.
@@ -166,6 +189,7 @@ class HubConfig:
             "relay_timeout_seconds": self.relay_timeout_seconds,
             "cli_timeout_seconds": self.cli_timeout_seconds,
             "plan_timeout_seconds": self.plan_timeout_seconds,
+            "plan_watch_seconds": self.plan_watch_seconds,
             "summary_timeout_seconds": self.summary_timeout_seconds,
             "verify_timeout_seconds": self.verify_timeout_seconds,
             "verify_server_probe_seconds": self.verify_server_probe_seconds,
@@ -196,6 +220,11 @@ class HubConfig:
             "router_sample_strength": self.router_sample_strength,
             "semantic_cache_threshold": self.semantic_cache_threshold,
             "semantic_cache_max_entries": self.semantic_cache_max_entries,
+            "semantic_cache_backend": self.semantic_cache_backend,
+            "embedding_model_path": self.embedding_model_path,
+            "embedding_device": self.embedding_device,
+            "embedding_max_length": self.embedding_max_length,
+            "semantic_cache_embedding_threshold": self.semantic_cache_embedding_threshold,
             "benchmark_min_tasks": self.benchmark_min_tasks,
             "audit_chain_enabled": self.audit_chain_enabled,
             "auto_merge_commit": self.auto_merge_commit,
@@ -246,7 +275,9 @@ class HubConfig:
         key = (model or "").strip()
         if not key:
             return {"input": 0.0, "output": 0.0, "known": False}
-        entry = self.pricing.get(key) or self.pricing.get(key.split("/")[-1]) or {}
+        short = key.split("/")[-1]
+        entry = (self.pricing.get(key) or self.pricing.get(short)
+                 or DEFAULT_PRICING.get(key) or DEFAULT_PRICING.get(short) or {})
         return {
             "input": float(entry.get("input", 0.0) or 0.0),
             "output": float(entry.get("output", 0.0) or 0.0),

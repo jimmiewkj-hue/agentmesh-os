@@ -4,6 +4,8 @@
   step_start / text {part.text} / step_finish {part.tokens, part.cost}
 The adapter reads those events and requires the agent to write the result file
 declared by the control plane, retrying once with `--continue` if it is missing.
+Chain nodes for the same Agent resume the recorded session with `--session`
+(an unknown id fails fast with "Session not found" instead of starting fresh).
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ class OpenCodeAdapter(CliAgentAdapter):
         self.executable = str(self.config.get("executable") or resolve_opencode_executable())
 
     def _base_command(self, request: ExecutionRequest, instruction: str, *,
-                      continue_session: bool = False) -> list[str]:
+                      continue_session: bool = False,
+                      resume_session_id: str = "") -> list[str]:
         exe = self.executable
         if not exe:
             raise ValueError("未找到 opencode 可执行文件")
@@ -59,7 +62,9 @@ class OpenCodeAdapter(CliAgentAdapter):
         auto = self.config.get("auto_approve", True)
         if str(auto).lower() not in ("0", "false", "no", "off"):
             args.append("--auto")
-        if continue_session:
+        if resume_session_id:
+            args += ["--session", resume_session_id]
+        elif continue_session:
             args.append("--continue")
         extra = [str(a) for a in (self.config.get("extra_args") or [])]
         args += extra
@@ -130,6 +135,11 @@ class OpenCodeAdapter(CliAgentAdapter):
             return ExecutionOutcome(status="failed", error="opencode 未安装或不可执行")
         instruction = self._instruction(request)
         timeout = float(self.config.get("timeout_seconds") or request.timeout_seconds)
+        resume_entry = request.resume_session if isinstance(request.resume_session, dict) else {}
+        resume_session_id = ""
+        if (resume_entry.get("resume") and resume_entry.get("session_id")
+                and bool(self.config.get("chain_reuse_agent_sessions", True))):
+            resume_session_id = str(resume_entry["session_id"])
         env = {
             "AGENTLOOP_WORKDIR": request.workdir,
             "AGENTLOOP_TASK_DIR": request.task_dir,
@@ -142,7 +152,8 @@ class OpenCodeAdapter(CliAgentAdapter):
         log_dir = ensure_dir(Path(request.task_dir) / "logs")
 
         proc = run_process(
-            self._base_command(request, instruction),
+            self._base_command(request, instruction,
+                               resume_session_id=resume_session_id),
             cwd=request.workdir, timeout=timeout, env=env,
         )
         atomic_write_text(log_dir / "opencode.stdout.log", proc.stdout)
@@ -200,7 +211,10 @@ class OpenCodeAdapter(CliAgentAdapter):
             result_path=request.result_path,
             logs=((proc.stdout + "\n" + proc.stderr + "\n" + repair_logs)[-30000:]),
             duration_ms=proc.duration_ms, pid=proc.pid, session_id=session_id,
-            extras={"result_written": payload is not None},
+            extras={"result_written": payload is not None,
+                    "interface": {"resumed_session_id":
+                                  resume_session_id if resume_session_id
+                                  and session_id == resume_session_id else ""}},
         )
 
     def health(self) -> dict[str, Any]:

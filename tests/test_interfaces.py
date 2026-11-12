@@ -174,7 +174,8 @@ def test_qoder_prepare_session_moves_transcript_and_updates_db(tmp_path, monkeyp
     monkeypatch.setattr(iface, "_start_app", lambda _exe: None)
     outcome = iface.prepare_qoder_session(
         workspace=workspace, model="DeepSeek-Flash",
-        config={"qoder_db": str(db), "qoder_projects": str(projects)},
+        config={"qoder_db": str(db), "qoder_projects": str(projects),
+                "qoder_sites": str(tmp_path / "sites")},
         allow_restart=True, allow_history_migration=True,
     )
     assert outcome.ok, outcome
@@ -222,7 +223,8 @@ def test_qoder_prepare_falls_back_to_session_with_transcript(tmp_path, monkeypat
     monkeypatch.setattr(iface, "_start_app", lambda _exe: None)
     outcome = iface.prepare_qoder_session(
         workspace=workspace, model="DeepSeek-Flash",
-        config={"qoder_db": str(db), "qoder_projects": str(projects)},
+        config={"qoder_db": str(db), "qoder_projects": str(projects),
+                "qoder_sites": str(tmp_path / "sites")},
         allow_restart=True, allow_history_migration=True,
     )
     assert outcome.ok, outcome
@@ -314,3 +316,93 @@ def test_set_model_programmatically_writes_qoder_default(tmp_path):
     assert outcome.ok
     payload = json.loads(default.read_text(encoding="utf-8"))
     assert payload["key"] == "gfmodel"
+
+
+def test_qoder_model_labels_come_from_the_app_dynamic_text(tmp_path):
+    dynamic = tmp_path / "qoder-cn.json"
+    dynamic.write_text(json.dumps({
+        "zh": {
+            "model.qmodel_latest.label": "Qwen3.7-Max",
+            "model.mmodel.label": "MiniMax-M3.1-Flash",
+            "model.dfmodel.label": "DeepSeek-Flash",
+        },
+        "en": {"model.qmodel_latest.label": "Qwen3.7-Max"},
+    }, ensure_ascii=False), encoding="utf-8")
+    labels = dict(iface._qoder_labels_from(str(dynamic)))
+    assert labels == {"qmodel_latest": "Qwen3.7-Max",
+                      "mmodel": "MiniMax-M3.1-Flash",
+                      "dfmodel": "DeepSeek-Flash"}
+
+
+def test_qoder_live_dynamic_texts_override_stale_labels(tmp_path):
+    live = tmp_path / "dynamic-texts.json"
+    live.write_text(json.dumps({
+        "schemaVersion": 1,
+        "locales": {"zh-CN": {
+            "modelSelector.item.qmodel_latest": "Qwen4-Max-Preview",
+            "modelSelector.item.qmodel_latest.description": "新一代基座模型",
+            "modelSelector.item.mmodel": "MiniMax-M2.7",
+            "modelSelector.item.jmodel": "Step-5-Preview",
+        }},
+    }, ensure_ascii=False), encoding="utf-8")
+    labels = dict(iface._qoder_labels_from(str(live)))
+    assert labels == {"qmodel_latest": "Qwen4-Max-Preview",
+                      "mmodel": "MiniMax-M2.7",
+                      "jmodel": "Step-5-Preview"}
+
+
+def test_qoder_catalog_keys_read_renderer_local_storage(tmp_path):
+    root = tmp_path / "leveldb"
+    root.mkdir()
+    entries = [["[\"runtime:qoder\",\"local\"]",
+                "[\"qmodel_latest\",\"model\"]",
+                "[\"kmodel\",\"model\"]",
+                "[\"qfmodel\",\"free\"]"]]
+    payload = "qoder.chatModelUpdates.v1:uid-1 " + json.dumps(entries)
+    (root / "000028.log").write_text(payload, encoding="utf-8")
+    keys = iface.qoder_catalog_keys({"qoder_local_storage": str(root)})
+    assert keys == ["kmodel", "qfmodel", "qmodel_latest"]
+
+
+def test_qoder_independent_session_preserves_user_history(tmp_path, monkeypatch):
+    workspace = str(tmp_path / "run-ws")
+    user_ws = str(tmp_path / "user-ws")
+    db = _qoder_db(tmp_path / "main.sqlite", cwd=user_ws, model="dfmodel")
+    projects = tmp_path / "projects"
+    user_transcript = _qoder_transcript(projects, user_ws, "qoder-sess", model="dfmodel")
+    before = user_transcript.read_text(encoding="utf-8")
+    monkeypatch.setattr(iface, "_process_running", lambda _name: False)
+    monkeypatch.setattr(iface, "_stop_process", lambda _name: None)
+    monkeypatch.setattr(iface, "_start_app", lambda _exe: None)
+    config = {"qoder_db": str(db), "qoder_projects": str(projects),
+              "qoder_sites": str(tmp_path / "sites"),
+              "qoder_daemon_log": str(tmp_path / "no-daemon.log")}
+    outcome = iface.prepare_qoder_session(
+        workspace=workspace, model="qmodel_latest", config=config,
+        allow_new_session=True,
+    )
+    assert outcome.ok, outcome
+    new_id = outcome.evidence["session_id"]
+    assert new_id != "qoder-sess"
+    assert outcome.evidence["new_session"] is True
+    conn = sqlite3.connect(db)
+    rows = {(row[0], row[1], row[2]) for row in conn.execute(
+        "select session_id, cwd, model from chat_sessions")}
+    conn.close()
+    assert ("qoder-sess", user_ws, "dfmodel") in rows
+    assert (new_id, workspace, "qmodel_latest") in rows
+    # The user's own transcript is byte-for-byte untouched.
+    assert user_transcript.read_text(encoding="utf-8") == before
+    new_path = projects / iface.qoder_project_slug(workspace) / f"{new_id}.jsonl"
+    assert new_path.exists()
+    events = [json.loads(line) for line in
+              new_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert events[0]["type"] == "workspace-directories"
+    assert events[0]["directories"] == [workspace]
+    assert events[-1]["type"] == "runtime-config"
+    assert events[-1]["model"] == "qmodel_latest"
+    verify = iface.verify_qoder_session(
+        workspace=workspace, model="qmodel_latest", started_at=0,
+        config=config, session_id=new_id,
+    )
+    assert verify.ok, verify

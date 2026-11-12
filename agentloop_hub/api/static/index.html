@@ -64,6 +64,7 @@ h3{font-size:14px;margin:0 0 8px}
 .table tr:hover td{background:#f8fafc}
 .mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
 pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;max-height:360px;font-size:12px;white-space:pre-wrap}
+pre.plain{background:#f8fafc;color:#17212b;border:1px solid var(--line)}
 .muted{color:var(--muted)}
 .empty{color:var(--muted);padding:18px;text-align:center;border:1px dashed var(--line);border-radius:8px}
 .tag{display:inline-block;padding:1px 7px;border-radius:6px;background:#f1f5f9;color:#334155;font-size:11px;margin:2px 4px 2px 0}
@@ -169,9 +170,76 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
         <div class="grow"><label>能力等级</label>
           <select id="bindingCapability"></select></div>
       </div>
+      <label class="check" style="margin-top:10px;border-bottom:0">
+        <span>停止当前尝试并改绑（终止 CLI 进程；GUI 请先在应用内停止）</span>
+        <input id="bindingStopActive" type="checkbox" style="width:auto">
+      </label>
       <div class="row" style="margin-top:14px;justify-content:flex-end">
         <button onclick="closeBindingEditor()">取消</button>
         <button class="primary" onclick="saveBindingEditor()">保存绑定</button>
+      </div>
+    </div>
+  </div>
+  <div id="importPlanModal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal" style="width:min(640px,94vw)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 style="margin:0">导入已有计划 JSON</h3>
+        <button class="small" onclick="closeImportPlanModal()">关闭</button>
+      </div>
+      <div class="sub" style="margin:6px 0 10px">粘贴计划 JSON，或填写项目内的计划文件路径。此入口不依赖浏览器 prompt()。</div>
+      <label>计划 JSON</label>
+      <textarea id="importPlanText" placeholder='{"plan_version": 1, "goal": "...", "tasks": [...]}' style="min-height:180px"></textarea>
+      <label>或：计划文件路径（相对项目根或绝对路径）</label>
+      <input id="importPlanPath" placeholder="例如 .agentloop/planning/plan.json">
+      <div class="row" style="margin-top:14px;justify-content:flex-end">
+        <button onclick="closeImportPlanModal()">取消</button>
+        <button class="primary" onclick="doImportPlan()">导入计划</button>
+      </div>
+    </div>
+  </div>
+  <div id="summaryModal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal" style="width:min(680px,94vw)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 style="margin:0">回填主节点汇总 JSON</h3>
+        <button class="small" onclick="closeSummaryModal()">关闭</button>
+      </div>
+      <div class="sub" style="margin:6px 0 10px">用于主节点在应用内完成汇总后，把 summary.json 交回控制平面（支持粘贴 JSON 或项目内路径）。</div>
+      <label>汇总 JSON</label>
+      <textarea id="summaryText" placeholder='{"summary_version": 1, "completion": "...", "changes": [], "verification": "...", "risks": [], "merge_recommendation": "approve|reject", "next_actions": []}' style="min-height:180px"></textarea>
+      <label>或：汇总文件路径（相对项目根或绝对路径）</label>
+      <input id="summaryPath" placeholder="例如 .agentloop/runs/<run_id>/summary/summary.json">
+      <div class="sub" id="summaryRunInfo" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:14px;justify-content:flex-end">
+        <button onclick="closeSummaryModal()">取消</button>
+        <button class="primary" onclick="submitSummaryJson()">提交汇总</button>
+      </div>
+    </div>
+  </div>
+  <div id="textInputModal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal" style="width:min(560px,94vw)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 id="textInputTitle" style="margin:0">输入</h3>
+        <button class="small" onclick="closeTextInputModal()">关闭</button>
+      </div>
+      <label id="textInputLabel"></label>
+      <textarea id="textInputValue" style="min-height:120px"></textarea>
+      <div class="row" style="margin-top:14px;justify-content:flex-end">
+        <button onclick="closeTextInputModal()">取消</button>
+        <button class="primary" onclick="confirmTextInputModal()">确定</button>
+      </div>
+    </div>
+  </div>
+  <div id="adoptModal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal" style="width:min(640px,94vw)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 id="adoptTitle" style="margin:0">采纳已有尝试成果</h3>
+        <button class="small" onclick="closeAdoptModal()">关闭</button>
+      </div>
+      <div class="sub" style="margin:6px 0 10px">采纳某个尝试已经写出的 result.json；不会重发请求。</div>
+      <div id="adoptList" class="muted">加载中…</div>
+      <div class="row" style="margin-top:14px;justify-content:flex-end">
+        <button onclick="closeAdoptModal()">取消</button>
+        <button class="primary" onclick="confirmAdopt()">采纳所选成果</button>
       </div>
     </div>
   </div>
@@ -205,7 +273,7 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
       <textarea id="goal" placeholder="例如：审查登录模块的安全问题，修复高风险漏洞并补充测试；不要修改数据库结构。"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="primary" onclick="requestPlan()">生成任务计划</button>
-        <button onclick="importPlanPrompt()">导入已有计划 JSON</button>
+        <button onclick="openImportPlanModal()">导入已有计划 JSON</button>
         <span class="sub" id="jobStatus"></span>
       </div>
       <div id="planResult" style="margin-top:12px"></div>
@@ -418,11 +486,15 @@ svg.dag{width:100%;height:380px;border:1px solid var(--line);border-radius:8px;b
           <div class="row" id="taskActions"></div>
         </div>
         <div id="taskBody" class="muted">从任务图或列表中选择一个任务。</div>
+        <h3 style="margin-top:14px">尝试记录</h3>
+        <div id="taskAttempts" class="muted">选择任务后加载。</div>
       </div>
       <div class="card">
         <h3>提交 / 回滚</h3>
         <label>接力成果 JSON（粘贴或填写文件路径）</label>
         <textarea id="resultInput" placeholder='{"task_id": "...", ...} 或 C:\path\result.json'></textarea>
+        <label>关联尝试（活动尝试会自动带上 attempt_id）</label>
+        <select id="resultAttempt"></select>
         <div class="row" style="margin-top:8px">
           <button class="primary" onclick="submitResult()">提交成果包</button>
           <button onclick="retryTask()">重试任务</button>

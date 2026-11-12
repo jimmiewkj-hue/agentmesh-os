@@ -513,6 +513,7 @@ CREATE TABLE IF NOT EXISTS semantic_cache (
     objective TEXT NOT NULL DEFAULT '',
     file_hash TEXT NOT NULL DEFAULT '',
     payload TEXT NOT NULL DEFAULT '{}',
+    embedding TEXT NOT NULL DEFAULT '',
     hits INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     last_hit_at TEXT NOT NULL DEFAULT '',
@@ -708,6 +709,10 @@ class Database:
         if "acked_seq" not in sub_columns:
             conn.execute(
                 "ALTER TABLE bus_subscriptions ADD COLUMN acked_seq INTEGER NOT NULL DEFAULT 0")
+        semantic_columns = columns("semantic_cache")
+        if "embedding" not in semantic_columns:
+            conn.execute(
+                "ALTER TABLE semantic_cache ADD COLUMN embedding TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_approval ON runs(approval_id) "
             "WHERE approval_id <> ''")

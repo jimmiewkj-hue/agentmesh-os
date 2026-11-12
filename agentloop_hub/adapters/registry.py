@@ -6,16 +6,22 @@ from ..errors import AdapterError
 from ..models import AdapterType, AgentRecord
 from .base import AgentAdapter
 from .cli import CliAgentAdapter
+from .dsh import DshAdapter
 from .gui import GuiAutomationAdapter
 from .mcp import McpAdapter
 from .opencode import OpenCodeAdapter
 from .relay import FileRelayAdapter, ManualAdapter
+from .zcode import ZcodeAdapter
 
 
 def create_adapter(agent: AgentRecord) -> AgentAdapter:
     kind = agent.adapter_type
     if kind == AdapterType.OPENCODE.value:
         return OpenCodeAdapter(agent)
+    if kind == AdapterType.ZCODE.value:
+        return ZcodeAdapter(agent)
+    if kind == AdapterType.DSH.value:
+        return DshAdapter(agent)
     if kind == AdapterType.MCP.value:
         return McpAdapter(agent)
     if kind == AdapterType.CLI.value:

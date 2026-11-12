@@ -74,15 +74,19 @@ def test_R1_main_node_is_never_routed_as_executor(env):
 
 
 def test_R1_control_plane_contains_no_llm_client():
-    """Controller 必须是确定性软件：控制平面不得调用任何 LLM 或远端 API。
+    """Controller 必须是确定性软件：控制平面不得内嵌 LLM 客户端做决策。
 
     本机 127.0.0.1 的 CDP 探活属于 GUI 桥接，不是控制决策，允许存在。
+    F4 联网检索（control/tools.py）是确定性的检索工具调用，不是 LLM 决策，
+    其搜索引擎主机在白名单内；LLM 厂商/ completions / 鉴权令牌仍然禁止。
     """
     import re
 
     root = Path(__file__).resolve().parents[1] / "agentloop_hub" / "control"
     llm_tokens = ("openai", "anthropic", "chat/completions", "api_key",
                   "authorization: bearer")
+    # Deterministic retrieval (F4), not an LLM client.
+    search_hosts = {"lite.duckduckgo.com", "html.duckduckgo.com", "duckduckgo.com"}
     url_re = re.compile(r"https?://[^\s\"'\)]+")
     offenders: list[str] = []
     for path in root.rglob("*.py"):
@@ -96,6 +100,8 @@ def test_R1_control_plane_contains_no_llm_client():
             host = netloc.split(":")[0]
             # Template URLs such as http://{target}:{port}/ are local probes.
             if "{" in netloc or "}" in netloc:
+                continue
+            if host in search_hosts:
                 continue
             if host not in ("127.0.0.1", "localhost"):
                 offenders.append(f"{path.name}:remote:{url}")

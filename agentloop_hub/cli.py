@@ -50,6 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="显示项目总览")
     sub.add_parser("doctor", help="环境与 Agent 健康检查")
     sub.add_parser("connectors", help="Agent Connector 统一能力清单")
+    search = sub.add_parser("search", help="控制平面联网检索（子节点可经此调用）")
+    search.add_argument("query", help="检索关键词")
+    search.add_argument("--max-results", type=int, default=5)
+    search.add_argument("--timeout", type=float, default=20.0)
     surface = sub.add_parser("surface", help="统一 5 能力矩阵（零 OS 输入证据）")
     surface.add_argument("--agent", default="", help="只输出指定 Agent")
     models = sub.add_parser("models", help="Agent 支持的模型清单")
@@ -108,7 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--product")
     add.add_argument("--edition", default="")
     add.add_argument("--adapter", default="file_relay",
-                     choices=["cli", "opencode", "file_relay", "manual", "session_only", "mcp"])
+                     choices=["cli", "opencode", "zcode", "file_relay", "manual", "session_only", "mcp",
+                              "gui_automation"])
     add.add_argument("--level", default="L2", choices=["L0", "L1", "L2", "L3", "L4"])
     add.add_argument("--command", help="CLI 可执行文件")
     add.add_argument("--config-json", help="adapter_config JSON")
@@ -351,6 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="启动本地 Web 控制台")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
+    sub.add_parser("mcp-serve", help="以 MCP stdio 服务暴露记忆/搜索工具")
 
     return parser
 
@@ -390,6 +396,17 @@ def main(argv: list[str] | None = None) -> int:
 
             serve(Path(args.project).expanduser() if args.project else Path.cwd(),
                   host=args.host, port=args.port, open_browser=False)
+            return 0
+
+        if args.command == "search":
+            from .control.tools import web_search
+            _print(web_search(args.query, max_results=args.max_results,
+                              timeout=args.timeout), as_json=True)
+            return 0
+
+        if args.command == "mcp-serve":
+            from .mcp_server import run_stdio
+            run_stdio(Path(args.project).expanduser() if args.project else Path.cwd())
             return 0
 
         hub = _hub(args)

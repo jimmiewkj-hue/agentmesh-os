@@ -51,7 +51,7 @@ from .control.paths import WorkspacePaths
 from .control.planning import PlanningService
 from .control.recovery import RecoveryService
 from .control.router import CapabilityRouter
-from .control.roles import RolePolicy
+from .control.roles import RolePolicy, spec_is_heavy
 from .control.runner import RunService
 from .control.sync import SyncService
 from .control.verification import Verifier
@@ -177,6 +177,10 @@ class Hub:
         if bool(getattr(self.config, "auto_reconcile_on_startup", True)):
             threading.Thread(target=self._startup_reconcile,
                              name="agentmesh-startup-reconcile", daemon=True).start()
+        try:
+            self.planning.resume_watches()
+        except Exception:
+            pass
 
     def _migrate_legacy_budget(self) -> None:
         """1000000 was the old default; budgets are advisory now."""
@@ -637,6 +641,9 @@ class Hub:
                     model: str = "") -> dict[str, Any]:
         return self.planning.import_plan(data, main_agent_id=main_agent_id, model=model)
 
+    def plan_watches(self) -> list[dict[str, Any]]:
+        return self.planning.list_watches()
+
     def approve_plan(self, plan_id: str, *, approval_id: str = "", note: str = "",
                      by: str = "user") -> dict[str, Any]:
         return self.planning.approve_plan(plan_id, approval_id=approval_id, note=note, by=by)
@@ -733,15 +740,32 @@ class Hub:
     def update_task_binding(self, uid: str, *, agent_id: str = "", model: str = "",
                             context_length: int | None = None,
                             capability_level: str | None = None,
-                            requeue: bool = False) -> dict[str, Any]:
+                            requeue: bool = False,
+                            stop_active: bool = False) -> dict[str, Any]:
         """Edit a chain node's agent/model/profile while the run is active."""
         task = self.store.get_task(uid)
         if not task:
             raise NotFoundError(f"任务不存在: {uid}")
         if task.status in ("completed", "canceled", "rejected"):
             raise ValidationError(f"任务已结束（{task.status}），不能再修改绑定")
-        if self.runner._is_active(uid):
-            raise ValidationError("该节点正在执行；请在节点结束/重试前修改")
+        was_active = bool(self.runner._is_active(uid)) or task.status in ("running", "verifying")
+        if was_active and not stop_active:
+            raise ValidationError(
+                "该节点正在执行；请在节点结束/重试前修改，"
+                "或勾选“停止当前尝试并改绑”后保存")
+        if was_active and stop_active:
+            # 2026-11-07 defect #9: a stuck node could only be rebound after
+            # its timeout.  Stopping is explicit, audited, and leaves the node
+            # ready for "retry" with the new binding.
+            self.runner.cancel_task(uid)
+            self.store.update_task(
+                uid, error="已按用户要求停止当前尝试并改绑；请点击“重试该节点”重新派发")
+            self.store.set_task_status(uid, "blocked", force=True)
+            self.audit.log("user", "task.stop_and_rebind", subject=uid, payload={
+                "agent_id": agent_id, "model": model,
+                "previous_agent": task.assigned_agent, "previous_model": task.spec.model,
+            })
+            task = self.store.get_task(uid) or task
         agent = self.get_agent(agent_id or task.assigned_agent or task.spec.suggested_agent)
         name = str(model or task.spec.model or "").strip()
         if not name:
@@ -781,7 +805,9 @@ class Hub:
         if requeue:
             # A relay/manual wait has no result; switching to an executable
             # agent must re-dispatch the same attempt-1 session/worktree.
-            if task.status in ("running", "verifying") or self.runner._is_active(uid):
+            if not stop_active and (
+                    task.status in ("running", "verifying")
+                    or self.runner._is_active(uid)):
                 raise ValidationError("该节点正在执行，不能改绑后立即重新派发")
             existing = self.store.get_result(uid)
             if existing and existing.get("valid"):
@@ -1160,7 +1186,8 @@ class Hub:
         agents = self.list_agents()
         rows = []
         for spec in segment.tasks:
-            candidates = policy.candidates(spec.role, agents=agents, catalog=catalog, limit=3)
+            candidates = policy.candidates(spec.role, agents=agents, catalog=catalog,
+                                           limit=3, heavy=spec_is_heavy(spec))
             rows.append({
                 "task": spec.to_dict(),
                 "candidates": [c.to_dict() for c in candidates],
@@ -1199,7 +1226,8 @@ class Hub:
             # Independent verification must not be the agent that did the work.
             exclude = executor_agents if spec.role == "verify" else set()
             candidates = policy.candidates(spec.role, agents=agents, catalog=catalog,
-                                           exclude=exclude)
+                                           exclude=exclude,
+                                           heavy=spec_is_heavy(spec))
             if not candidates:
                 notes.append(f"{spec.role}: 没有可用候选，任务将交给通用路由")
                 bindings.append({"task_id": spec.task_id, "role": spec.role,
@@ -1454,6 +1482,7 @@ class Hub:
             raise ValidationError("链路至少需要一个阶段")
         prepared = [self._prepare_chain_stage(raw, index)
                     for index, raw in enumerate(stages, start=1)]
+        heavy_warnings = self._chain_heavy_warnings(prepared, goal)
         # A model is a property of the task, not of the agent: the executor
         # reads ``task.spec.model`` first and only falls back to the agent's
         # selected model.
@@ -1490,6 +1519,7 @@ class Hub:
                 "plan_revision": plan.revision,
                 "plan_hash": plan.content_hash,
                 "stages": prepared,
+                "warnings": heavy_warnings,
                 "next": "到第 4 步批准计划，再点击开始执行",
             }
             if approve and not save_only:
@@ -1580,6 +1610,7 @@ class Hub:
             "run_id": "", "main_agent_id": main_agent_id or "",
             "stages": prepared, "approval_id": imported.get("approval_id", ""),
             "architecture_approval_id": imported.get("architecture_approval_id", ""),
+            "warnings": heavy_warnings,
             "next": "到第 4 步批准计划，再点击开始执行",
         }
         if save_only or not approve:
@@ -1610,6 +1641,29 @@ class Hub:
             self.start_run(run_id, max_parallel=max_parallel, background=background)
             outcome["status"] = "started"
         return outcome
+
+    def _chain_heavy_warnings(self, prepared: list[dict[str, Any]],
+                              goal: str) -> list[str]:
+        """Warn (do not block) when a heavy stage pins a free-tier model.
+
+        2026-11-07 defect #6: the WebUI chain bound opencode's free model to a
+        Blender/GLB rebuild and two 120-minute attempts timed out.  The pin is
+        the user's explicit decision, so saving stays possible with a visible
+        warning instead of a silent mid-run swap.
+        """
+        from .control.roles import classify_model, is_heavy_task
+        warnings: list[str] = []
+        for stage in prepared:
+            if classify_model(stage.get("model", "")) != "free":
+                continue
+            if not is_heavy_task(stage.get("title", ""), stage.get("objective", ""),
+                                 " ".join(stage.get("verification_commands") or []), goal):
+                continue
+            label = stage.get("task_id") or f"阶段{stage.get('stage')}"
+            warnings.append(
+                f"{label}: 重任务绑定了 free 档模型 {stage.get('model')}；"
+                "实测易长时间等待/超时，建议改用标准档模型")
+        return warnings
 
     def _prepare_chain_stage(self, raw: dict[str, Any], index: int) -> dict[str, Any]:
         agent_id = str(raw.get("agent_id") or "").strip()
@@ -1879,9 +1933,14 @@ class Hub:
     # ------------------------------------------------------------------
     def recommend_models(self, *, task_type: str = "analysis",
                          limit: int = 8,
-                         profile: str = "balanced") -> dict[str, Any]:
+                         profile: str = "balanced",
+                         objective: str = "", heavy: bool = False) -> dict[str, Any]:
         """Rank (agent, model) pairs by quality first, then by real cost."""
         from .control import trae_interface
+        from .control.roles import classify_model as _classify_model
+        from .control.roles import is_heavy_task
+
+        heavy = bool(heavy) or is_heavy_task(objective)
 
         required = set(TASK_CAPABILITY_REQUIREMENTS.get(task_type, set()))
         catalog = self.model_catalog.catalog()
@@ -1911,6 +1970,11 @@ class Hub:
                 if duration else 0.5
             for row in rows:
                 name = str(row["name"])
+                if str((row.get("health") or {}).get("status") or "") == "degraded":
+                    continue
+                if heavy and _classify_model(name) == "free":
+                    # Free tiers stall on Blender/GLB-scale work (defect #6).
+                    continue
                 rate = trae_rates.get(str(agent.adapter_config.get("gui_app") or ""), {}).get(name)
                 if "free" in name.lower():
                     cost, source = 0.0, "free_model"
@@ -1934,7 +1998,9 @@ class Hub:
                 })
         if not candidates:
             return {"task_type": task_type, "recommended": None,
-                    "candidates": [], "reason": "没有满足能力要求的 Agent/模型"}
+                    "candidates": [], "heavy": heavy,
+                    "reason": "没有满足能力要求的 Agent/模型"
+                              + ("（重任务已排除 free 档）" if heavy else "")}
         max_cost = max(c["cost"] for c in candidates) or 1.0
         for c in candidates:
             c["cost_score"] = round(1.0 - c["cost"] / max_cost, 4)
@@ -1961,7 +2027,7 @@ class Hub:
         ranked = sorted(candidates, key=lambda c: (-c["value"], c["cost"]))[:limit]
         return {"task_type": task_type, "required": sorted(required),
                 "profile": profile, "recommended": picked, "best_value": best,
-                "threshold": round(threshold, 4),
+                "threshold": round(threshold, 4), "heavy": heavy,
                 "note": ("质量取该 Agent 的历史 benchmark（无历史用 0.6 先验）；"
                          "成本优先取应用自身目录倍率，free 模型为 0，其余为估计值"),
                 "candidates": ranked}
@@ -2395,6 +2461,10 @@ class Hub:
     def close(self) -> None:
         try:
             self._heartbeat_stop.set()
+        except Exception:
+            pass
+        try:
+            self.planning.stop_watches()
         except Exception:
             pass
         try:

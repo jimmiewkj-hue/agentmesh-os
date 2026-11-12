@@ -394,3 +394,83 @@ def test_blender_is_resolved_from_its_standard_install_location():
     env = Verifier._command_env("blender -b -P tools/blender/build_all.py")
     assert "Blender" in env.get("PATH", "")
     assert Verifier._command_env("npm run build") == {}
+
+
+def _draft_evidence_task(git_repo, tmp_path, evidence):
+    verifier = build_verifier(git_repo)
+    wt = tmp_path / "wt_draft"
+    create_worktree(str(git_repo), str(wt), "HEAD")
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    draft = wt / ".agentloop-task" / "T1" / "attempt-1"
+    draft.mkdir(parents=True)
+    (draft / "build.log").write_text("build ok\n", encoding="utf-8")
+    patch = tmp_path / "draft.patch"
+    generate_patch(str(wt), str(patch))
+    task = Task(
+        uid="run:T1", project_id="prj", plan_id="plan", run_id="run",
+        spec=TaskSpec(task_id="T1", title="fix", objective="fix",
+                      type="implementation", scope=["calc.py"]),
+        status="verifying", base_commit="HEAD", workdir=str(wt),
+        patch_path=str(patch), task_dir=str(tmp_path / "td_draft"),
+    )
+    result = ResultPackage({
+        "task_id": "T1", "agent_id": "a", "status": "completed", "summary": "fixed",
+        "findings": [], "files_read": [], "files_changed": ["calc.py"],
+        "commands_run": [], "tool_calls": [], "tests": [],
+        "evidence": evidence,
+        "risks": [], "unresolved_items": [], "artifacts": [],
+        "token_usage": {}, "cost_estimate": {}, "recommended_next_action": [],
+    })
+    return verifier, task, result, wt
+
+
+def test_draft_evidence_resolves_against_execution_worktree(git_repo, tmp_path):
+    verifier, task, result, wt = _draft_evidence_task(
+        git_repo, tmp_path,
+        [{"file": "calc.py", "lines": "1-2"},
+         {"file": ".agentloop-task/T1/attempt-1/build.log", "description": "构建日志"}])
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["evidence_files"] == "passed", outcome.report.to_dict()
+    assert outcome.report.status != "failed"
+    assert outcome.report.evidence[0]["draft_evidence_from_execution_worktree"] == [
+        ".agentloop-task/T1/attempt-1/build.log"]
+    # The frozen verification tree must still not contain the draft directory.
+    assert not (Path(outcome.snapshot_dir) / ".agentloop-task").exists()
+
+
+def test_draft_evidence_missing_everywhere_still_fails(git_repo, tmp_path):
+    verifier, task, result, wt = _draft_evidence_task(
+        git_repo, tmp_path,
+        [{"file": ".agentloop-task/T1/attempt-1/absent.log"}])
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["evidence_files"] == "failed"
+    assert outcome.report.status == "failed"
+
+
+def test_non_draft_evidence_only_in_execution_worktree_still_fails(git_repo, tmp_path):
+    verifier, task, result, wt = _draft_evidence_task(git_repo, tmp_path, [])
+    (wt / "untracked-proof.txt").write_text("not in patch", encoding="utf-8")
+    result.payload["evidence"] = [{"file": "untracked-proof.txt"}]
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["evidence_files"] == "failed"
+
+
+def test_evidence_path_traversal_and_foreign_absolute_paths_fail(git_repo, tmp_path):
+    verifier, task, result, wt = _draft_evidence_task(git_repo, tmp_path, [])
+    outside = tmp_path / "outside.txt"
+    outside.write_text("foreign", encoding="utf-8")
+    result.payload["evidence"] = [
+        {"file": "../../outside.txt"},
+        {"file": str(outside)},
+    ]
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["evidence_files"] == "failed"
+    assert len(outcome.report.warnings) >= 1
+
+
+def test_absolute_draft_evidence_inside_execution_worktree_passes(git_repo, tmp_path):
+    verifier, task, result, wt = _draft_evidence_task(git_repo, tmp_path, [])
+    draft_file = wt / ".agentloop-task" / "T1" / "attempt-1" / "build.log"
+    result.payload["evidence"] = [{"file": str(draft_file)}]
+    outcome = verifier.verify(task, result)
+    assert outcome.report.checks["evidence_files"] == "passed", outcome.report.to_dict()

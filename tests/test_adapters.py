@@ -177,6 +177,104 @@ def test_opencode_adapter_health_and_missing_result_repair(tmp_path, monkeypatch
     assert outcome.status == "failed"
 
 
+def _opencode_scripted(monkeypatch, tmp_path, result_path, session_id, config=None):
+    from agentloop_hub.adapters import opencode as oc
+    from agentloop_hub.adapters.process import ProcessResult
+
+    fake = tmp_path / "opencode.exe"
+    fake.write_text("", encoding="utf-8")
+    agent = make_agent({
+        "executable": str(fake), "timeout_seconds": 60, "repair_attempts": 0,
+        **(config or {}),
+    }, adapter_type="opencode", level="L3")
+    adapter = OpenCodeAdapter(agent)
+    captured = {}
+
+    def fake_run(cmd, cwd=None, timeout=None, env=None):
+        captured["cmd"] = list(cmd)
+        result_path.write_text(json.dumps({"status": "completed", "summary": "ok"}),
+                               encoding="utf-8")
+        stdout = "\n".join([
+            json.dumps({"type": "step_start", "sessionID": session_id,
+                        "part": {"type": "step-start"}}),
+            json.dumps({"type": "text", "sessionID": session_id,
+                        "part": {"type": "text", "text": "OK"}}),
+            json.dumps({"type": "step_finish", "sessionID": session_id,
+                        "part": {"type": "step-finish",
+                                 "tokens": {"total": 10, "input": 5, "output": 5},
+                                 "cost": 0}}),
+        ])
+        return ProcessResult(command=list(cmd), exit_code=0, stdout=stdout,
+                             stderr="", duration_ms=10)
+
+    monkeypatch.setattr(oc, "run_process", fake_run)
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    task_dir = tmp_path / ".task"
+    task_dir.mkdir(exist_ok=True)
+    prompt = prompt_file(tmp_path)
+    return adapter, captured, work, task_dir, prompt
+
+
+def test_opencode_chain_resume_uses_session_flag(tmp_path, monkeypatch):
+    result_path = tmp_path / ".task" / "result.json"
+    (tmp_path / ".task").mkdir()
+    adapter, captured, work, task_dir, prompt = _opencode_scripted(
+        monkeypatch, tmp_path, result_path, "ses_prior")
+    req = ExecutionRequest("prj", str(tmp_path), make_task(work), str(work),
+                           str(task_dir), str(prompt), str(result_path),
+                           resume_session={"resume": True, "session_id": "ses_prior",
+                                           "workdir": str(work)})
+    outcome = adapter.execute(req)
+    assert outcome.status == "completed"
+    assert captured["cmd"][captured["cmd"].index("--session") + 1] == "ses_prior"
+    assert "--continue" not in captured["cmd"]
+    assert outcome.session_id == "ses_prior"
+    assert outcome.extras["interface"]["resumed_session_id"] == "ses_prior"
+
+
+def test_opencode_chain_resume_can_be_disabled(tmp_path, monkeypatch):
+    result_path = tmp_path / ".task" / "result.json"
+    (tmp_path / ".task").mkdir()
+    adapter, captured, work, task_dir, prompt = _opencode_scripted(
+        monkeypatch, tmp_path, result_path, "ses_new",
+        config={"chain_reuse_agent_sessions": False})
+    req = ExecutionRequest("prj", str(tmp_path), make_task(work), str(work),
+                           str(task_dir), str(prompt), str(result_path),
+                           resume_session={"resume": True, "session_id": "ses_prior"})
+    outcome = adapter.execute(req)
+    assert outcome.status == "completed"
+    assert "--session" not in captured["cmd"]
+    assert outcome.extras["interface"]["resumed_session_id"] == ""
+
+
+def test_opencode_first_node_starts_fresh_session(tmp_path, monkeypatch):
+    result_path = tmp_path / ".task" / "result.json"
+    (tmp_path / ".task").mkdir()
+    adapter, captured, work, task_dir, prompt = _opencode_scripted(
+        monkeypatch, tmp_path, result_path, "ses_first")
+    req = ExecutionRequest("prj", str(tmp_path), make_task(work), str(work),
+                           str(task_dir), str(prompt), str(result_path))
+    outcome = adapter.execute(req)
+    assert outcome.status == "completed"
+    assert "--session" not in captured["cmd"]
+    assert "--continue" not in captured["cmd"]
+    assert outcome.extras["interface"]["resumed_session_id"] == ""
+
+
+def test_opencode_resume_not_claimed_on_session_mismatch(tmp_path, monkeypatch):
+    result_path = tmp_path / ".task" / "result.json"
+    (tmp_path / ".task").mkdir()
+    adapter, captured, work, task_dir, prompt = _opencode_scripted(
+        monkeypatch, tmp_path, result_path, "ses_different")
+    req = ExecutionRequest("prj", str(tmp_path), make_task(work), str(work),
+                           str(task_dir), str(prompt), str(result_path),
+                           resume_session={"resume": True, "session_id": "ses_prior"})
+    outcome = adapter.execute(req)
+    assert outcome.status == "completed"
+    assert outcome.extras["interface"]["resumed_session_id"] == ""
+
+
 def test_file_relay_waiting_then_collects(tmp_path):
     work = tmp_path / "work"
     work.mkdir()

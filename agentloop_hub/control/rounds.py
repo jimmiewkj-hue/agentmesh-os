@@ -26,6 +26,18 @@ from typing import Any, Iterable
 
 from ..models import Task, TaskPlan, TaskSpec, TaskStatus, VerificationStatus
 
+# 2026-11-07 defect #7: the fallback planner told the agent to "git rm
+# --cached 并提交" while the plan forbade commits, and --cached produces no
+# patch diff, so verification failed on an empty patch.  These delivery rules
+# are restated in every fallback/replan task so recorded suggestions can never
+# override the control plane's actual delivery mechanism.
+DELIVERY_RULES = (
+    "成果只能以工作区文件变更（patch）交付；禁止 git commit/push。",
+    "`git rm --cached` 不产生补丁差异，禁止作为修复手段；"
+    "需要版本库停止跟踪某文件时写入 unresolved，由人类在合并阶段处理（若 scope 允许可修改 .gitignore）。",
+    "未解决项中的建议若与计划约束或上述规则冲突，以约束为准，并在成果包中说明冲突。",
+)
+
 FAILED_STATES = {
     TaskStatus.FAILED.value,
     TaskStatus.BLOCKED.value,
@@ -309,6 +321,16 @@ def fallback_specs(*, plan: TaskPlan, tasks: list[Task], summary: dict[str, Any]
     deps = _prior_dependencies(tasks)
     unresolved = decision.unresolved or ["上一轮未通过验收，但未记录具体原因"]
     bullet = "\n".join(f"- {item}" for item in unresolved[:12])
+    constraints = [str(item).strip() for item in (plan.constraints or [])
+                   if str(item).strip()]
+    constraint_block = ""
+    if constraints:
+        constraint_block = (
+            "任务约束（强制，逐条遵守）：\n"
+            + "\n".join(f"- {item}" for item in constraints) + "\n")
+    delivery_block = (
+        "交付机制（强制）：\n"
+        + "\n".join(f"- {item}" for item in DELIVERY_RULES) + "\n")
     impl_id = f"R{round_number}_T001"
     commands = _fallback_commands(tasks, test_command)
     implementation = TaskSpec(
@@ -321,6 +343,7 @@ def fallback_specs(*, plan: TaskPlan, tasks: list[Task], summary: dict[str, Any]
         objective=(
             f"第 {round_number} 轮续跑：原始目标“{plan.goal}”上一轮未通过。"
             f"上一轮结论：{summary.get('completion') or '未说明'}。\n"
+            f"{constraint_block}{delivery_block}"
             f"请先读取当前工作区（已包含上一轮依赖任务补丁），只修复以下未解决项，"
             f"不要重复已完成工作；必须给出文件定位与命令/测试证据。\n{bullet}"
         ),

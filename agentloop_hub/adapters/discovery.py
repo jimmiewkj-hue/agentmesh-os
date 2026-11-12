@@ -346,10 +346,19 @@ QODER_CN_MODEL_ALIASES = {"dfmodel": "DeepSeek-Flash"}
 WORKBUDDY_MODEL_ALIASES = {"glm-5.3-flash": "GLM-5.3-Flash"}
 
 
-def _models_from_qoder_cn(home: Path, projects: Path | None) -> list[str]:
+def _models_from_qoder_cn(home: Path, projects: Path | None,
+                          appdata: Path | None = None) -> list[str]:
     models = set(_models_from_jsonl_projects(projects, kind="qoder")) if projects else set()
-    catalog = home / ".qoder-cn" / ".models"
-    if catalog.exists() or "dfmodel" in models:
+    try:
+        from ..control.interfaces import list_qoder_models
+        root = (appdata or Path(os.environ.get("APPDATA") or "")) / "com.qodercn.app.stable"
+        models.update(row["id"] for row in list_qoder_models({
+            "qoder_db": str(root / "main.sqlite"),
+            "qoder_local_storage": str(root / "Local Storage" / "leveldb"),
+        }))
+    except Exception:
+        pass
+    if not models:
         models.update(QODER_CN_MODEL_ALIASES)
         models.update(QODER_CN_MODEL_ALIASES.values())
     return sorted(models)
@@ -424,7 +433,7 @@ def detect_models_for_agent(agent: AgentRecord, ctx: DiscoveryContext | None = N
     if reader == "qoder":
         projects = data_path or ctx.home / ".qoder" / "projects"
         if agent.agent_id == "qoder_cn":
-            return _models_from_qoder_cn(ctx.home, projects)
+            return _models_from_qoder_cn(ctx.home, projects, ctx.appdata)
         try:
             from ..control.interfaces import list_qoder_models
             rows = list_qoder_models({"qoder_db": str(cfg.get("qoder_db") or "")})
@@ -717,7 +726,7 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         structured=qoder_cn_gui,
         adapter_type=AdapterType.GUI_AUTOMATION.value if qoder_cn_gui else AdapterType.FILE_RELAY.value,
         adapter_config=qoder_cn_config,
-        models=_models_from_qoder_cn(ctx.home, qoder_cn_projects),
+        models=_models_from_qoder_cn(ctx.home, qoder_cn_projects, ctx.appdata),
         version=_qoder_cn_version(ctx.home) if _qoder_cn_version(ctx.home) != "unknown"
         else _read_version_from_exe(qoder_cn_exe),
     )
@@ -738,13 +747,46 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         ctx.localappdata / "Programs" / "ZCode" / "ZCode.exe",
     ])
     zcode_rollout = ctx.home / ".zcode" / "cli" / "rollout"
-    out.append(_make_agent(
+    # The desktop install ships a headless CLI core (resources/glm/zcode.cjs).
+    # With ELECTRON_RUN_AS_NODE=1 it runs without the GUI, so ZCode is L3:
+    # zero-input prompt + model pinning via a temporary provider config copy.
+    zcode_cjs = zcode_exe.parent.joinpath("resources", "glm", "zcode.cjs") if zcode_exe else None
+    zcode_cli = bool(zcode_exe and zcode_cjs and zcode_cjs.exists())
+    zcode_config = {
+        "mode": "zcode_cli" if zcode_cli else "file_relay",
+        "zcode_exe": str(zcode_exe) if zcode_exe else "",
+        "zcode_cjs": str(zcode_cjs) if zcode_cjs and zcode_cjs.exists() else "",
+        "executable": str(zcode_exe) if zcode_exe else "",
+        "permission_mode": "yolo",
+        "model_retry_max_retries": 1,
+        "timeout_seconds": 1800,
+        "repair_attempts": 1,
+        "session_reader": "zcode",
+        "data_path": str(zcode_rollout),
+        "provider_config": str(ctx.home / ".zcode" / "v2" / "provider_config.json"),
+    }
+    zcode_record = _make_agent(
         agent_id="zcode", name="ZCode", product="ZCode", edition="domestic",
         exe=zcode_exe, data_path=zcode_rollout if zcode_rollout.exists() else (ctx.home / ".zcode" if (ctx.home / ".zcode").exists() else None),
         reader="zcode", project_id=project_id,
-        access_level=AccessLevel.L2.value if zcode_exe or zcode_rollout.exists() else AccessLevel.L1.value,
-        structured=False, models=_models_from_zcode(ctx.home / ".zcode", zcode_rollout),
-    ))
+        access_level=AccessLevel.L3.value if zcode_cli else (
+            AccessLevel.L2.value if zcode_exe or zcode_rollout.exists() else AccessLevel.L1.value),
+        structured=zcode_cli,
+        adapter_type=AdapterType.ZCODE.value if zcode_cli else AdapterType.FILE_RELAY.value,
+        adapter_config=zcode_config,
+        models=_models_from_zcode(ctx.home / ".zcode", zcode_rollout),
+    )
+    if zcode_cli:
+        zcode_record.capabilities.update({
+            "auto_executable": True, "structured_output": True, "background": True,
+        })
+        zcode_record.extra["zcode_cli"] = {
+            "entrypoint": str(zcode_cjs),
+            "prompt_flag": "-p",
+            "json_output": True,
+            "model_pinning": "temp provider config (providerOrder/modelOrder)",
+        }
+    out.append(zcode_record)
 
     # --- WorkBuddy --------------------------------------------------------
     wb_exe = _first_existing([
@@ -811,16 +853,50 @@ def discover_agents(project_id: str = "", ctx: DiscoveryContext | None = None) -
         ctx.programfiles / "DeepSeek Harness" / "DeepSeek Harness.exe",
     ])
     dsh_sessions = ctx.home / ".dsh" / "sessions"
-    out.append(_make_agent(
+    # The desktop install ships a headless profile booted through the Electron
+    # binary in Node mode (resources/app.asar/.../cli.js --profile headless
+    # --json). With a real exe + asar archive dsh is L3: zero-input prompt,
+    # JSON run events and --session-id continuity. Credentials gate execution
+    # (MISSING_CREDENTIAL), not the channel's programmability.
+    from .dsh import resolve_dsh_install
+    dsh_exe_resolved, dsh_cli = resolve_dsh_install({"dsh_exe": str(dsh_exe) if dsh_exe else ""})
+    dsh_headless = bool(dsh_exe_resolved and dsh_cli)
+    dsh_config = {
+        "mode": "dsh_cli" if dsh_headless else "file_relay",
+        "dsh_exe": dsh_exe_resolved,
+        "dsh_cli": dsh_cli,
+        "executable": dsh_exe_resolved,
+        "profile": "headless",
+        "timeout_seconds": 1800,
+        "repair_attempts": 1,
+        "session_reader": "dsh",
+        "data_path": str(dsh_sessions),
+    }
+    dsh_record = _make_agent(
         agent_id="dsh", name="DeepSeek Harness", product="DeepSeek Harness", edition="domestic",
         exe=dsh_exe,
         data_path=dsh_sessions if dsh_sessions.exists() else (ctx.home / ".dsh" if (ctx.home / ".dsh").exists() else None),
         reader="dsh", project_id=project_id,
-        access_level=AccessLevel.L2.value if dsh_exe or dsh_sessions.exists() else AccessLevel.L1.value,
-        structured=False,
+        access_level=AccessLevel.L3.value if dsh_headless else (
+            AccessLevel.L2.value if dsh_exe or dsh_sessions.exists() else AccessLevel.L1.value),
+        structured=dsh_headless,
+        adapter_type=AdapterType.DSH.value if dsh_headless else AdapterType.FILE_RELAY.value,
+        adapter_config=dsh_config,
         models=sorted(set(_models_from_dsh_sessions(dsh_sessions))
                       | set(_models_from_dsh(ctx.home / ".dsh"))),
-    ))
+    )
+    if dsh_headless:
+        dsh_record.capabilities.update({
+            "auto_executable": True, "structured_output": True, "background": True,
+        })
+        dsh_record.extra["dsh_cli"] = {
+            "entrypoint": dsh_cli,
+            "profile": "headless",
+            "json_output": True,
+            "session_resume": "--session-id",
+            "credential": "DEEPSEEK_API_KEY or a provider plugin patched into the headless profile",
+        }
+    out.append(dsh_record)
 
     # --- OpenCode (only real non-interactive CLI on this machine) ----------
     oc_exe = resolve_opencode_executable()

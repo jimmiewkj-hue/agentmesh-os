@@ -240,3 +240,230 @@ def test_workbuddy_active_sessions_use_latest_timestamp(tmp_path):
     )
     active = reader.active_sessions(max_idle_seconds=900)
     assert [item["id"] for item in active] == ["sess-active"]
+
+
+def _trae_reader(tmp_path, **config):
+    return TraeReader(trae_cn_profile(), config,
+                      state_reader=lambda: trae.TraeState(
+                          app="trae_cn", uid="u1",
+                          db=tmp_path / "state.vscdb", items={}),
+                      text_reader=lambda: {"ok": True, "text": ""})
+
+
+def test_trae_receipt_accepts_attempt_result_file(tmp_path, monkeypatch):
+    reader = _trae_reader(tmp_path)
+    result_file = tmp_path / "result.json"
+    result_file.write_text('{"task_id": "T1", "summary": "done"}', encoding="utf-8")
+    reader.completion_path = str(result_file)
+    receipt = reader.has_marker("M1")
+    assert receipt["ok"] is True
+    assert receipt["source"] == "attempt-result-file"
+
+
+def test_trae_receipt_invalid_result_file_falls_through(tmp_path, monkeypatch):
+    reader = _trae_reader(tmp_path)
+    result_file = tmp_path / "result.json"
+    result_file.write_text("half-written {", encoding="utf-8")
+    reader.completion_path = str(result_file)
+    monkeypatch.setattr(trae, "trae_marker_in_transcript",
+                        lambda *a, **k: {"found": False, "reason": "MARKER_NOT_FOUND"})
+    receipt = reader.has_marker("M1")
+    assert receipt["ok"] is False
+
+
+def test_trae_receipt_accepts_marker_rendered_outside_composer(tmp_path, monkeypatch):
+    reader = _trae_reader(tmp_path)
+    monkeypatch.setattr(trae, "trae_marker_in_transcript",
+                        lambda *a, **k: {"found": True, "outside": 1, "inside": 0,
+                                         "page_id": "P1"})
+    receipt = reader.has_marker("M1")
+    assert receipt["ok"] is True
+    assert receipt["source"] == "cdp-transcript"
+
+
+def test_trae_receipt_rejects_marker_only_in_composer(tmp_path, monkeypatch):
+    reader = _trae_reader(tmp_path)
+    monkeypatch.setattr(trae, "trae_marker_in_transcript",
+                        lambda *a, **k: {"found": False, "in_composer_only": True,
+                                         "outside": 0, "inside": 1})
+    receipt = reader.has_marker("M1")
+    assert receipt["ok"] is False
+    assert receipt["reason"] == "MARKER_ONLY_IN_COMPOSER"
+
+
+def test_trae_receipt_unknown_without_any_evidence(tmp_path, monkeypatch):
+    reader = _trae_reader(tmp_path)
+    monkeypatch.setattr(trae, "trae_marker_in_transcript",
+                        lambda *a, **k: {"found": False, "reason": "MARKER_NOT_FOUND"})
+    receipt = reader.has_marker("M1")
+    assert receipt["ok"] is False
+    assert receipt["reason"] == "MARKER_NOT_FOUND"
+
+
+def test_trae_marker_probe_scans_all_pages_and_pins_first(monkeypatch):
+    from agentloop_hub.gui import cdp as cdp_module
+
+    class FakeTransport:
+        def __init__(self, url, *, origin="", timeout=8):
+            self.page_id = url.rsplit("/", 1)[-1]
+
+        def close(self):
+            pass
+
+    probes = {"P1": {"found": False, "inside": 1, "outside": 0},
+              "P2": {"found": True, "inside": 0, "outside": 1}}
+    seen: list[str] = []
+
+    def fake_evaluate(transport, expression, timeout):
+        seen.append(transport.page_id)
+        assert "M1" in expression
+        return probes[transport.page_id]
+
+    monkeypatch.setattr(cdp_module, "_targets", lambda port: [
+        {"type": "page", "id": pid, "webSocketDebuggerUrl": f"ws://fake/{pid}"}
+        for pid in ("P1", "P2")])
+    monkeypatch.setattr(cdp_module, "WebSocketTransport", FakeTransport)
+    monkeypatch.setattr(cdp_module, "_evaluate", fake_evaluate)
+    found = trae.trae_marker_in_transcript(9342, "M1", page_id="P2")
+    assert found["found"] is True
+    assert seen[0] == "P2"
+    probes["P2"] = {"found": False}
+    probes["P1"] = {"found": True, "outside": 1}
+    found = trae.trae_marker_in_transcript(9342, "M1")
+    assert found["found"] is True
+    assert found["page_id"] == "P1"
+
+
+def test_adapter_reconcile_accepts_trae_attempt_result(tmp_path):
+    from agentloop_hub.adapters.gui import GuiAutomationAdapter
+    from test_gui_adapter import make_agent
+
+    agent = make_agent("trae_cn")
+    agent.agent_id = "trae_cn"
+    adapter = GuiAutomationAdapter(
+        agent, config={"mode": "gui_automation", "gui_app": "trae_cn"})
+    adapter._reader = _trae_reader(tmp_path)
+    result_file = tmp_path / "attempt-result.json"
+    result_file.write_text(json.dumps({
+        "task_id": "T008", "agent_id": "trae_cn", "status": "completed",
+        "summary": "评审完成",
+    }), encoding="utf-8")
+    attempt = {
+        "attempt_id": "att_1",
+        "binding": {"marker": "M1"},
+        "result_path": str(result_file),
+    }
+    receipt = adapter.reconcile_submission(attempt)
+    assert receipt["status"] == "accepted"
+    assert receipt["evidence"]["source"] == "attempt-result-file"
+    assert receipt["package"]["summary"] == "评审完成"
+    assert adapter._reader.completion_path == str(result_file)
+
+
+def _hollow_trae_state(tmp_path, messages=0, status=""):
+    session = {"sessionId": "s1", "messageIds": [f"m{i}" for i in range(messages)]}
+    if status:
+        session["assistant_task_status"] = status
+    items = {
+        "solo-lite-mode-state-map-u1": json.dumps({"code": {"session": session}}),
+        "u1:AI.agent.model.recent_user_selection_by_agent_label": json.dumps(
+            {"SOLO": {"modelId": "solo_agent_1__deepseek-v4.1-flash"}}),
+    }
+    return trae.TraeState(app="trae_cn", uid="u1",
+                          db=tmp_path / "state.vscdb", items=items)
+
+
+def _seq_reader(values):
+    box = {"i": 0}
+
+    def next_value():
+        value = values[min(box["i"], len(values) - 1)]
+        box["i"] += 1
+        return value
+    return next_value
+
+
+def test_trae_reader_fallback_when_global_state_is_hollow(tmp_path):
+    """2026-11-11 real defect: messageIds=0 / no assistant_task_status while
+    the window had finished; the reader must accept DOM + result-file proof."""
+    marker = "AGENTMESH_GUI_MARKER_HOLLOW"
+    state = _hollow_trae_state(tmp_path)
+    result_file = tmp_path / "plan.json"
+    result_file.write_text('{"plan_version": 1, "goal": "g", "tasks": []}',
+                           encoding="utf-8")
+    final = (f"user prompt {marker}\n展示更多\nTRAE 思考用时 3m 33s\n"
+             "已创建 1 个文件\n```json\n{\"plan_version\": 1}\n```")
+    texts = [f"user prompt {marker}", final, final, final]
+    seq_texts = _seq_reader(texts)
+    reader = TraeReader(
+        trae_cn_profile(),
+        {"trae_poll_seconds": 0.01, "trae_stable_seconds": 0.01},
+        state_reader=lambda: state,
+        text_reader=lambda: {"ok": True, "text": seq_texts()},
+    )
+    reader.completion_path = str(result_file)
+    reply = reader.wait_reply(marker, started_at=time.time(), timeout=2,
+                              stall_seconds=5, expected_model="deepseek-v4.1-flash")
+    assert reply.session_id == "s1"
+    assert "plan_version" in reply.text
+
+
+def test_trae_reader_fallback_needs_evidence(tmp_path):
+    from agentloop_hub.gui.base import GuiAutomationError
+    marker = "AGENTMESH_GUI_MARKER_NOEVIDENCE"
+    state = _hollow_trae_state(tmp_path)
+    text = f"user prompt {marker}\nTRAE\n一些回复但没有完成证据"
+    reader = TraeReader(
+        trae_cn_profile(),
+        {"trae_poll_seconds": 0.01, "trae_stable_seconds": 0.01},
+        state_reader=lambda: state,
+        text_reader=lambda: {"ok": True, "text": text},
+    )
+    import pytest
+    with pytest.raises(GuiAutomationError):
+        reader.wait_reply(marker, started_at=time.time(), timeout=0.3,
+                          stall_seconds=5)
+
+
+def test_trae_reader_fallback_disabled_when_state_available(tmp_path):
+    from agentloop_hub.gui.base import GuiAutomationError
+    marker = "AGENTMESH_GUI_MARKER_WORKING"
+    state = _hollow_trae_state(tmp_path, messages=2, status="working")
+    result_file = tmp_path / "plan.json"
+    result_file.write_text('{"plan_version": 1}', encoding="utf-8")
+    text = f"user prompt {marker}\nTRAE 思考用时 1m\nreply"
+    reader = TraeReader(
+        trae_cn_profile(),
+        {"trae_poll_seconds": 0.01, "trae_stable_seconds": 0.01},
+        state_reader=lambda: state,
+        text_reader=lambda: {"ok": True, "text": text},
+    )
+    reader.completion_path = str(result_file)
+    import pytest
+    with pytest.raises(GuiAutomationError):
+        reader.wait_reply(marker, started_at=time.time(), timeout=0.3,
+                          stall_seconds=5)
+
+
+def test_send_trae_prompt_reports_ok(monkeypatch):
+    """The receipt gate reads result['ok']; a successful click must set it."""
+    import agentloop_hub.gui.cdp as cdp_mod
+    monkeypatch.setattr(trae, "dismiss_trae_trust_dialog",
+                        lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(trae, "pick_trae_page",
+                        lambda *a, **k: {"id": "P1", "webSocketDebuggerUrl": "ws://x"})
+    monkeypatch.setattr(cdp_mod, "send_prompt_via_cdp", lambda *a, **k: {"ok": True})
+
+    class FakeTransport:
+        def __init__(self, *a, **k):
+            pass
+
+        def close(self):
+            pass
+    monkeypatch.setattr(cdp_mod, "WebSocketTransport", FakeTransport)
+    monkeypatch.setattr(cdp_mod, "_evaluate",
+                        lambda *a, **k: {"ok": True, "method": "class-click"})
+    result = trae.send_trae_prompt("hello", submit_retries=1)
+    assert result["ok"] is True
+    assert result["page_id"] == "P1"
+    assert result["submit"]["ok"] is True

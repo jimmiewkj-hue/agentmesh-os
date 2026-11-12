@@ -10,7 +10,10 @@ import pytest
 from agentloop_hub.control.zero_input import (
     OsInputBlocked, current_policy, os_input_allowed, require_os_input, status,
 )
-from agentloop_hub.gui.cdp import SUBMIT_JS, send_prompt_via_cdp
+from agentloop_hub.gui.cdp import (
+    SUBMIT_JS, qoder_model_catalog_via_cdp, select_qoder_model_via_cdp,
+    send_prompt_via_cdp,
+)
 from agentloop_hub.gui.base import GuiAutomationError
 
 
@@ -164,6 +167,76 @@ def test_cdp_missing_submit_button_is_explicit():
         send_prompt_via_cdp("x", transport=transport, submit_retries=1)
     assert info.value.code == "GUI_SEND_FAILED"
     assert info.value.details["submit"]["reason"] == "NO_SUBMIT"
+
+
+def test_qoder_model_selection_uses_menu_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTLOOP_HOME", str(tmp_path))
+    closed = {"open": False, "trigger": [864, 720, 76, 28],
+              "trigger_text": "Auto", "items": []}
+    opened = {"open": True, "trigger": [864, 720, 76, 28],
+              "trigger_text": "Auto",
+              "items": [{"key": "auto", "label": "Auto", "selected": True,
+                         "rect": [633, 430, 295, 34]},
+                        {"key": "qmodel_latest", "label": "Qwen4-Max-Preview",
+                         "selected": False, "rect": [633, 461, 295, 34]}]}
+    selected = {"open": False, "trigger": [752, 720, 188, 28],
+                "trigger_text": "Qwen4-Max-Preview\n极高", "items": []}
+    transport = FakeTransport([
+        _value(closed),                       # probe: menu closed
+        {}, {}, {},                           # mouse move/press/release
+        _value(opened),                       # menu is open
+        _value({"x": 780, "y": 478, "w": 295, "h": 34,
+                "label": "Qwen4-Max-Preview"}),  # scroll + item point
+        {}, {}, {},                           # click the item
+        _value(selected),                     # trigger now shows the model
+    ])
+    result = select_qoder_model_via_cdp("qmodel_latest", port=9222,
+                                        transport=transport)
+    assert result["ok"] is True
+    assert result["label"] == "Qwen4-Max-Preview"
+    inputs = [params for method, params in transport.calls
+              if method == "Input.dispatchMouseEvent"]
+    assert len(inputs) == 6
+    assert all(params["type"] in ("mouseMoved", "mousePressed", "mouseReleased")
+               for params in inputs)
+    cache = tmp_path / "qoder-models.json"
+    assert cache.is_file()
+    assert "Qwen4-Max-Preview" in cache.read_text(encoding="utf-8")
+
+
+def test_qoder_model_selection_already_selected(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTLOOP_HOME", str(tmp_path))
+    opened = {"open": True, "trigger": [752, 720, 188, 28],
+              "trigger_text": "Qwen4-Max-Preview\n极高",
+              "items": [{"key": "qmodel_latest", "label": "Qwen4-Max-Preview",
+                         "selected": True, "rect": [633, 461, 295, 34]}]}
+    transport = FakeTransport([
+        _value(opened),
+        _value(None),   # close via Escape
+    ])
+    result = select_qoder_model_via_cdp("qmodel_latest", port=9222,
+                                        transport=transport)
+    assert result == {"ok": True, "already": True, "model": "qmodel_latest",
+                      "label": "Qwen4-Max-Preview"}
+    assert not any(method == "Input.dispatchMouseEvent"
+                   for method, _ in transport.calls)
+
+
+def test_qoder_catalog_reads_keys_and_labels(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTLOOP_HOME", str(tmp_path))
+    opened = {"open": True, "trigger": [752, 720, 188, 28],
+              "trigger_text": "Qwen4-Max-Preview\n极高",
+              "items": [
+                  {"key": "auto", "label": "Auto", "selected": False,
+                   "rect": [633, 430, 295, 34]},
+                  {"key": "qmodel_latest", "label": "Qwen4-Max-Preview",
+                   "selected": True, "rect": [633, 461, 295, 34]},
+              ]}
+    transport = FakeTransport([_value(opened), _value(None)])
+    result = qoder_model_catalog_via_cdp(port=9222, transport=transport)
+    assert result["ok"] is True
+    assert [item["key"] for item in result["items"]] == ["auto", "qmodel_latest"]
+    assert result["items"][1]["label"] == "Qwen4-Max-Preview"
 
 
 def _record(agent_id, **overrides):

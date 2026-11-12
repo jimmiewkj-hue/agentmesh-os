@@ -47,6 +47,7 @@ from ..connectors import (
 from ..errors import ValidationError
 from ..models import AgentRecord, TaskType
 from ..util import read_json, read_text, write_json
+from .model_health import is_degraded
 
 TIER_LABELS: dict[int, str] = {
     0: "local",
@@ -78,6 +79,28 @@ def classify_model(name: str) -> str:
         if any(key in text for key in keys):
             return label
     return "standard"
+
+
+# 2026-11-07 defect #6: a free-tier model spent 2x120 minutes on a Blender/GLB
+# rebuild that a standard model finished in 51-85 minutes.  Heavy work is
+# detected from the task's own words/commands, and free tiers are skipped for
+# it at planning/recommendation time (never silently mid-execution).
+HEAVY_TASK_MARKERS = (
+    "blender", ".glb", ".gltf", "三维", "3d", "重建", "渲染", "实机",
+    "帧率", "fps", "draw call", "三角面", "场景搭建", "大规模扫描", "全量扫描",
+)
+
+
+def is_heavy_task(*texts: str) -> bool:
+    blob = " ".join(str(t or "") for t in texts).lower()
+    return any(marker in blob for marker in HEAVY_TASK_MARKERS)
+
+
+def spec_is_heavy(spec: Any) -> bool:
+    return is_heavy_task(
+        getattr(spec, "title", ""), getattr(spec, "objective", ""),
+        " ".join(getattr(spec, "verification_commands", None) or []),
+        " ".join(getattr(spec, "scope", None) or []))
 
 
 def _access_rank(level: str) -> int:
@@ -471,7 +494,8 @@ class RolePolicy:
     def candidates(self, role_name: str, *, agents: list[AgentRecord],
                    catalog: dict[str, list[str]], exclude: Iterable[str] = (),
                    min_tier: int = 0, max_tier: int | None = None,
-                   require_auto: bool = True, limit: int = 0) -> list[Candidate]:
+                   require_auto: bool = True, limit: int = 0,
+                   heavy: bool = False) -> list[Candidate]:
         """Expand a role's ladder against the *real* catalog.
 
         A ladder rung with no matching model simply produces nothing; the next
@@ -501,6 +525,10 @@ class RolePolicy:
                 if require_auto and not is_auto_executable(agent):
                     continue
                 for model_rank, model in enumerate(self._models_in_rule(rule, catalog, agent)):
+                    if is_degraded(agent, model):
+                        continue
+                    if heavy and classify_model(model) == "free":
+                        continue
                     key = f"{agent.agent_id}::{model}"
                     if key in seen:
                         continue

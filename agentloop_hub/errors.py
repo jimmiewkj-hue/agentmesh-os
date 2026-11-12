@@ -31,6 +31,10 @@ class ConflictError(HubError):
     code = "conflict"
 
 
+class SessionComposeConflictError(ConflictError):
+    code = "session_compose_conflict"
+
+
 class PermissionDeniedError(HubError):
     code = "permission_denied"
 

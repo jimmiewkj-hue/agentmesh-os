@@ -630,7 +630,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.recommend_models(
                     task_type=query.get("task_type", "analysis"),
                     limit=int(query.get("limit", "8") or 8),
-                    profile=query.get("profile", "balanced")))
+                    profile=query.get("profile", "balanced"),
+                    objective=query.get("objective", ""),
+                    heavy=str(query.get("heavy", "")).lower() in ("1", "true", "yes")))
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "bindings":
                 self._json(200, hub.run_bindings(parts[2]))
@@ -646,6 +648,9 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 return
             if path == "/api/plans":
                 self._json(200, {"plans": hub.plans(limit=int(query.get("limit", "50")))})
+                return
+            if path == "/api/plans/watches":
+                self._json(200, {"watches": hub.plan_watches()})
                 return
             if len(parts) == 3 and parts[1] == "plans":
                 self._json(200, hub.plan(parts[2]))
@@ -673,6 +678,30 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                     raise NotFoundError("该任务没有 Patch")
                 text = patch_path.read_text(encoding="utf-8", errors="replace")
                 self._json(200, {"task_uid": task.uid, "patch": text})
+                return
+            if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "attempts":
+                task = hub.task(parts[2])
+                attempts = []
+                for row in hub.store.list_attempts(task.uid):
+                    result_path = Path(str(row.get("result_path") or ""))
+                    attempts.append({
+                        "attempt_id": row.get("attempt_id"),
+                        "attempt_number": row.get("attempt_number"),
+                        "status": row.get("status"),
+                        "purpose": row.get("purpose"),
+                        "request_id": row.get("request_id"),
+                        "session_id": row.get("session_id"),
+                        "result_path": str(result_path),
+                        "result_exists": bool(result_path.is_file()
+                                              and result_path.stat().st_size > 0),
+                        "error": str(row.get("error") or "")[:300],
+                        "created_at": row.get("created_at"),
+                        "finished_at": row.get("finished_at"),
+                        "active": row.get("attempt_id") == task.active_attempt_id,
+                    })
+                self._json(200, {"task_uid": task.uid,
+                                 "active_attempt_id": task.active_attempt_id,
+                                 "attempts": attempts})
                 return
             if len(parts) == 3 and parts[1] == "tasks":
                 level = query.get("level", "findings")
@@ -747,6 +776,12 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
             if path == "/api/memory/bootstrap":
                 self._json(200, hub.bootstrap(agent_id=query.get("agent_id", ""),
                                               scope=query.get("scope", "")))
+                return
+            if path == "/api/tools/web_search":
+                from ..control.tools import web_search
+                self._json(200, web_search(
+                    query.get("q", "") or query.get("query", ""),
+                    max_results=int(query.get("max_results", "5") or 5)))
                 return
             if len(parts) == 3 and parts[1] == "governance":
                 self._json(200, hub.governance_status(parts[2]))
@@ -1052,7 +1087,22 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                 self._json(200, hub.request_release(parts[2]))
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "summary":
-                self._json(200, hub.submit_summary(parts[2], body.get("summary") or body))
+                payload = body.get("summary")
+                path = body.get("path") or body.get("summary_path")
+                if payload is None and path:
+                    # 2026-11-07 defect #9: the close-out channel only accepted
+                    # inline JSON; a path is resolved inside the project.
+                    candidate = Path(str(path))
+                    if not candidate.is_absolute():
+                        candidate = Path(hub.project.root) / candidate
+                    resolved = candidate.resolve()
+                    if not resolved.is_relative_to(Path(hub.project.root).resolve()):
+                        raise ValidationError("汇总文件只能位于项目目录内")
+                    if not resolved.is_file():
+                        raise NotFoundError(f"汇总文件不存在: {resolved}")
+                    payload = resolved
+                self._json(200, hub.submit_summary(
+                    parts[2], payload if payload is not None else body))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] in ("result", "submit-result"):
                 self._json(200, hub.submit_result(
@@ -1092,6 +1142,7 @@ def _make_handler(hub: Hub | None, jobs: JobManager,
                     capability_level=(str(body.get("capability_level"))
                                       if body.get("capability_level") is not None else None),
                     requeue=bool(body.get("requeue", False)),
+                    stop_active=bool(body.get("stop_active", False)),
                 ))
                 return
             if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "cancel":

@@ -11,6 +11,7 @@ const state = {
   chainDraft: null, chainRunId: '', chainTimer: null,
   chainHydratedFor: '', chainPersistTimer: null, manualAlertKey: '',
   bindingTask: null,
+  summaryRun: '', adoptTask: null, textInputCallback: null,
   // Which control last changed the main model.  Save and plan generation must
   // read the same canonical value, not two competing fields.
   mainModelSource: 'select',
@@ -276,7 +277,9 @@ function modelOptions(agentId, selected) {
     const label = (m.display_name && m.display_name !== m.name)
       ? `${baseLabel} (${m.name})` : baseLabel;
     const rate = (m.rate != null) ? ` · x${m.rate}` : '';
-    html += `<option value="${esc(m.name)}" ${m.name === selected ? 'selected' : ''}>${esc(label)}${rate} · ${esc(m.source_label || m.source)}</option>`;
+    const degraded = ((m.health || {}).status === 'degraded')
+      ? ` · ⚠${(m.health || {}).reason || '已降级'}` : '';
+    html += `<option value="${esc(m.name)}" ${m.name === selected ? 'selected' : ''}>${esc(label)}${rate}${esc(degraded)} · ${esc(m.source_label || m.source)}</option>`;
   });
   if (selected && !names.includes(selected)) {
     html += `<option value="${esc(selected)}" selected>${esc(selected)} · 手动</option>`;
@@ -460,7 +463,8 @@ function onMainAgentChange() {
   fillProfileInputs('mainContext', 'mainCapability', id,
     $('mainModelSelect').value || entry.selected_model || '');
   $('mainInfo').innerHTML = entry.models && entry.models.length
-    ? `该 Agent 已探测到 ${entry.models.length} 个模型：${entry.models.map((m) => esc(m.name)).join(', ')}`
+    ? `该 Agent 已探测到 ${entry.models.length} 个模型：${entry.models.map((m) => esc(m.name)
+        + ((m.health || {}).status === 'degraded' ? '（已降级）' : '')).join(', ')}`
     : '该 Agent 暂未探测到模型；可手填模型名。';
 }
 function syncMainCustom() {
@@ -588,6 +592,7 @@ function renderCommandRun() {
     ${['running', 'waiting_user', 'paused'].includes(run.status)
       ? `<button class="danger" onclick="cancelRun('${esc(run.run_id)}')">停止运行（取消节点）</button>` : ''}
     ${['waiting_user', 'paused'].includes(run.status) && !manualSubmit && !pendingHighRisk.length ? `<button class="primary" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
+    ${['running', 'waiting_user', 'paused'].includes(run.status) ? `<button onclick="openSummaryModal('${esc(run.run_id)}')">回填汇总 JSON</button>` : ''}
     ${manualSubmit ? '<span class="sub">已阻塞：请按弹窗提示在 Agent 应用中点击发送，完成后会自动继续</span>' : ''}
     ${pendingHighRisk.length ? '<span class="sub">存在待批准的高风险操作，请在上方弹窗点击“批准高风险并继续”</span>' : ''}
     ${run.status === 'pending_acceptance' ? `<button onclick="location.hash='#approvals'">验收确认</button>` : ''}
@@ -657,8 +662,10 @@ function renderCommandChainNodes() {
       <td class="sub">${esc(elapsedText)}</td>
       <td class="sub">${esc((t.error || (t.verification_status === 'warning'
         ? '验证通过但有警告（可能是 scope 超出计划范围），详见任务详情' : '')).slice(0, 160))}</td>
-      <td>${!['completed', 'canceled', 'rejected', 'running', 'verifying'].includes(t.status)
+      <td>${!['completed', 'canceled', 'rejected'].includes(t.status)
         ? `<button class="small" onclick="openBindingEditor('${esc(t.uid)}')">编辑绑定</button>` : ''}
+        ${['waiting_user', 'failed', 'blocked', 'paused'].includes(t.status)
+          ? `<button class="small" onclick="openAdoptModal('${esc(t.uid)}')">采纳成果</button>` : ''}
         ${submissionUnconfirmed ? `<button class="primary small" onclick="reconcileNode('${esc(t.uid)}','${esc(run.run_id)}')">核对原请求</button>` : ''}
         ${canRetry ? `<button class="small" onclick="retryNode('${esc(t.uid)}','${esc(run.run_id)}')">重试节点</button>` : ''}
         ${t.status === 'failed' ? `<button class="small" onclick="reverifyNode('${esc(t.uid)}')">重新验证</button>` : ''}
@@ -675,7 +682,17 @@ function renderCommandChainNodes() {
 function renderBlockAlert() {
   const box = $('blockAlert');
   if (!box) return;
-  const actions = ((state.overview || {}).manual_actions) || [];
+  const taskByUid = Object.fromEntries((state.tasks || []).map((t) => [t.uid, t]));
+  const runStatus = ((state.overview || {}).latest_run || {}).status || '';
+  const liveRun = ['running', 'waiting_user', 'paused'].includes(runStatus);
+  // 2026-11-07 defect #10: cards for SUMMARY/ROUNDx_PLAN stayed after the
+  // synthetic node finished.  Only actions that are still actionable survive.
+  const actions = (((state.overview || {}).manual_actions) || []).filter((a) => {
+    const t = taskByUid[a.task_uid];
+    if (t) return ['waiting_user', 'failed', 'blocked', 'paused', 'running']
+      .includes(t.status);
+    return liveRun;
+  });
   const highRisk = (((state.overview || {}).pending_approvals) || []).filter(
     (a) => a.status === 'pending' && a.kind === 'high_risk');
   if (!actions.length && !highRisk.length) {
@@ -723,13 +740,16 @@ function renderBlockAlert() {
         ${restart ? `<button class="primary small" onclick="restartAgentInterface('${esc(a.agent_id)}','${esc(a.task_uid)}','${esc(run.run_id)}')">重启 Agent 接口</button>` : ''}
         ${synthetic ? `<button class="primary small" onclick="resumeRun('${esc(run.run_id)}')">继续运行</button>` : ''}
         ${!synthetic && String(a.error || '').startsWith('SUBMISSION_') ? `<button class="primary small" onclick="reconcileNode('${esc(a.task_uid)}','${esc(run.run_id)}')">核对原请求</button>` : ''}
-        ${!synthetic && !String(a.error || '').startsWith('SUBMISSION_') && (restart || ['agent_not_running', 'agent_busy', 'login_required'].includes(kind)) ? `<button class="small" onclick="retryNode('${esc(a.task_uid)}','${esc(run.run_id)}')">重试该节点</button>` : ''}
+        ${!synthetic ? `<button class="small" onclick="openAdoptModal('${esc(a.task_uid)}')">采纳成果</button>` : ''}
+        ${!synthetic && !String(a.error || '').startsWith('SUBMISSION_') && (restart || ['agent_not_running', 'agent_busy', 'login_required', 'workspace_trust'].includes(kind)) ? `<button class="small" onclick="retryNode('${esc(a.task_uid)}','${esc(run.run_id)}')">重试该节点</button>` : ''}
         <button class="small" onclick="refresh()">刷新状态</button>
       </div>
     </div>`;
   }).join('');
   box.innerHTML = `<h3>链路已阻塞：需要人工处理 ${actions.length + highRisk.length} 项</h3>
-    <div class="sub">阻塞期间不会启动下一个节点；批准高风险或完成应用内操作后自动继续。</div>${approvalItems}${items}`;
+    <div class="sub">阻塞期间不会启动下一个节点；批准高风险或完成应用内操作后自动继续。</div>
+    ${liveRun ? `<div class="row" style="margin:6px 0 2px"><button class="small" onclick="openSummaryModal('${esc(run.run_id || '')}')">回填汇总 JSON</button></div>` : ''}
+    ${approvalItems}${items}`;
   box.classList.remove('hidden');
 }
 
@@ -994,10 +1014,16 @@ function renderChainPlanInfo() {
 
 function chainModelOptions(agentId, selected) {
   const item = ((state.models || {}).by_agent || {})[agentId] || { models: [] };
-  const names = (item.models || []).map((m) => m.name);
+  const rows = item.models || [];
+  const names = rows.map((m) => m.name);
   let html = '';
-  names.forEach((name) => {
-    html += `<option value="${esc(name)}" ${name === selected ? 'selected' : ''}>${esc(name)}</option>`;
+  rows.forEach((m) => {
+    const name = m.name;
+    const degraded = ((m.health || {}).status === 'degraded');
+    const label = degraded
+      ? `${name} · ⚠${(m.health || {}).reason || '已降级'}`
+      : name;
+    html += `<option value="${esc(name)}" ${name === selected ? 'selected' : ''}>${esc(label)}</option>`;
   });
   if (selected && !names.includes(selected)) {
     html += `<option value="${esc(selected)}" selected>${esc(selected)} · 手动</option>`;
@@ -1295,6 +1321,11 @@ async function saveChainConfig() {
     $('chainStatus').textContent = `已保存 ${result.plan_id} · ${stages.length} 阶段（待审批）`;
     toast('链路配置已保存。请到第 4 步批准计划，再点击“开始执行”。');
     $('chainPlanInfo').textContent = `已保存到 ${result.plan_id}；第 4 步批准后才会开始执行`;
+    const warnings = result.warnings || [];
+    if (warnings.length) {
+      $('chainPlanInfo').textContent += ' · ⚠ ' + warnings.join('；');
+      toast('⚠ ' + warnings.join('；'), true);
+    }
     refresh();
   } catch (e) {
     $('chainStatus').textContent = '保存失败';
@@ -1343,7 +1374,8 @@ function openBindingEditor(uid) {
   const agentId = task.assigned_agent || (task.spec && task.spec.suggested_agent) || '';
   const model = (task.spec && task.spec.model) || task.model || '';
   $('bindingTitle').textContent = `编辑节点 ${task.task_id}`;
-  $('bindingInfo').textContent = `状态 ${task.status} · 修改后对排队/阻塞/等待节点立即生效；正在运行的节点请等结束或重试。`;
+  $('bindingInfo').textContent = `状态 ${task.status} · 修改后对排队/阻塞/等待节点立即生效；` +
+    `正在运行的节点需勾选“停止当前尝试并改绑”，保存后点击“重试该节点”。`;
   $('bindingAgent').innerHTML = agents.map((a) => (
     `<option value="${esc(a.agent_id)}" ${a.agent_id === agentId ? 'selected' : ''}>${esc(a.name)} · ${esc(a.adapter_type || '')}</option>`
   )).join('') + (agentId && !agents.some((a) => a.agent_id === agentId)
@@ -1356,6 +1388,7 @@ function openBindingEditor(uid) {
     context: spec.context_length || profile.context_length || 0,
     capability: spec.capability_level || profile.capability_level || '',
   });
+  if ($('bindingStopActive')) $('bindingStopActive').checked = false;
   $('bindingModal').style.display = 'flex';
 }
 function onBindingAgentChange() {
@@ -1386,6 +1419,7 @@ async function saveBindingEditor() {
       model: $('bindingModel').value,
       context_length: contextLength,
       capability_level: capabilityLevel,
+      stop_active: !!($('bindingStopActive') && $('bindingStopActive').checked),
     });
     closeBindingEditor();
     toast('节点绑定已更新');
@@ -1678,16 +1712,44 @@ async function loadMcpTools(agentId) {
 }
 
 async function callMcpTool(agentId, tool) {
-  const raw = prompt(`输入 ${tool} 的 JSON 参数（必须符合服务端 inputSchema）：`, '{}');
-  if (raw == null) return;
-  let args;
-  try { args = JSON.parse(raw || '{}'); } catch (e) { toast('参数不是 JSON：' + e.message, true); return; }
-  try {
-    const data = await post('/api/agents/' + encodeURIComponent(agentId) + '/mcp/call',
-      { tool, arguments: args });
-    $('mcpResult').innerHTML = `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`;
-    toast('MCP 工具调用完成');
-  } catch (e) { toast(e.message, true); }
+  openTextInputModal({
+    title: `调用 MCP 工具 · ${tool}`,
+    label: `输入 ${tool} 的 JSON 参数（必须符合服务端 inputSchema）`,
+    value: '{}',
+    onOk: async (raw) => {
+      let args;
+      try { args = JSON.parse(raw || '{}'); } catch (e) {
+        toast('参数不是 JSON：' + e.message, true); return false;
+      }
+      try {
+        const data = await post('/api/agents/' + encodeURIComponent(agentId) + '/mcp/call',
+          { tool, arguments: args });
+        $('mcpResult').innerHTML = `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`;
+        toast('MCP 工具调用完成');
+      } catch (e) { toast(e.message, true); }
+      return true;
+    },
+  });
+}
+
+function openTextInputModal({ title, label, value, onOk }) {
+  $('textInputTitle').textContent = title || '输入';
+  $('textInputLabel').textContent = label || '';
+  $('textInputValue').value = value || '';
+  state.textInputCallback = onOk || null;
+  $('textInputModal').style.display = 'flex';
+  $('textInputValue').focus();
+}
+function closeTextInputModal() {
+  $('textInputModal').style.display = 'none';
+  state.textInputCallback = null;
+}
+async function confirmTextInputModal() {
+  const callback = state.textInputCallback;
+  const value = $('textInputValue').value;
+  if (!callback) { closeTextInputModal(); return; }
+  const done = await callback(value);
+  if (done !== false) closeTextInputModal();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1745,8 +1807,49 @@ async function selectTask(uid) {
   location.hash = '#task';
   try {
     state.selected = await api('/api/tasks/' + encodeURIComponent(uid) + '?level=evidence');
-    renderTask(); loadLogs();
+    renderTask(); loadTaskAttempts(uid); loadLogs();
   } catch (e) { toast('加载任务失败：' + e.message, true); }
+}
+
+async function loadTaskAttempts(uid) {
+  const box = $('taskAttempts');
+  const select = $('resultAttempt');
+  if (box) box.innerHTML = '加载中…';
+  if (select) select.innerHTML = '';
+  try {
+    const data = await api('/api/tasks/' + encodeURIComponent(uid) + '/attempts');
+    const attempts = (data && data.attempts) || [];
+    if (select) {
+      select.innerHTML = '<option value="">不关联（仅历史任务可用）</option>' + attempts.map((a) => (
+        `<option value="${esc(a.attempt_id)}" ${a.active ? 'selected' : ''}>` +
+        `#${esc(a.attempt_number)} ${esc(a.attempt_id)} · ${esc(a.status || '')}` +
+        `${a.result_exists ? ' · 有成果文件' : ''}</option>`
+      )).join('');
+    }
+    if (!box) return;
+    if (!attempts.length) { box.innerHTML = '<div class="muted">该任务还没有尝试记录。</div>'; return; }
+    box.innerHTML = `<table class="table"><thead><tr><th>尝试</th><th>状态</th>
+      <th>结果文件</th><th>错误</th><th>操作</th></tr></thead><tbody>${attempts.map((a) => `
+        <tr><td class="mono">#${esc(a.attempt_number)} ${esc(a.attempt_id)}${a.active ? ' <span class="pill info">活动</span>' : ''}</td>
+        <td>${esc(a.status || '')}</td>
+        <td class="mono">${a.result_exists ? '<span class="pill ok">有</span>' : '<span class="pill">无</span>'}</td>
+        <td class="sub mono">${esc((a.error || '').slice(0, 160))}</td>
+        <td>${a.result_exists ? `<button class="small" onclick="adoptAttemptDirect('${esc(a.attempt_id)}')">采纳</button>` : ''}</td>
+        </tr>`).join('')}</tbody></table>`;
+  } catch (e) {
+    if (box) box.innerHTML = `<div class="muted">尝试记录加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function adoptAttemptDirect(attemptId) {
+  const t = state.selected; if (!t) return;
+  try {
+    await post('/api/tasks/' + encodeURIComponent(t.uid) + '/adopt-attempt',
+      { attempt_id: attemptId });
+    toast('已采纳该尝试成果，进入验证');
+    selectTask(t.uid);
+    refresh();
+  } catch (e) { toast(e.message, true); }
 }
 
 function renderTask() {
@@ -1755,6 +1858,8 @@ function renderTask() {
     $('taskTitle').textContent = '未选择任务';
     $('taskBody').innerHTML = '<div class="muted">从任务图或列表中选择一个任务。</div>';
     $('taskActions').innerHTML = '';
+    if ($('taskAttempts')) $('taskAttempts').innerHTML = '选择任务后加载。';
+    if ($('resultAttempt')) $('resultAttempt').innerHTML = '';
     return;
   }
   $('taskTitle').textContent = `${t.task_id} · ${t.title}`;
@@ -2162,10 +2267,45 @@ async function watchPlanJob(jobId) {
     url.searchParams.delete('plan_job');
     window.history.replaceState({}, '', url);
   } else if (out.status === 'waiting_user') {
-    $('planResult').innerHTML = `<div class="card"><h3>等待主节点 UI 执行</h3><div class="sub">提示词：${esc(out.prompt_path || '')}</div><pre>${esc(out.message || '')}</pre></div>`;
+    renderWaitingPlanCard(out);
   } else {
     toast(out.error || '规划未完成', true);
   }
+}
+
+function renderWaitingPlanCard(out) {
+  const ma = out.manual_action || {};
+  const importPath = out.result_path || out.plan_path || '';
+  $('planResult').innerHTML = `<div class="card"><h3>等待主节点 UI 执行</h3><div class="sub">计划 ${esc(out.plan_id || '')} · 提示词：${esc(out.prompt_path || '')}</div><pre class="plain">${esc(out.message || ma.message || '')}</pre><div class="sub">${esc(ma.instructions || '')}</div><div class="sub" id="planWatchStatus">${out.plan_id ? '自动检测计划文件中…' : ''}</div><div class="row" style="margin-top:8px"><button class="small" onclick="openImportPlanModal(${esc(JSON.stringify(importPath))})">导入该计划 JSON</button></div></div>`;
+  watchPlanCompletion(out.plan_id);
+}
+
+let planWatchTimer = null;
+function watchPlanCompletion(planId) {
+  if (planWatchTimer) { clearInterval(planWatchTimer); planWatchTimer = null; }
+  if (!planId) return;
+  const started = Date.now();
+  planWatchTimer = setInterval(async () => {
+    const el = $('planWatchStatus');
+    try {
+      const r = await api('/api/plans/watches');
+      const w = (r.watches || []).find((x) => x.plan_id === planId);
+      if (!w) { if (el) el.textContent = '监视记录不存在'; clearInterval(planWatchTimer); planWatchTimer = null; return; }
+      if (w.status === 'completed') {
+        clearInterval(planWatchTimer); planWatchTimer = null;
+        toast('已检测到主节点写出的计划，载入待审批', false);
+        await refresh();
+        loadChainFromPlan(true);
+        return;
+      }
+      if (['invalid', 'expired', 'failed', 'superseded'].includes(w.status)) {
+        clearInterval(planWatchTimer); planWatchTimer = null;
+        if (el) el.textContent = '自动接收结束：' + w.status + (w.error ? ' · ' + w.error : '');
+        return;
+      }
+      if (el) el.textContent = `自动检测计划文件中… ${Math.round((Date.now() - started) / 1000)}s（完成后自动载入待审批）`;
+    } catch (e) { /* 轮询失败下一轮重试 */ }
+  }, 3000);
 }
 
 async function resumePlanJobFromUrl() {
@@ -2184,6 +2324,8 @@ async function resumePlanJobFromUrl() {
         const url = new URL(window.location.href);
         url.searchParams.delete('plan_job');
         window.history.replaceState({}, '', url);
+      } else if (job.status === 'completed' && out.status === 'waiting_user') {
+        renderWaitingPlanCard(out);
       }
     }
   } catch (e) {
@@ -2191,14 +2333,113 @@ async function resumePlanJobFromUrl() {
   }
 }
 
-async function importPlanPrompt() {
-  const text = prompt('粘贴计划 JSON（或填写计划文件路径）：', '');
-  if (!text) return;
+async function openImportPlanModal(prefillPath) {
+  // 2026-11-07 defect #11: ZCode's embedded browser has no prompt(); use an
+  // in-page modal so plan import works in every supported browser surface.
+  $('importPlanText').value = '';
+  $('importPlanPath').value = prefillPath || '';
+  $('importPlanModal').style.display = 'flex';
+}
+function closeImportPlanModal() {
+  $('importPlanModal').style.display = 'none';
+}
+async function doImportPlan() {
+  const text = $('importPlanText').value.trim();
+  const path = $('importPlanPath').value.trim();
+  if (!text && !path) { toast('请粘贴计划 JSON 或填写路径', true); return; }
   try {
     let body = {};
-    try { body.plan = JSON.parse(text); } catch (e) { body.path = text; }
+    if (text) {
+      let t = text;
+      if (t.startsWith('```')) {
+        t = t.replace(/^```[^\n]*\n?/, '').replace(/\n?```\s*$/, '');
+      }
+      try { body.plan = JSON.parse(t); } catch (e) { body.path = text; }
+    } else {
+      body.path = path;
+    }
     await post('/api/plans/import', body);
-    toast('计划已导入，待审批'); refresh();
+    closeImportPlanModal();
+    toast('计划已导入，待审批');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+function openSummaryModal(runId) {
+  state.summaryRun = runId || ((state.overview && state.overview.latest_run || {}).run_id || '');
+  $('summaryText').value = '';
+  $('summaryPath').value = '';
+  $('summaryRunInfo').textContent = state.summaryRun
+    ? `目标运行：${state.summaryRun}` : '没有可回填的运行';
+  $('summaryModal').style.display = 'flex';
+}
+function closeSummaryModal() {
+  $('summaryModal').style.display = 'none';
+  state.summaryRun = '';
+}
+async function submitSummaryJson() {
+  const runId = state.summaryRun;
+  if (!runId) { toast('没有可回填的运行', true); return; }
+  const text = $('summaryText').value.trim();
+  const path = $('summaryPath').value.trim();
+  if (!text && !path) { toast('请粘贴汇总 JSON 或填写路径', true); return; }
+  try {
+    let body = {};
+    if (text) {
+      let parsed;
+      try { parsed = JSON.parse(text); } catch (e) { body.path = text; }
+      if (parsed) body.summary = parsed;
+    } else {
+      body.path = path;
+    }
+    await post('/api/runs/' + encodeURIComponent(runId) + '/summary', body);
+    closeSummaryModal();
+    toast('汇总已提交');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function openAdoptModal(uid) {
+  const task = (state.tasks || []).find((t) => t.uid === uid);
+  state.adoptTask = task || { uid };
+  $('adoptTitle').textContent = `采纳已有尝试成果 · ${task ? task.task_id : uid}`;
+  $('adoptList').innerHTML = '加载中…';
+  $('adoptModal').style.display = 'flex';
+  try {
+    const data = await api('/api/tasks/' + encodeURIComponent(uid) + '/attempts');
+    const attempts = (data && data.attempts) || [];
+    if (!attempts.length) {
+      $('adoptList').innerHTML = '<div class="muted">该任务还没有尝试记录。</div>';
+      return;
+    }
+    $('adoptList').innerHTML = `<table class="table"><thead><tr><th>尝试</th><th>状态</th>
+      <th>结果文件</th><th>错误</th><th>选择</th></tr></thead><tbody>${attempts.map((a) => `
+        <tr><td class="mono">#${esc(a.attempt_number)} ${esc(a.attempt_id)}${a.active ? ' <span class="pill info">活动</span>' : ''}</td>
+        <td>${esc(a.status || '')}</td>
+        <td>${a.result_exists ? '<span class="pill ok">有 result.json</span>' : '<span class="pill">无</span>'}</td>
+        <td class="sub mono">${esc((a.error || '').slice(0, 120))}</td>
+        <td><input type="radio" name="adoptAttempt" value="${esc(a.attempt_id)}"
+          ${a.result_exists ? '' : 'disabled'} ${a.active && a.result_exists ? 'checked' : ''}
+          style="width:auto"></td></tr>`).join('')}</tbody></table>`;
+  } catch (e) {
+    $('adoptList').innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+  }
+}
+function closeAdoptModal() {
+  $('adoptModal').style.display = 'none';
+  state.adoptTask = null;
+}
+async function confirmAdopt() {
+  const task = state.adoptTask;
+  if (!task) return;
+  const picked = document.querySelector('input[name="adoptAttempt"]:checked');
+  if (!picked) { toast('请选择一个有 result.json 的尝试', true); return; }
+  try {
+    await post('/api/tasks/' + encodeURIComponent(task.uid) + '/adopt-attempt',
+      { attempt_id: picked.value });
+    closeAdoptModal();
+    toast('已采纳该尝试成果，进入验证');
+    refresh();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -2257,6 +2498,10 @@ async function submitResult() {
   try {
     let body = {};
     try { body.payload = JSON.parse(text); } catch (e) { body.path = text; }
+    // 2026-11-07 defect #9: an active attempt requires attempt_id/request_id;
+    // the UI now sends the selected attempt instead of a bare payload.
+    const attemptId = ($('resultAttempt') && $('resultAttempt').value) || '';
+    if (attemptId) body.attempt_id = attemptId;
     await post('/api/tasks/' + encodeURIComponent(t.uid) + '/result', body);
     toast('成果包已提交');
     state.selected = await api('/api/tasks/' + encodeURIComponent(t.uid) + '?level=evidence');

@@ -86,7 +86,7 @@ CONNECTOR_PROFILES: tuple[ConnectorProfile, ...] = (
     ConnectorProfile("qoder_cn", "Qoder CN", "domestic", ("read_files", "write_files", "terminal", "mcp"), "L2"),
     ConnectorProfile("workbuddy", "WorkBuddy", "domestic", ("read_files", "write_files", "terminal", "mcp"), "L2"),
     ConnectorProfile("zcode", "ZCode", "domestic", ("read_files", "write_files", "terminal", "mcp"), "L2"),
-    ConnectorProfile("dsh", "DeepSeek Harness", "domestic", ("read_files", "write_files", "terminal", "mcp"), "L2"),
+    ConnectorProfile("dsh", "DeepSeek Harness", "domestic", ("read_files", "write_files", "terminal", "mcp"), "L3", "dsh"),
     ConnectorProfile("opencode", "OpenCode", "international", ("read_files", "write_files", "terminal", "mcp"), "L3", "opencode"),
     ConnectorProfile(
         "claude_code", "Claude Code", "international",
@@ -146,7 +146,7 @@ def is_auto_executable(agent: AgentRecord) -> bool:
         return False
     if explicit is True:
         return agent.status not in ("offline", "error")
-    if kind in ("cli", "opencode"):
+    if kind in ("cli", "opencode", "zcode", "dsh"):
         if agent.status in ("offline", "error"):
             return False
         config = agent.adapter_config or {}
@@ -184,12 +184,18 @@ def derive_capability_list(agent: AgentRecord) -> list[str]:
     caps -= explicitly_disabled
     # Analysis requires a non-interactive CLI or a verified GUI automation
     # bridge. A file-relay GUI alone still needs a human and is excluded.
-    if "read_files" in caps and agent.adapter_type in ("cli", "opencode", "gui_automation"):
+    if "read_files" in caps and agent.adapter_type in ("cli", "opencode", "zcode", "gui_automation"):
         caps.add("analysis")
     if "write_files" in caps:
         caps.update({"code_generation", "documentation"})
     if "terminal" in caps:
         caps.update({"testing", "execution"})
+        # The Controller ships a keyless web-search tool that any terminal-capable
+        # Agent can call (CLI `agentmesh search` / GET /api/tools/web_search).
+        # This is hub-mediated retrieval, not the Agent's native browsing; an
+        # explicit user disable still wins.
+        if "web_search" not in explicitly_disabled:
+            caps.add("web_search")
     # Any coding-capable local agent can review and design; router still ranks
     # by measured success/cost/speed rather than assuming equal quality.
     if {"read_files", "write_files", "terminal"}.issubset(caps):

@@ -15,7 +15,7 @@ from typing import Any
 from ..adapters import create_adapter
 from ..adapters.base import ExecutionRequest
 from ..config import HubConfig
-from ..errors import ConflictError, NotFoundError, ValidationError
+from ..errors import ConflictError, NotFoundError, SessionComposeConflictError, ValidationError
 from ..models import (
     RESULT_REQUIRED_FIELDS, AgentRecord, ChangeRecord, ChangeStatus, Project,
     ResultPackage, Task, TaskPlan, TaskSpec, TaskStatus, VerificationReport,
@@ -43,9 +43,10 @@ from .model_profile import resolve_profile
 from .paths import WorkspacePaths
 from .prompts import PromptBuilder
 from .router import CapabilityRouter
-from .roles import RolePolicy, classify_model
+from .roles import RolePolicy, classify_model, spec_is_heavy
 from .rounds import (
-    RoundDecision, collect_unresolved, decide as decide_round, fallback_specs,
+    DELIVERY_RULES, RoundDecision, collect_unresolved,
+    decide as decide_round, fallback_specs,
     prefix_delta_specs, round_tasks_for, signature_of,
 )
 from .scheduler import TaskScheduler
@@ -126,6 +127,9 @@ class RunService:
         self._active_run_id = ""
         self._active_tasks: set[str] = set()
         self._active_tasks_lock = threading.Lock()
+        # Attempts the operator explicitly stopped (stop-and-rebind).  A late
+        # agent outcome must never overwrite the rebinding or the retry.
+        self._stopped_attempts: set[str] = set()
         self._cancel_events: dict[str, threading.Event] = {}
         self._cancel_lock = threading.Lock()
 
@@ -655,6 +659,21 @@ class RunService:
                                    payload={"session_workdir": remembered,
                                             "workdir": workdir})
                     resume_session = {}
+        except SessionComposeConflictError as exc:
+            message = exc.message[:800]
+            self.store.set_task_status(uid, TaskStatus.WAITING_USER.value,
+                                       error=message, force=True)
+            self.store.update_run(
+                task.run_id, status="waiting_user",
+                blocked_reason=f"{task.task_id}: {message}", error=message)
+            self.leases.release(uid)
+            self.audit.log("control-plane", "task.session_compose_blocked",
+                           subject=uid, payload=exc.details)
+            self.checkpoints.create("task_waiting_user", run_id=task.run_id,
+                                    task_uid=uid)
+            self.memory.sync_task_state(task.run_id)
+            self.memory.sync_workflow(task.run_id)
+            return
         except Exception as exc:
             reason = f"输入快照准备失败: {exc}"
             self.store.set_task_status(uid, TaskStatus.FAILED.value,
@@ -676,6 +695,7 @@ class RunService:
                     )
             self.cost.record_saving(
                 "intermediate_reuse", saved, task_uid=uid, run_id=task.run_id,
+                cost_saved=self.cost.usd_saved(saved, request_model),
                 detail={"upstream": [item["task_id"] for item in upstream]},
             )
         hints = self.cost.intermediate_hints(task) if self.cost else []
@@ -721,6 +741,7 @@ class RunService:
             extra_context = self.cost.compress_context(
                 extra_context, context_budget,
                 kind="context_compression", task_uid=uid, run_id=task.run_id,
+                model=request_model,
             )
         task_pkg = self.prompts.write_task_package(
             task, agent, plan, self.memory.injectable(scope=task.task_id),
@@ -799,6 +820,7 @@ class RunService:
                     )
                     self.cost.record_saving(
                         "exact_cache", tokens_saved, task_uid=uid, run_id=task.run_id,
+                        cost_saved=self.cost.usd_saved(tokens_saved, request_model),
                         detail={"cache_key": cache_key},
                     )
                 self.store.save_result(task, result, valid=True)
@@ -852,6 +874,31 @@ class RunService:
         finally:
             with self._active_tasks_lock:
                 self._active_tasks.discard(uid)
+        stopped = False
+        with self._active_tasks_lock:
+            if attempt_id in self._stopped_attempts:
+                stopped = True
+                self._stopped_attempts.discard(attempt_id)
+        current = self.store.get_task(uid)
+        current_attempt = str(getattr(current, "active_attempt_id", "") or "") \
+            if current else ""
+        if stopped or current is None or current_attempt != str(attempt_id or "") \
+                or str(getattr(current, "status", "")) == TaskStatus.CANCELED.value:
+            # 2026-11-07 defect #9: stop-and-rebind / retry may start a new
+            # attempt while this agent is still finishing.  The late outcome
+            # is evidence only and must not touch the new attempt's state.
+            self.store.update_attempt(
+                attempt_id, status="canceled",
+                error="尝试已被用户停止/改绑替代，晚到结果未采用",
+                finished_at=now_iso())
+            self.leases.release(uid)
+            self.audit.log("control-plane", "task.stale_attempt_discarded",
+                           subject=uid,
+                           payload={"attempt_id": attempt_id,
+                                    "active_attempt_id": current_attempt,
+                                    "status": getattr(current, "status", ""),
+                                    "stopped_by_user": stopped})
+            return
         interface_binding = ((outcome.extras or {}).get("interface") or {})
         submission = outcome.submission_receipt or (
             (interface_binding.get("submission") if isinstance(interface_binding, dict) else {})
@@ -910,6 +957,7 @@ class RunService:
         self.audit.log(agent.agent_id, "task.executed", subject=uid,
                        payload={"status": outcome.status, "duration_ms": outcome.duration_ms,
                                 "error": outcome.error[:500], "session": outcome.session_id})
+        self._update_model_health(agent, request.model, outcome)
         if outcome.result_payload is not None:
             write_json(task_pkg.persistent_result_path, outcome.result_payload)
         if self.bus and (outcome.result_payload is None or outcome.status != "completed"):
@@ -1289,15 +1337,31 @@ class RunService:
                               cwd=workdir, check=False)
             if reverse.returncode == 0:
                 continue
+            head = (run_git(["rev-parse", "HEAD"], cwd=workdir,
+                            check=False).stdout_text or "").strip()
+            untracked = set((run_git(
+                ["ls-files", "--others", "--exclude-standard"],
+                cwd=workdir, check=False).stdout_text or "").splitlines())
             ok, detail = apply_patch(
                 workdir, patch, three_way=True,
                 exclude_prefixes=PATCH_EXCLUDE_PREFIXES)
             if not ok:
+                self._restore_after_failed_apply(workdir, head, untracked, patch)
                 self.audit.log("control-plane", "task.session_dependency_failed",
                                subject=task.uid,
                                payload={"upstream": upstream.task_id,
+                                        "patch": str(patch), "workdir": workdir,
                                         "detail": detail[:600]})
-                return False
+                raise SessionComposeConflictError(
+                    "SESSION_COMPOSE_CONFLICT: 上游 "
+                    f"{upstream.task_id} 的补丁无法合入该 Agent 的会话工作树，"
+                    f"原会话已保留。请在 {workdir} 手动执行 "
+                    f"git apply --3way \"{patch}\"，解决冲突并提交，"
+                    "然后点击继续运行或该节点的重试；也可改绑 Agent/模型。",
+                    details={"upstream": upstream.task_id, "patch": str(patch),
+                             "workdir": workdir, "detail": detail[:600],
+                             "session_preserved": True},
+                )
             run_git([*identity, "add", "-A"], cwd=workdir, check=False)
             run_git([*identity, "commit", "--allow-empty", "-m",
                      f"chore: compose {upstream.task_id} into {task.task_id} session tree"],
@@ -1307,6 +1371,21 @@ class RunService:
                        subject=task.uid,
                        payload={"upstream": applied, "workdir": workdir})
         return True
+
+    @staticmethod
+    def _restore_after_failed_apply(workdir: str, head: str,
+                                    untracked_before: set[str], patch: Path) -> None:
+        # A failed --3way leaves conflict markers and unmerged index entries;
+        # restore only what the attempt touched so unrelated untracked files
+        # (build outputs, drafts) survive and the session tree stays clean.
+        run_git(["reset", "--hard", head], cwd=workdir, check=False)
+        after = set((run_git(["ls-files", "--others", "--exclude-standard"],
+                             cwd=workdir, check=False).stdout_text or "").splitlines())
+        candidates = set(patch_files(patch, exclude_prefixes=PATCH_EXCLUDE_PREFIXES))
+        for rel in sorted((after - untracked_before) & candidates):
+            target = Path(workdir) / rel
+            if target.is_file():
+                target.unlink(missing_ok=True)
 
     def _apply_upstream_patches(self, task: Task, workdir: str,
                                 manifest: dict[str, Any] | None = None) -> None:
@@ -1443,7 +1522,50 @@ class RunService:
                 f"固定模型 {task.spec.model} 不在 {agent_id} 的真实模型清单中",
                 details={"task_id": task.task_id, "agent_id": agent_id,
                          "model": task.spec.model, "available": sorted(known)[:20]})
+        from .model_health import HEALTH_LABELS, model_health
+        entry = model_health(agent, task.spec.model)
+        if str(entry.get("status") or "") == "degraded":
+            label = HEALTH_LABELS.get(str(entry.get("reason") or ""), entry.get("reason") or "")
+            raise ValidationError(
+                f"固定模型 {task.spec.model} 已降级（{label}）；"
+                "请重新同步模型目录确认恢复，或在链路中改绑其他模型",
+                details={"task_id": task.task_id, "agent_id": agent_id,
+                         "model": task.spec.model, "health": entry})
         return agent
+
+    def _update_model_health(self, agent: AgentRecord, model: str,
+                             outcome: Any) -> None:
+        """Record observed provider health; never guess it.
+
+        A completed run clears a degraded mark; a failed run whose error is a
+        real subscription/auth/quota signal degrades the model so the planner
+        and ladder stop binding it until a probe proves recovery.
+        """
+        from .model_health import (classify_model_error, degraded_entry,
+                                   health_map, ok_entry)
+        model = str(model or "")
+        if not model:
+            return
+        current = health_map(agent).get(model) or {}
+        if outcome.status == "completed":
+            if str(current.get("status") or "") != "degraded":
+                return
+            entry = ok_entry(source="execution")
+        else:
+            kind = classify_model_error(outcome.error)
+            if not kind:
+                return
+            entry = degraded_entry(kind, outcome.error, source="execution")
+        fresh = self.store.get_agent(agent.agent_id)
+        if fresh is None:
+            return
+        extra = dict(fresh.extra or {})
+        health = dict(extra.get("model_health") or {})
+        health[model] = entry
+        extra["model_health"] = health
+        self.store.update_agent_extra(agent.agent_id, extra)
+        self.audit.log("control-plane", "model.health_changed", subject=agent.agent_id,
+                       payload={"model": model, "health": entry})
 
     def _agent_profile(self, agent: AgentRecord, task: Task | None,
                        model: str) -> dict[str, Any]:
@@ -1469,10 +1591,12 @@ class RunService:
         )
 
     def _verifier_model(self, agent: AgentRecord) -> str:
+        from .model_health import is_degraded
         selected = str((agent.extra or {}).get("selected_model") or "")
-        if selected:
+        if selected and not is_degraded(agent, selected):
             return selected
-        models = list(agent.models or [])
+        models = [name for name in (agent.models or [])
+                  if not is_degraded(agent, str(name))]
         free = [name for name in models if "free" in str(name).lower()]
         # opencode-go/* free entries can still be region-gated; the plain
         # opencode/*-free catalog was probe-verified on this machine.
@@ -1485,18 +1609,21 @@ class RunService:
         return str(models[0]) if models else ""
 
     def _model_for_agent(self, agent: AgentRecord, task: Task | None = None) -> str:
+        from .model_health import is_degraded
         pinned_ids = {task.assigned_agent, task.spec.suggested_agent} - {""} if task else set()
         model = str(task.spec.model or "") if task else ""
         if model and (not pinned_ids or agent.agent_id in pinned_ids):
             return model
         selected = str((agent.extra or {}).get("selected_model") or "")
-        if selected:
+        if selected and not is_degraded(agent, selected):
             return selected
         current = self.store.get_main_node(self.project.project_id)
-        if current and current["agent_id"] == agent.agent_id and current.get("model"):
+        if current and current["agent_id"] == agent.agent_id and current.get("model") \
+                and not is_degraded(agent, str(current["model"])):
             return current["model"]
-        if agent.models:
-            return agent.models[0]
+        for name in agent.models or []:
+            if not is_degraded(agent, str(name)):
+                return str(name)
         return ""
 
     # ------------------------------------------------------------------
@@ -1527,6 +1654,7 @@ class RunService:
         ladder = policy.candidates(
             role_name, agents=agents, catalog=catalog,
             require_auto=self.config.router_require_auto_executable,
+            heavy=spec_is_heavy(task.spec),
         )
         current_model = str(task.spec.model or "")
         current_key = f"{task.assigned_agent}::{current_model}"
@@ -2139,7 +2267,7 @@ class RunService:
                 continue
             if agent.status in ("offline", "error"):
                 continue
-            if agent.adapter_type in ("cli", "opencode"):
+            if agent.adapter_type in ("cli", "opencode", "zcode"):
                 cli_candidates.append(agent)
             elif agent.adapter_type == "gui_automation" and is_auto_executable(agent):
                 # A second desktop agent is a valid independent verifier, but
@@ -2264,6 +2392,16 @@ class RunService:
         tasks = self.store.list_tasks(run_id)
         requeued = 0
         for task in tasks:
+            if task.status == TaskStatus.WAITING_USER.value and \
+                    str(task.error or "").startswith("SESSION_COMPOSE_CONFLICT:"):
+                # No request was sent yet; requeue only retries the compose
+                # and blocks again safely if the conflict is still present.
+                self.store.set_task_status(task.uid, TaskStatus.QUEUED.value, force=True)
+                self.store.update_task(task.uid, error="")
+                requeued += 1
+                self.audit.log("control-plane", "task.requeued_after_conflict_resolution",
+                               subject=task.uid)
+                continue
             if task.status == TaskStatus.WAITING_USER.value and (
                     str(task.error or "").startswith("SUBMISSION_")
                     or str(task.error or "").startswith("MANUAL_ACTION_")):
@@ -2402,6 +2540,7 @@ class RunService:
             ctx = self.cost.compress_context(
                 ctx, self.config.context_summary_tokens,
                 kind="context_compression", run_id=run_id,
+                model=str(run.get("model") or ""),
             )
         main_agent = self.store.get_agent(run.get("main_agent_id") or plan.main_agent_id)
         if not main_agent:
@@ -2879,10 +3018,17 @@ class RunService:
                 t.task_id for t in tasks if t.status == TaskStatus.COMPLETED.value
             ],
             "round_history": history,
+            # 2026-11-07 defect #7: the fallback planner produced "git rm
+            # --cached 并提交", which contradicted the plan's commit ban and
+            # produced an empty patch.  Every replan carries the constraints
+            # and the delivery mechanics so no instruction can contradict them.
+            "plan_constraints": list(plan.constraints or []),
+            "delivery_rules": DELIVERY_RULES,
             "instruction": (
                 "只规划关闭上述未解决项所需的最小增量任务；不要重复已完成工作。"
                 "可写任务必须给出最小必要 scope，并依赖上一轮相关任务；"
                 "不要把难度或不确定性写成阻塞。"
+                "未解决项的建议若与 plan_constraints/delivery_rules 冲突，以约束为准。"
             ),
         }
 
@@ -3027,6 +3173,10 @@ class RunService:
         task = self.store.get_task(uid)
         if not task:
             raise NotFoundError(f"任务不存在: {uid}")
+        if task.active_attempt_id:
+            with self._active_tasks_lock:
+                self._stopped_attempts.add(str(task.active_attempt_id))
+                self._active_tasks.discard(uid)
         if task.pid:
             from ..adapters.process import kill_tree
             kill_tree(task.pid)
